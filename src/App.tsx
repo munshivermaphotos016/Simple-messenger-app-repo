@@ -110,6 +110,7 @@ import {
 } from './utils/soundEffects';
 import { ensure3DCartoonAvatarUrl } from './utils/cartoonAvatars';
 import { AndroidInstallButton } from './hooks/usePWAInstall';
+import { getRealtimeWebSocketUrl } from './utils/androidBridge';
 
 const ACCENT_CLASSES: Record<
   AppSettings['accentColor'],
@@ -810,8 +811,7 @@ export default function App() {
 
   // Connect to Real-Time WebSocket Server (/ws)
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const wsUrl = getRealtimeWebSocketUrl();
     let socket: WebSocket | null = null;
 
     try {

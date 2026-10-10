@@ -116,25 +116,41 @@ export const AndroidInstallButton: React.FC<{
 
   return (
     <>
-      <button
-        type="button"
-        onClick={async () => {
-          if (isInstallable) {
-            await install();
-          } else {
-            setShowGuide(true);
+      <div className="inline-flex items-center gap-1.5 shrink-0">
+        <a
+          href="/Simple-Android.apk"
+          download="Simple-Android.apk"
+          className={
+            isCompact
+              ? 'min-h-[34px] px-2.5 py-1 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-bold flex items-center gap-1.5 transition-colors shrink-0'
+              : 'min-h-[40px] px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-2 shadow-lg shadow-emerald-500/20 transition-all active:scale-95'
           }
-        }}
-        className={
-          isCompact
-            ? 'min-h-[34px] px-2.5 py-1 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1.5 transition-colors shrink-0'
-            : 'min-h-[40px] px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-2 shadow-lg shadow-emerald-500/20 transition-all active:scale-95'
-        }
-        title="Install Simple on Android Home Screen"
-      >
-        <Download className="w-3.5 h-3.5 shrink-0" />
-        <span>{isCompact ? 'Install App' : 'Install Android App'}</span>
-      </button>
+          title="Download Simple-Android.apk directly to your phone"
+        >
+          <Download className="w-3.5 h-3.5 shrink-0" />
+          <span>{isCompact ? 'Download APK' : 'Download Android APK'}</span>
+        </a>
+
+        <button
+          type="button"
+          onClick={async () => {
+            if (isInstallable) {
+              await install();
+            } else {
+              setShowGuide(true);
+            }
+          }}
+          className={
+            isCompact
+              ? 'min-h-[34px] px-2.5 py-1 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1.5 transition-colors shrink-0'
+              : 'min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-emerald-300 text-xs font-bold flex items-center gap-1.5 transition-all active:scale-95'
+          }
+          title="Install Simple on Android Home Screen"
+        >
+          <Smartphone className="w-3.5 h-3.5 shrink-0" />
+          <span>{isCompact ? 'Install' : 'Install App'}</span>
+        </button>
+      </div>
 
       {showGuide && (
         <div
@@ -152,7 +168,7 @@ export const AndroidInstallButton: React.FC<{
                 </div>
                 <div>
                   <h3 className="text-sm font-bold text-white">Install Native Android App</h3>
-                  <p className="text-[11px] text-slate-400">Created by Dr. M Verma</p>
+                  <p className="text-[11px] text-slate-400">Created by Dr. M Verma · v1.0.0 APK</p>
                 </div>
               </div>
               <button
@@ -164,8 +180,26 @@ export const AndroidInstallButton: React.FC<{
               </button>
             </div>
 
+            <div className="p-3.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5">
+              <div className="text-xs font-bold text-emerald-300">
+                Option 1: Direct APK File Installation (Recommended)
+              </div>
+              <p className="text-[11px] text-slate-300 leading-relaxed">
+                Download <strong>Simple-Android.apk</strong> directly from this app or from the root of your synced GitHub repository (<code>/Simple-Android.apk</code> or <code>/releases/Simple-v1.0.0.apk</code>) and open it on your Android phone to install.
+              </p>
+              <a
+                href="/Simple-Android.apk"
+                download="Simple-Android.apk"
+                className="w-full min-h-[38px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2"
+              >
+                <Download className="w-4 h-4" />
+                <span>Download Simple-Android.apk</span>
+              </a>
+            </div>
+
             {isIOS ? (
               <div className="space-y-2 text-xs text-slate-300 leading-relaxed bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+                <div className="font-bold text-white">Option 2: iOS Home Screen App</div>
                 <p>
                   1. Tap the <strong>Share</strong> button in your browser toolbar.
                 </p>
@@ -175,6 +209,7 @@ export const AndroidInstallButton: React.FC<{
               </div>
             ) : (
               <div className="space-y-2 text-xs text-slate-300 leading-relaxed bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+                <div className="font-bold text-white">Option 2: Instant WebAPK Install</div>
                 <p>
                   1. Open the browser menu (<strong>⋮</strong> in Chrome on Android).
                 </p>
@@ -190,9 +225,9 @@ export const AndroidInstallButton: React.FC<{
             <button
               type="button"
               onClick={() => setShowGuide(false)}
-              className="w-full min-h-[40px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold"
+              className="w-full min-h-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold"
             >
-              Got It
+              Close
             </button>
           </div>
         </div>

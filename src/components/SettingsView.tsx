@@ -4306,6 +4306,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* Direct Android APK File & GitHub Repository APK Download Box */}
+              <div className="p-4 rounded-2xl bg-slate-950/90 border border-emerald-500/30 flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                    <Smartphone className="w-4 h-4 text-emerald-400" />
+                    <span>Native Android Package Included: Simple-Android.apk (v1.0.0)</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Available directly in your synced GitHub repository root (<code>/Simple-Android.apk</code> &amp; <code>/releases/Simple-v1.0.0.apk</code>) and GitHub Releases, or download directly below.
+                  </p>
+                </div>
+                <a
+                  href="/Simple-Android.apk"
+                  download="Simple-Android.apk"
+                  className="min-h-[38px] px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-2 shrink-0 shadow-lg shadow-emerald-500/20"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download Simple-Android.apk</span>
+                </a>
+              </div>
             </div>
 
             <div className="grid sm:grid-cols-2 gap-3.5">

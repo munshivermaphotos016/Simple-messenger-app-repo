@@ -186,6 +186,23 @@ async function startServer() {
 
   const httpServer = createServer(app);
   const wss = new WebSocketServer({ noServer: true });
+  const hmrFallbackWss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (protocols) => {
+      if (protocols.has('vite-hmr')) return 'vite-hmr';
+      if (protocols.has('vite-ping')) return 'vite-ping';
+      const first = protocols.values().next().value;
+      return first || false;
+    },
+  });
+
+  hmrFallbackWss.on('connection', (ws) => {
+    try {
+      ws.send(JSON.stringify({ type: 'connected' }));
+    } catch {
+      // Ignore
+    }
+  });
 
   httpServer.on('upgrade', (request, socket, head) => {
     const pathname = request.url ? request.url.split('?')[0] : '';
@@ -193,8 +210,34 @@ async function startServer() {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
+    } else {
+      hmrFallbackWss.handleUpgrade(request, socket, head, (ws) => {
+        hmrFallbackWss.emit('connection', ws, request);
+      });
     }
   });
+
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  const sendApkFile = (_req: express.Request, res: express.Response) => {
+    const apkPath = path.join(process.cwd(), 'Simple-Android.apk');
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android.apk"');
+    res.sendFile(apkPath);
+  };
+
+  app.get('/Simple-Android.apk', sendApkFile);
+  app.get('/releases/Simple-v1.0.0.apk', sendApkFile);
+  app.get('/api/download/apk', sendApkFile);
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -595,7 +638,7 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
+      server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);

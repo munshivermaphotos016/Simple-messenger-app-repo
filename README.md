@@ -2,7 +2,22 @@
 
 **Created by Dr. M Verma**
 
-Simple is a privacy-first, end-to-end encrypted (E2EE) native-grade Android messaging, HD voice/video calling, and 24-hour status application built with WebCrypto (`ECDH P-256` + `AES-256-GCM`), WebRTC (`DTLS-SRTP`), Firebase Firestore synchronization, and an Express + WebSocket real-time relay server.
+Simple is a privacy-first, end-to-end encrypted (E2EE) native Android messaging, HD voice/video calling, and 24-hour status application built with WebCrypto (`ECDH P-256` + `AES-256-GCM`), WebRTC (`DTLS-SRTP`), Firebase Firestore synchronization, and an Express + WebSocket real-time relay server.
+
+---
+
+## Direct Android `.apk` Download & Installation
+
+This repository includes the ready-to-install, cryptographically signed (JAR v1 + APK Signature Scheme v2) native Android `.apk` files directly in the repository:
+
+- **[`Simple-Android.apk`](./Simple-Android.apk)** (Repository Root — Direct Download)
+- **[`releases/Simple-v1.0.0.apk`](./releases/Simple-v1.0.0.apk)** (Releases Folder — Versioned APK)
+
+### How to Install on Your Android Phone from GitHub:
+1. Tap **[`Simple-Android.apk`](./Simple-Android.apk)** in this GitHub repository.
+2. Tap **Download raw file** (or the `⋯` menu → **Download** on GitHub Mobile).
+3. Open the downloaded **`Simple-Android.apk`** on your phone and tap **Install** (allow *Install unknown apps* if prompted by Android).
+4. Launch **Simple** from your Android App Drawer (`com.drmverma.simple.messenger`).
 
 ---
 
@@ -14,6 +29,17 @@ Simple is a privacy-first, end-to-end encrypted (E2EE) native-grade Android mess
 - **3D Cartoon Avatars & Sticker Packs**: 20 built-in 3D cartoon character & mascot avatars plus 3D sticker packs and custom avatar studio.
 - **24-Hour Encrypted Status Updates**: Post photo, trimmed video, or typography status stories with audience privacy controls (`Everyone`, `My Contacts`, `Only Share With`).
 - **Cloud & Local Backups**: Encrypted password-protected backups, local `.json` device file export/import, and Google Drive / Firestore cloud account recovery.
+
+---
+
+## Rebuilding the Android `.apk` Locally
+
+To rebuild `Simple-Android.apk` and `releases/Simple-v1.0.0.apk` after modifying the source code:
+
+```bash
+npm install
+npm run build:apk
+```
 
 ---
 
@@ -31,26 +57,9 @@ Open `http://localhost:3000` in your browser or on your Android device.
 
 ---
 
-## Installing as a Native Android App
-
-### Option A: Direct Android WebAPK / Standalone Installation
-1. Open the app URL in **Chrome on Android**.
-2. Tap **Install App** in the top bar (or open **Settings → About & App Info → Install Android App**).
-3. Simple installs directly to your Android App Drawer and launches full-screen in native standalone mode with offline caching and hardware back-button navigation.
-
-### Option B: Building a Native Android `.apk` with Capacitor
-The repository includes `capacitor.config.json` (`com.drmverma.simple.messenger`) pre-configured for Android Studio:
-
-```bash
-npm run build
-npx @capacitor/cli add android
-npx @capacitor/cli sync android
-npx @capacitor/cli open android
-```
-
----
-
 ## Creator & Credits
 
 - **Creator & Lead Architect**: **Dr. M Verma**
+- **Package ID**: `com.drmverma.simple.messenger`
 - **License**: All rights reserved · Created by Dr. M Verma.
+
