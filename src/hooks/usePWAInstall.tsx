@@ -118,7 +118,7 @@ export const AndroidInstallButton: React.FC<{
     <>
       <div className="inline-flex items-center gap-1.5 shrink-0">
         <a
-          href="/Simple-Android.apk"
+          href="/api/download/apk?v=2.0.0"
           download="Simple-Android.apk"
           className={
             isCompact
@@ -190,12 +190,12 @@ export const AndroidInstallButton: React.FC<{
                 Download <strong>Simple-Android.apk</strong> directly from this app or from the root of your synced GitHub repository (<code>/Simple-Android.apk</code> or <code>/releases/Simple-v1.0.0.apk</code>) and open it on your Android phone to install.
               </p>
               <a
-                href="/Simple-Android.apk"
+                href="/api/download/apk?v=2.0.0"
                 download="Simple-Android.apk"
                 className="w-full min-h-[38px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2"
               >
                 <Download className="w-4 h-4" />
-                <span>Download Simple-Android.apk</span>
+                <span>Download Simple-Android.apk (v2.0)</span>
               </a>
             </div>
 

@@ -232,6 +232,9 @@ async function startServer() {
     const apkPath = path.join(process.cwd(), 'Simple-Android.apk');
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android.apk"');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.sendFile(apkPath);
   };
 
