@@ -23,7 +23,8 @@ import {
 } from 'lucide-react';
 import { DirectoryUser, SavedContact, UserAccount } from '../types/simple';
 import { PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
-import { apiFetch } from '../utils/androidBridge';
+import { apiFetch, getRemoteServerOrigin } from '../utils/androidBridge';
+import { shareSimpleApk } from '../hooks/usePWAInstall';
 import {
   computeEmailHash,
   computePhoneHash,
@@ -293,9 +294,70 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
     setContactEmail('');
     setContactFeedback(
       matched
-        ? `Saved ${finalName} (@${matched.username}) to your contacts!`
-        : `Saved ${finalName} (${finalPhone}) to your contacts!`
+        ? `Saved ${finalName} (@${matched.username}) — Already on Simple!`
+        : `Saved ${finalName} (${finalPhone}) — You can invite them on WhatsApp with the Simple APK!`
     );
+  };
+
+  const handleSyncPhoneContacts = async () => {
+    const navAny = navigator as any;
+    if (navAny.contacts && typeof navAny.contacts.select === 'function') {
+      try {
+        const picked = await navAny.contacts.select(['name', 'tel', 'email'], { multiple: true });
+        if (Array.isArray(picked) && picked.length > 0) {
+          let syncedCount = 0;
+          let matchedOnAppCount = 0;
+          picked.forEach((p: any, idx: number) => {
+            const rawName = (Array.isArray(p.name) ? p.name[0] : p.name) || 'Contact';
+            const rawTel = (Array.isArray(p.tel) ? p.tel[0] : p.tel) || '';
+            const rawEmail = (Array.isArray(p.email) ? p.email[0] : p.email) || '';
+            const norm = normalizePhone(rawTel);
+            if (norm.length >= 6) {
+              const matched = findMatchingDirectoryUser(rawTel, undefined, rawEmail);
+              if (matched) matchedOnAppCount += 1;
+              onSaveContact(
+                {
+                  id: `cnt_${Date.now()}_${idx}`,
+                  savedName: String(rawName).trim() || rawTel,
+                  phone: String(rawTel).trim(),
+                  normalizedPhone: norm,
+                  phoneHash: computePhoneHash(norm),
+                  phoneTailHash: computePhoneTailHash(norm),
+                  username:
+                    matched?.username ||
+                    generateDefaultUsername(String(rawName), String(rawTel), String(rawEmail)),
+                  email: String(rawEmail).trim().toLowerCase() || matched?.email || '',
+                  matchedUserUid: matched?.uid || deriveUidFromPhone(norm),
+                  addedAt: Date.now(),
+                },
+                false
+              );
+              syncedCount += 1;
+            }
+          });
+          showDirToast(
+            `Synced ${syncedCount} phone contacts (${matchedOnAppCount} already on Simple!)`
+          );
+          setActiveTab('contacts');
+          return;
+        }
+      } catch {
+        // User cancelled or Contact Picker unsupported in this WebView context
+      }
+    }
+    setActiveTab('contacts');
+    showDirToast('Add your phone contacts below or import to match friends on Simple');
+  };
+
+  const openWhatsAppApkInvite = (targetPhone?: string, targetName?: string) => {
+    const cleanDigits = normalizePhone(targetPhone || '');
+    const apkUrl = `${getRemoteServerOrigin()}/Simple-Messenger.apk`;
+    const inviteText = `Hey${targetName ? ` ${targetName}` : ''}! I'm using Simple Messenger for private end-to-end encrypted chats & calls. Download and install the Simple Android APK here to message me (@${currentAccount.username}): ${apkUrl}`;
+    const waUrl =
+      cleanDigits.length >= 7
+        ? `https://wa.me/${cleanDigits}?text=${encodeURIComponent(inviteText)}`
+        : `https://wa.me/?text=${encodeURIComponent(inviteText)}`;
+    window.location.href = waUrl;
   };
 
   const handleSendRegistrationOtps = async () => {
@@ -1051,11 +1113,29 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
                 Find friends by <strong>Phone Number</strong>, <strong>@username</strong>, or <strong>Email</strong> — hold or tap <strong>Select</strong> for multiple contacts.
               </p>
             </div>
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+              <button
+                type="button"
+                onClick={handleSyncPhoneContacts}
+                className="min-h-[38px] px-2.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5"
+                title="Sync contacts from your phone and match who uses Simple"
+              >
+                <Users className="w-3.5 h-3.5" />
+                <span>Sync Contacts</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => shareSimpleApk(currentAccount.username)}
+                className="min-h-[38px] px-2.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 text-xs font-semibold flex items-center gap-1.5"
+                title="Share Simple APK on WhatsApp or any app"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                <span>Share APK</span>
+              </button>
               <button
                 type="button"
                 onClick={() => setIsMultiSelectMode(true)}
-                className="min-h-[40px] px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold flex items-center gap-1.5"
+                className="min-h-[38px] px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold flex items-center gap-1.5"
                 title="Select multiple contacts"
               >
                 <CheckSquare className="w-4 h-4" />
@@ -1063,7 +1143,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
               </button>
               <button
                 onClick={onClose}
-                className="min-h-[40px] min-w-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-slate-300 shrink-0"
+                className="min-h-[38px] min-w-[38px] rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-slate-300 shrink-0"
                 aria-label="Close directory"
               >
                 <X className="w-5 h-5" />
@@ -1133,21 +1213,45 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
                 {filteredDirectory.length === 0 ? (
                   <div className="p-6 rounded-2xl bg-slate-950 border border-slate-800 text-center space-y-3">
                     <p className="text-sm font-semibold text-slate-200">
-                      No existing account matched "{searchQuery}"
+                      {searchQuery
+                        ? `No registered account found for "${searchQuery}" yet`
+                        : 'No other registered users in directory yet'}
                     </p>
                     <p className="text-xs text-slate-400">
-                      Want to save <strong>{searchQuery}</strong> as a mobile contact and start an encrypted chat right away?
+                      {searchQuery
+                        ? `Save ${searchQuery} to your contacts or share the Simple APK with them on WhatsApp so they can install Simple and chat with you!`
+                        : 'Sync your phone contacts or share the Simple APK with your friends on WhatsApp to start chatting!'}
                     </p>
-                    <button
-                      onClick={() => {
-                        setContactPhone(searchQuery);
-                        setActiveTab('contacts');
-                      }}
-                      className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5"
-                    >
-                      <UserPlus className="w-4 h-4" />
-                      Save "{searchQuery}" & Message
-                    </button>
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      {searchQuery && (
+                        <button
+                          onClick={() => {
+                            setContactPhone(searchQuery);
+                            setActiveTab('contacts');
+                          }}
+                          className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5"
+                        >
+                          <UserPlus className="w-4 h-4" />
+                          Save "{searchQuery}" & Message
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => openWhatsAppApkInvite(searchQuery)}
+                        className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold inline-flex items-center gap-1.5"
+                      >
+                        <Share2 className="w-4 h-4" />
+                        Share APK on WhatsApp
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => shareSimpleApk(currentAccount.username)}
+                        className="min-h-[40px] px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold inline-flex items-center gap-1.5"
+                      >
+                        <Share2 className="w-4 h-4 text-cyan-400" />
+                        Share Whole APK File
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="divide-y divide-slate-800/80 rounded-2xl bg-slate-950/80 border border-slate-800">
@@ -1516,10 +1620,14 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
                               <span className="text-sm font-semibold text-white truncate">
                                 {cnt.savedName}
                               </span>
-                              {matchedUser && (
+                              {matchedUser ? (
                                 <span className="text-[11px] text-emerald-400 font-medium flex items-center gap-0.5">
                                   <CheckCircle2 className="w-3.5 h-3.5" />
                                   On Simple (@{matchedUser.username})
+                                </span>
+                              ) : (
+                                <span className="text-[11px] text-amber-300 font-medium">
+                                  Not on Simple yet · Invite with APK
                                 </span>
                               )}
                             </div>
@@ -1531,7 +1639,21 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-1.5 shrink-0">
+                        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                          {!matchedUser && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openWhatsAppApkInvite(cnt.phone, cnt.savedName);
+                              }}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5"
+                              title={`Send Simple APK invite to ${cnt.savedName} on WhatsApp`}
+                            >
+                              <Share2 className="w-3.5 h-3.5" />
+                              <span>Share APK on WhatsApp</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={(e) => {

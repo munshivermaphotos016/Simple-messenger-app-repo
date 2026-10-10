@@ -109,8 +109,8 @@ import {
   triggerVibration,
 } from './utils/soundEffects';
 import { ensure3DCartoonAvatarUrl } from './utils/cartoonAvatars';
-import { AndroidInstallButton } from './hooks/usePWAInstall';
-import { apiFetch, getRealtimeWebSocketUrl } from './utils/androidBridge';
+import { AndroidInstallButton, shareSimpleApk } from './hooks/usePWAInstall';
+import { apiFetch, getRealtimeWebSocketUrl, getRemoteServerOrigin } from './utils/androidBridge';
 import simpleAppIcon from './assets/images/simple_app_icon.png';
 
 const ACCENT_CLASSES: Record<
@@ -125,19 +125,20 @@ const ACCENT_CLASSES: Record<
 };
 
 export default function App() {
-  // Persistent state loaded from localStorage
+  const [isAppBooting, setIsAppBooting] = useState<boolean>(true);
+
+  // Persistent state loaded from localStorage (v3 clean real-account storage)
   const [account, setAccount] = useState<UserAccount>(() => {
-    const saved = localStorage.getItem('simple_account_v2');
+    const saved = localStorage.getItem('simple_account_v3');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
         return {
           ...INITIAL_USER_ACCOUNT,
           ...parsed,
-          avatarUrl: ensure3DCartoonAvatarUrl(
-            parsed.avatarUrl ?? INITIAL_USER_ACCOUNT.avatarUrl,
-            parsed.name || INITIAL_USER_ACCOUNT.name
-          ),
+          avatarUrl: parsed.avatarUrl
+            ? ensure3DCartoonAvatarUrl(parsed.avatarUrl, parsed.name || 'User')
+            : undefined,
         };
       } catch {
         return INITIAL_USER_ACCOUNT;
@@ -147,22 +148,10 @@ export default function App() {
   });
 
   const [settings, setSettings] = useState<AppSettings>(() => {
-    const saved = localStorage.getItem('simple_settings_v2');
+    const saved = localStorage.getItem('simple_settings_v3');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (!parsed.wallpaperThemeMigratedV3) {
-          return {
-            ...INITIAL_SETTINGS,
-            ...parsed,
-            wallpaperStyle: 'theme_img_1',
-            wallpaperOpacity: parsed.wallpaperOpacity ?? 75,
-            wallpaperBlur: parsed.wallpaperBlur ?? 0,
-            wallpaperThemeMigratedV3: true,
-            onlineStatusVisibility: parsed.onlineStatusVisibility || 'same_as_last_seen',
-            showOnlineStatus: parsed.showOnlineStatus ?? true,
-          };
-        }
         return { ...INITIAL_SETTINGS, ...parsed };
       } catch {
         return INITIAL_SETTINGS;
@@ -172,20 +161,11 @@ export default function App() {
   });
 
   const [chats, setChats] = useState<ChatConversation[]>(() => {
-    const saved = localStorage.getItem('simple_chats_v2');
+    const saved = localStorage.getItem('simple_chats_v3');
     if (saved) {
       try {
         const parsed: ChatConversation[] = JSON.parse(saved);
-        return parsed.map((c) => {
-          const match = INITIAL_CHATS.find((ic) => ic.id === c.id);
-          return {
-            ...c,
-            avatarUrl: ensure3DCartoonAvatarUrl(
-              c.avatarUrl || match?.avatarUrl,
-              c.name || match?.name || c.id
-            ),
-          };
-        });
+        return Array.isArray(parsed) ? parsed : INITIAL_CHATS;
       } catch {
         return INITIAL_CHATS;
       }
@@ -194,20 +174,11 @@ export default function App() {
   });
 
   const [directoryUsers, setDirectoryUsers] = useState<DirectoryUser[]>(() => {
-    const saved = localStorage.getItem('simple_directory_v2');
+    const saved = localStorage.getItem('simple_directory_v3');
     if (saved) {
       try {
         const parsed: DirectoryUser[] = JSON.parse(saved);
-        return parsed.map((u) => {
-          const match = INITIAL_DIRECTORY_USERS.find((iu) => iu.uid === u.uid);
-          return {
-            ...u,
-            avatarUrl: ensure3DCartoonAvatarUrl(
-              u.avatarUrl || match?.avatarUrl,
-              u.name || match?.name || u.uid
-            ),
-          };
-        });
+        return Array.isArray(parsed) ? parsed : INITIAL_DIRECTORY_USERS;
       } catch {
         return INITIAL_DIRECTORY_USERS;
       }
@@ -216,25 +187,16 @@ export default function App() {
   });
 
   const [savedContacts, setSavedContacts] = useState<SavedContact[]>(() => {
-    const saved = localStorage.getItem('simple_contacts_v2');
+    const saved = localStorage.getItem('simple_contacts_v3');
     return saved ? JSON.parse(saved) : INITIAL_SAVED_CONTACTS;
   });
 
   const [calls, setCalls] = useState<CallRecord[]>(() => {
-    const saved = localStorage.getItem('simple_calls_v2');
+    const saved = localStorage.getItem('simple_calls_v3');
     if (saved) {
       try {
         const parsed: CallRecord[] = JSON.parse(saved);
-        return parsed.map((cl) => {
-          const match = INITIAL_CALL_HISTORY.find((ic) => ic.id === cl.id);
-          return {
-            ...cl,
-            avatarUrl: ensure3DCartoonAvatarUrl(
-              cl.avatarUrl || match?.avatarUrl,
-              cl.participantName || cl.id
-            ),
-          };
-        });
+        return Array.isArray(parsed) ? parsed : INITIAL_CALL_HISTORY;
       } catch {
         return INITIAL_CALL_HISTORY;
       }
@@ -243,20 +205,11 @@ export default function App() {
   });
 
   const [statuses, setStatuses] = useState<StatusPost[]>(() => {
-    const saved = localStorage.getItem('simple_statuses_v2');
+    const saved = localStorage.getItem('simple_statuses_v3');
     if (saved) {
       try {
         const parsed: StatusPost[] = JSON.parse(saved);
-        return parsed.map((st) => {
-          const match = INITIAL_STATUS_POSTS.find((ist) => ist.id === st.id);
-          return {
-            ...st,
-            authorAvatarUrl: ensure3DCartoonAvatarUrl(
-              st.authorAvatarUrl || match?.authorAvatarUrl,
-              st.authorName || st.id
-            ),
-          };
-        });
+        return Array.isArray(parsed) ? parsed : INITIAL_STATUS_POSTS;
       } catch {
         return INITIAL_STATUS_POSTS;
       }
@@ -265,7 +218,7 @@ export default function App() {
   });
 
   const [devices, setDevices] = useState<LinkedDevice[]>(() => {
-    const saved = localStorage.getItem('simple_devices_v2');
+    const saved = localStorage.getItem('simple_devices_v3');
     return saved ? JSON.parse(saved) : INITIAL_LINKED_DEVICES;
   });
 
@@ -374,14 +327,16 @@ export default function App() {
   const [showNewGroupModal, setShowNewGroupModal] = useState(false);
   const [newChatMode, setNewChatMode] = useState<'group' | 'qr'>('group');
   const [newGroupName, setNewGroupName] = useState('');
-  const [newGroupMembersInput, setNewGroupMembersInput] = useState('elena.sec, mvance.webrtc');
+  const [newGroupMembersInput, setNewGroupMembersInput] = useState('');
 
   const [safetyModalChat, setSafetyModalChat] = useState<ChatConversation | null>(null);
   const [showMyProfilePhotoModal, setShowMyProfilePhotoModal] = useState<boolean>(false);
   const [previewContactAvatarChat, setPreviewContactAvatarChat] = useState<ChatConversation | null>(null);
   const [activeCall, setActiveCall] = useState<ActiveCallSession | null>(null);
   const [incomingCallInvite, setIncomingCallInvite] = useState<ActiveCallSession | null>(null);
-  const [showOnboarding, setShowOnboarding] = useState<boolean>(false);
+  const [showOnboarding, setShowOnboarding] = useState<boolean>(
+    () => !account.id || !account.onboardingCompleted
+  );
   const [notificationBanner, setNotificationBanner] = useState<{
     title: string;
     body: string;
@@ -391,37 +346,45 @@ export default function App() {
   const [newStatusText, setNewStatusText] = useState('');
   const [newStatusPrivacy, setNewStatusPrivacy] = useState<StatusPost['privacy']>('all_contacts');
 
-  // Persist to localStorage
+  // Startup Loading Screen on Launch (initializes E2EE keys & verifies saved credentials)
   useEffect(() => {
-    localStorage.setItem('simple_account_v2', JSON.stringify(account));
+    const timer = window.setTimeout(() => {
+      setIsAppBooting(false);
+    }, 850);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  // Persist to localStorage (v3)
+  useEffect(() => {
+    localStorage.setItem('simple_account_v3', JSON.stringify(account));
   }, [account]);
 
   useEffect(() => {
-    localStorage.setItem('simple_settings_v2', JSON.stringify(settings));
+    localStorage.setItem('simple_settings_v3', JSON.stringify(settings));
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem('simple_chats_v2', JSON.stringify(chats));
+    localStorage.setItem('simple_chats_v3', JSON.stringify(chats));
   }, [chats]);
 
   useEffect(() => {
-    localStorage.setItem('simple_directory_v2', JSON.stringify(directoryUsers));
+    localStorage.setItem('simple_directory_v3', JSON.stringify(directoryUsers));
   }, [directoryUsers]);
 
   useEffect(() => {
-    localStorage.setItem('simple_contacts_v2', JSON.stringify(savedContacts));
+    localStorage.setItem('simple_contacts_v3', JSON.stringify(savedContacts));
   }, [savedContacts]);
 
   useEffect(() => {
-    localStorage.setItem('simple_calls_v2', JSON.stringify(calls));
+    localStorage.setItem('simple_calls_v3', JSON.stringify(calls));
   }, [calls]);
 
   useEffect(() => {
-    localStorage.setItem('simple_statuses_v2', JSON.stringify(statuses));
+    localStorage.setItem('simple_statuses_v3', JSON.stringify(statuses));
   }, [statuses]);
 
   useEffect(() => {
-    localStorage.setItem('simple_devices_v2', JSON.stringify(devices));
+    localStorage.setItem('simple_devices_v3', JSON.stringify(devices));
   }, [devices]);
 
   // Helper to merge a user into local directory state and link any matching saved contacts by SHA-256 phoneHash
@@ -505,14 +468,19 @@ export default function App() {
 
   // Register current user in Express Server + Firebase Firestore Directory & /phone_index/{phoneHash} without plaintext phone exposure
   const syncUserAccountToDirectory = async (acc: UserAccount, fp: string) => {
-    const normPhone = normalizePhone(acc.phone) || '14158904319';
-    const phoneHash = computePhoneHash(normPhone);
-    const phoneTailHash = computePhoneTailHash(normPhone);
+    if (!acc.id || !acc.onboardingCompleted || (!acc.phone && !acc.email)) {
+      return;
+    }
+    const normPhone = normalizePhone(acc.phone);
+    const phoneHash = normPhone ? computePhoneHash(normPhone) : '';
+    const phoneTailHash = normPhone ? computePhoneTailHash(normPhone) : '';
     const emailHash = computeEmailHash(acc.email);
     const cleanUsername =
       acc.username.trim().toLowerCase().replace(/^@/, '') ||
       generateDefaultUsername(acc.name, acc.phone, acc.email);
-    const safeUid = acc.id.replace(/[^a-zA-Z0-9_-]/g, '_') || deriveUidFromPhone(normPhone);
+    const safeUid =
+      acc.id.replace(/[^a-zA-Z0-9_-]/g, '_') ||
+      (normPhone ? deriveUidFromPhone(normPhone) : `usr_${Date.now()}`);
 
     const localDirEntry: DirectoryUser = {
       uid: safeUid,
@@ -1342,73 +1310,53 @@ export default function App() {
           }
         }
       } catch {
-        // Fallback to deterministic UID registration below
+        // Offline or not registered in Firestore yet
       }
     }
 
-    if (!matchedUser) {
-      // 3. Map normalized phone number to deterministic UID via SHA-256 hash without revealing plaintext phone in Firestore
-      const localCreatedUser: DirectoryUser = {
-        uid: deterministicUid,
-        name: contact.savedName.slice(0, 80),
-        username: (
-          contact.username ||
-          generateDefaultUsername(contact.savedName, contact.phone, contact.email)
-        ).slice(0, 40),
-        phone: contact.phone.slice(0, 32),
-        normalizedPhone: normPhone.slice(0, 24),
-        phoneHash,
-        phoneTailHash,
-        email: (contact.email || '').toLowerCase().trim().slice(0, 120),
-        emailHash,
-        about: 'Connected via SHA-256 Mobile Number Discovery on Simple',
-        avatarColor: '#10B981',
-        identityFingerprint:
-          '71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3A91C4F82D03E',
-        allowUsernameDiscovery: true,
-        hidePhoneNumber: true,
-        isOnline: true,
-        lastSeen: 'Online',
-        updatedAt: Date.now(),
-      };
-      upsertDirectoryUser(localCreatedUser);
+    // Update SavedContact with matchedUserUid ONLY if the contact actually uses Simple
+    setSavedContacts((prev) =>
+      prev.map((c) =>
+        (phoneHash && c.phoneHash === phoneHash) || c.normalizedPhone === normPhone
+          ? {
+              ...c,
+              matchedUserUid: matchedUser ? matchedUser.uid : undefined,
+              username: matchedUser?.username || c.username,
+            }
+          : c
+      )
+    );
 
-      // Firestore payload masks the phone number so plaintext is never stored in Firestore
-      const firestoreCreatedUser: DirectoryUser = {
-        ...localCreatedUser,
-        phone: maskPhoneForFirestore(contact.phone).slice(0, 32),
-        normalizedPhone: 'REDACTED_SHA256',
-      };
-
-      fetch('/api/directory/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(firestoreCreatedUser),
-      }).catch(() => {});
-
-      try {
-        await setDoc(doc(db, 'directory', firestoreCreatedUser.uid), firestoreCreatedUser);
-        if (phoneHash) {
-          await setDoc(doc(db, 'phone_index', phoneHash), {
-            phoneHash,
-            phoneTailHash,
-            targetUid: firestoreCreatedUser.uid,
-            username: firestoreCreatedUser.username,
-            name: firestoreCreatedUser.name,
-            avatarColor: firestoreCreatedUser.avatarColor,
-            identityFingerprint: firestoreCreatedUser.identityFingerprint,
-            updatedAt: Date.now(),
-          });
-        }
-      } catch {
-        // Offline fallback handled
+    if (startChatImmediately) {
+      if (matchedUser) {
+        await handleStartOrOpenChatWithDirectoryUser(matchedUser, contact.savedName);
+      } else {
+        // Contact does not use Simple yet: create a direct chat thread where user can message or share the APK on WhatsApp
+        const pendingUser: DirectoryUser = {
+          uid: deterministicUid,
+          name: contact.savedName.slice(0, 80) || contact.phone,
+          username: (
+            contact.username ||
+            generateDefaultUsername(contact.savedName, contact.phone, contact.email)
+          ).slice(0, 40),
+          phone: contact.phone.slice(0, 32),
+          normalizedPhone: normPhone.slice(0, 24),
+          phoneHash,
+          phoneTailHash,
+          email: (contact.email || '').toLowerCase().trim().slice(0, 120),
+          emailHash,
+          about: 'Not on Simple yet — Share APK on WhatsApp to invite',
+          avatarColor: '#10B981',
+          identityFingerprint:
+            '71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3A91C4F82D03E',
+          allowUsernameDiscovery: true,
+          hidePhoneNumber: false,
+          isOnline: false,
+          lastSeen: 'Invite to Simple via APK',
+          updatedAt: Date.now(),
+        };
+        await handleStartOrOpenChatWithDirectoryUser(pendingUser, contact.savedName);
       }
-
-      matchedUser = localCreatedUser;
-    }
-
-    if (startChatImmediately && matchedUser) {
-      await handleStartOrOpenChatWithDirectoryUser(matchedUser, contact.savedName);
     }
   };
 
@@ -2065,6 +2013,89 @@ export default function App() {
   const accent = ACCENT_CLASSES[settings.accentColor];
 
   const isMobileChatOpen = activeTab === 'chats' && Boolean(selectedChatId);
+  const requiresAccountSetup =
+    !account.id || !account.onboardingCompleted || (!account.phone && !account.email);
+
+  // 1. First-Launch Loading Screen
+  if (isAppBooting) {
+    return (
+      <div className="h-[100dvh] w-full flex flex-col items-center justify-center bg-[#070A0E] text-white p-6 select-none">
+        <div className="w-full max-w-xs flex flex-col items-center text-center space-y-5">
+          <div className="relative">
+            <div className="absolute -inset-3 rounded-3xl bg-emerald-500/20 blur-xl animate-pulse" />
+            <img
+              src={simpleAppIcon}
+              alt="Simple"
+              className="relative w-20 h-20 rounded-3xl border border-emerald-500/40 object-cover shadow-2xl bg-black"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <h1 className="font-display text-2xl font-bold tracking-tight text-white">
+              Simple
+            </h1>
+            <p className="text-xs text-emerald-400 font-medium">
+              End-to-End Encrypted Messenger
+            </p>
+          </div>
+          <div className="w-48 h-1.5 rounded-full bg-slate-900 overflow-hidden border border-slate-800">
+            <div className="h-full w-2/3 bg-emerald-500 rounded-full animate-pulse" />
+          </div>
+          <p className="text-[11px] font-mono text-slate-400">
+            Initializing ECDH P-256 keys & syncing directory…
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. First-Time Account Creation / Login Gate (Required before entering Chats)
+  if (requiresAccountSetup || showOnboarding) {
+    return (
+      <div className="h-[100dvh] w-full bg-[#070A0E] text-white overflow-hidden">
+        <OnboardingModal
+          account={account}
+          settings={settings}
+          localFingerprint={localFingerprint}
+          onComplete={(updatedAccount, updatedSettings, restoredChats) => {
+            const finalAccount: UserAccount = {
+              ...updatedAccount,
+              onboardingCompleted: true,
+            };
+            setAccount(finalAccount);
+            setSettings((prev) => ({ ...prev, ...updatedSettings }));
+            if (restoredChats && Array.isArray(restoredChats) && restoredChats.length > 0) {
+              setChats(restoredChats);
+            }
+            syncUserAccountToDirectory(finalAccount, localFingerprint);
+
+            const fullBackupJson = JSON.stringify({
+              account: finalAccount,
+              settings: { ...settings, ...updatedSettings },
+              chats: restoredChats && restoredChats.length > 0 ? restoredChats : chats,
+              updatedAt: Date.now(),
+            });
+            saveCloudAccountBackup({
+              uid: finalAccount.id,
+              username: finalAccount.username,
+              phoneHash: normalizePhone(finalAccount.phone),
+              emailHash: finalAccount.email
+                ? finalAccount.email.trim().toLowerCase()
+                : undefined,
+              backupJson: fullBackupJson,
+            });
+
+            setShowOnboarding(false);
+            setActiveTab('chats');
+          }}
+          onCancel={() => {
+            if (!requiresAccountSetup) {
+              setShowOnboarding(false);
+            }
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -2523,6 +2554,51 @@ export default function App() {
 
               {/* Conversation Rows (with Swipe-Right to Pin, Swipe-Left to Archive, Long-Press & 3-Dots Options) */}
               <div className="flex-1 overflow-y-auto divide-y divide-slate-800/50 relative pb-20">
+                {visibleChats.length === 0 && !globalSearch.trim() && (
+                  <div className="p-5 m-3 rounded-2xl bg-slate-900/70 border border-slate-800/90 text-center space-y-3">
+                    <div className="w-11 h-11 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mx-auto">
+                      <MessageSquare className="w-5 h-5" />
+                    </div>
+                    <div className="space-y-1">
+                      <h3 className="text-sm font-bold text-white">No conversations yet</h3>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Sync your phone contacts to see who is already on Simple, or share the Simple APK on WhatsApp to invite friends.
+                      </p>
+                    </div>
+                    <div className="flex flex-col gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setShowContactsDirectoryModal(true)}
+                        className="w-full min-h-[40px] px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-1.5"
+                      >
+                        <UserPlus className="w-4 h-4" />
+                        <span>Sync Contacts & Start Chat</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const apkUrl = `${getRemoteServerOrigin()}/Simple-Android.apk`;
+                          const text = `Hey! Join me on Simple Messenger (@${account.username || 'simple'}). Download & install the official Android APK here: ${apkUrl}`;
+                          window.open(
+                            `https://wa.me/?text=${encodeURIComponent(text)}`,
+                            '_blank',
+                            'noopener,noreferrer'
+                          );
+                        }}
+                        className="w-full min-h-[38px] px-3 py-2 rounded-xl bg-[#25D366]/15 hover:bg-[#25D366]/25 border border-[#25D366]/40 text-[#25D366] text-xs font-bold flex items-center justify-center gap-1.5"
+                      >
+                        <span>Share APK on WhatsApp</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => shareSimpleApk()}
+                        className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold"
+                      >
+                        Share APK File Directly
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {visibleChats.map((chat) => {
                   const lastMsg = chat.messages[chat.messages.length - 1];
                   const isSelected = chat.id === selectedChatId;

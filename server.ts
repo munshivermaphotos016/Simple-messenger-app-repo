@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 
 const PORT = 3000;
@@ -33,9 +34,14 @@ export interface DirectoryUserRecord {
   username: string;
   phone: string;
   normalizedPhone: string;
+  phoneHash?: string;
+  phoneTailHash?: string;
   email: string;
+  emailHash?: string;
+  passwordHash?: string;
   about: string;
   avatarColor: string;
+  avatarUrl?: string;
   identityFingerprint: string;
   allowUsernameDiscovery: boolean;
   hidePhoneNumber: boolean;
@@ -54,117 +60,73 @@ interface EncryptedBackupBlob {
   ciphertextBase64: string;
 }
 
+interface CloudAccountBackupRecord {
+  uid: string;
+  username: string;
+  phoneHash?: string;
+  emailHash?: string;
+  passwordHash?: string;
+  backupJson: string;
+  updatedAt: number;
+}
+
 export function normalizePhoneDigits(phone: string): string {
   return phone.replace(/[^0-9]/g, '');
 }
 
-// Seeded Global Registered Users Directory (Findable by Phone Number, @username, or Email)
-const INITIAL_DIRECTORY_USERS: DirectoryUserRecord[] = [
-  {
-    uid: 'usr_self_01',
-    name: 'Alex Rivera',
-    username: 'alex.rivera',
-    phone: '+1 (415) 890-4319',
-    normalizedPhone: '14158904319',
-    email: 'alex@simple.privacy',
-    about: 'Signal-grade encryption · Zero telemetry',
-    avatarColor: '#10B981',
-    identityFingerprint: 'A91C4F82D03E71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: true,
-    lastSeen: 'Online',
-    updatedAt: Date.now(),
-  },
-  {
-    uid: 'chat_elena',
-    name: 'Dr. Elena Rostova',
-    username: 'elena.sec',
-    phone: '+41 44 580 12 90',
-    normalizedPhone: '41445801290',
-    email: 'elena@eth.ch',
-    about: 'Cryptography Researcher · ETH Zürich',
-    avatarColor: '#10B981',
-    identityFingerprint: '8F4A2C91E0B73D55A19C4820F7D631E8B45A920C11E3D84076A5C291B0E4D73A',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: true,
-    lastSeen: 'Online',
-    updatedAt: Date.now(),
-  },
-  {
-    uid: 'chat_marcus',
-    name: 'Marcus Vance',
-    username: 'mvance.webrtc',
-    phone: '+1 (415) 890-2211',
-    normalizedPhone: '14158902211',
-    email: 'marcus@simple.privacy',
-    about: 'Real-time audio/video infrastructure',
-    avatarColor: '#6366F1',
-    identityFingerprint: '3B7E92A4C108D65F29E3B10487C5A2D9E0F143B876C2D591A4E0B38271C6D94F',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: true,
-    lastSeen: 'Online',
-    updatedAt: Date.now(),
-  },
-  {
-    uid: 'usr_sora',
-    name: 'Sora Takahashi',
-    username: 'sora.compose',
-    phone: '+81 3-5555-0192',
-    normalizedPhone: '81355550192',
-    email: 'sora@android.jp',
-    about: 'Jetpack Compose & Material 3 Lead',
-    avatarColor: '#F59E0B',
-    identityFingerprint: '9D4E2A17B6C83F512A9D04E7B3C618290F4E1D2C3B4A5908F4A2C91E0B73D55A',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: true,
-    lastSeen: 'Online',
-    updatedAt: Date.now(),
-  },
-  {
-    uid: 'usr_priya',
-    name: 'Priya Sharma',
-    username: 'priya.k',
-    phone: '+91 98765 43210',
-    normalizedPhone: '919876543210',
-    email: 'priya@security.in',
-    about: 'Zero-Knowledge Systems Architect',
-    avatarColor: '#EC4899',
-    identityFingerprint: '4F82D03E71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3A91C',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: true,
-    lastSeen: 'Online',
-    updatedAt: Date.now(),
-  },
-  {
-    uid: 'usr_david',
-    name: 'David Miller',
-    username: 'david.m',
-    phone: '+44 7700 900077',
-    normalizedPhone: '447700900077',
-    email: 'david@london.uk',
-    about: 'Available on Simple E2EE',
-    avatarColor: '#06B6D4',
-    identityFingerprint: '71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3A91C4F82D03E',
-    allowUsernameDiscovery: true,
-    hidePhoneNumber: false,
-    isOnline: false,
-    lastSeen: 'Last seen 12m ago',
-    updatedAt: Date.now(),
-  },
-];
+const DB_DIR = path.join(process.cwd(), '.data');
+const DB_FILE = path.join(DB_DIR, 'simple-db.json');
 
 const userDirectory = new Map<string, DirectoryUserRecord>();
-INITIAL_DIRECTORY_USERS.forEach((u) => userDirectory.set(u.uid, u));
-
 const encryptedBackups = new Map<string, EncryptedBackupBlob>();
+const cloudAccountBackups = new Map<string, CloudAccountBackupRecord>();
 const routedMessages: Array<Record<string, unknown>> = [];
 const otpChallenges = new Map<string, OtpChallengeRecord>();
 const verifiedOwnershipTokens = new Map<string, VerifiedOwnershipToken>();
+
+function loadPersistentDatabase(): void {
+  try {
+    if (!fs.existsSync(DB_FILE)) return;
+    const raw = fs.readFileSync(DB_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.users)) {
+      parsed.users.forEach((u: DirectoryUserRecord) => {
+        if (u && u.uid) userDirectory.set(u.uid, u);
+      });
+    }
+    if (Array.isArray(parsed.accountBackups)) {
+      parsed.accountBackups.forEach(([k, v]: [string, CloudAccountBackupRecord]) => {
+        if (k && v) cloudAccountBackups.set(k, v);
+      });
+    }
+    if (Array.isArray(parsed.routedMessages)) {
+      parsed.routedMessages.slice(-500).forEach((m: Record<string, unknown>) => {
+        routedMessages.push(m);
+      });
+    }
+  } catch {
+    // Ignore corrupt or missing initial DB file
+  }
+}
+
+function savePersistentDatabase(): void {
+  try {
+    if (!fs.existsSync(DB_DIR)) {
+      fs.mkdirSync(DB_DIR, { recursive: true });
+    }
+    const payload = {
+      users: Array.from(userDirectory.values()),
+      accountBackups: Array.from(cloudAccountBackups.entries()),
+      routedMessages: routedMessages.slice(-500),
+      updatedAt: Date.now(),
+    };
+    fs.writeFileSync(DB_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+  } catch {
+    // Ignore write errors
+  }
+}
+
+loadPersistentDatabase();
 
 function normalizeTargetForOtp(channel: 'phone' | 'email', raw: string): string {
   if (channel === 'phone') {
@@ -422,24 +384,35 @@ async function startServer() {
       name,
       username,
       phone,
+      normalizedPhone,
+      phoneHash,
+      phoneTailHash,
       email,
+      emailHash,
+      passwordHash,
       about,
       avatarColor,
+      avatarUrl,
       identityFingerprint,
       allowUsernameDiscovery,
       hidePhoneNumber,
     } = req.body;
 
-    if (!uid || !phone) {
-      res.status(400).json({ error: 'uid and phone are required' });
+    if (!uid) {
+      res.status(400).json({ error: 'uid is required' });
       return;
     }
 
-    const normPhone = normalizePhoneDigits(String(phone));
+    const existing = userDirectory.get(String(uid));
+    const normPhone =
+      normalizedPhone && normalizedPhone !== 'REDACTED_SHA256'
+        ? normalizePhoneDigits(String(normalizedPhone))
+        : normalizePhoneDigits(String(phone || existing?.normalizedPhone || ''));
     const cleanUsername = String(
       username ||
+        existing?.username ||
         (email ? String(email).split('@')[0] : '') ||
-        `user.${normPhone.slice(-6)}`
+        `user.${normPhone.slice(-6) || Date.now().toString().slice(-4)}`
     )
       .toLowerCase()
       .replace(/^@/, '')
@@ -447,15 +420,21 @@ async function startServer() {
 
     const record: DirectoryUserRecord = {
       uid: String(uid),
-      name: String(name || cleanUsername),
+      name: String(name || existing?.name || cleanUsername),
       username: cleanUsername,
-      phone: String(phone),
-      normalizedPhone: normPhone,
-      email: String(email || '').toLowerCase().trim(),
-      about: String(about || 'Available on Simple E2EE'),
-      avatarColor: String(avatarColor || '#10B981'),
+      phone: String(phone || existing?.phone || ''),
+      normalizedPhone: normPhone || String(existing?.normalizedPhone || ''),
+      phoneHash: phoneHash ? String(phoneHash) : existing?.phoneHash,
+      phoneTailHash: phoneTailHash ? String(phoneTailHash) : existing?.phoneTailHash,
+      email: String(email ?? existing?.email ?? '').toLowerCase().trim(),
+      emailHash: emailHash ? String(emailHash) : existing?.emailHash,
+      passwordHash: passwordHash ? String(passwordHash) : existing?.passwordHash,
+      about: String(about || existing?.about || 'Hey there! I am using Simple.'),
+      avatarColor: String(avatarColor || existing?.avatarColor || '#10B981'),
+      avatarUrl: avatarUrl ? String(avatarUrl) : existing?.avatarUrl,
       identityFingerprint: String(
         identityFingerprint ||
+          existing?.identityFingerprint ||
           'A91C4F82D03E71B46502C8E194F307A2D5B8E1C490F2A73816D4C90B2E5F81A3'
       ),
       allowUsernameDiscovery: allowUsernameDiscovery !== false,
@@ -466,6 +445,7 @@ async function startServer() {
     };
 
     userDirectory.set(record.uid, record);
+    savePersistentDatabase();
 
     // Broadcast updated user profile to all connected clients
     wss.clients.forEach((client) => {
@@ -480,6 +460,57 @@ async function startServer() {
     });
 
     res.json({ ok: true, user: record });
+  });
+
+  // Sync saved phone contacts against registered Simple users
+  app.post('/api/contacts/sync', (req, res) => {
+    const contacts: Array<{
+      phone?: string;
+      normalizedPhone?: string;
+      phoneHash?: string;
+      phoneTailHash?: string;
+      email?: string;
+      emailHash?: string;
+    }> = Array.isArray(req.body.contacts) ? req.body.contacts : [];
+
+    const allUsers = Array.from(userDirectory.values());
+    const matchedUsers: DirectoryUserRecord[] = [];
+    const seenUids = new Set<string>();
+
+    contacts.forEach((c) => {
+      const cDigits = normalizePhoneDigits(String(c.normalizedPhone || c.phone || ''));
+      const cTail = cDigits.length >= 7 ? cDigits.slice(-10) : cDigits;
+      const cHash = c.phoneHash ? String(c.phoneHash) : '';
+      const cTailHash = c.phoneTailHash ? String(c.phoneTailHash) : '';
+      const cEmail = String(c.email || '').trim().toLowerCase();
+      const cEmailHash = c.emailHash ? String(c.emailHash) : '';
+
+      allUsers.forEach((u) => {
+        if (seenUids.has(u.uid)) return;
+        const uDigits = normalizePhoneDigits(u.normalizedPhone || u.phone || '');
+        const uTail = uDigits.length >= 7 ? uDigits.slice(-10) : uDigits;
+        const matchByHash =
+          (cHash && u.phoneHash && cHash === u.phoneHash) ||
+          (cTailHash && u.phoneTailHash && cTailHash === u.phoneTailHash) ||
+          (cEmailHash && u.emailHash && cEmailHash === u.emailHash);
+        const matchByDigits =
+          cDigits.length >= 7 &&
+          uDigits.length >= 7 &&
+          (cDigits === uDigits || cTail === uTail || uDigits.endsWith(cTail) || cDigits.endsWith(uTail));
+        const matchByEmail = Boolean(cEmail && u.email && cEmail === u.email.toLowerCase());
+
+        if (matchByHash || matchByDigits || matchByEmail) {
+          seenUids.add(u.uid);
+          matchedUsers.push(u);
+        }
+      });
+    });
+
+    res.json({
+      ok: true,
+      matchedUsers,
+      totalRegisteredUsers: allUsers.length,
+    });
   });
 
   // Search/Find user by Phone Number, @username, or Email
@@ -563,20 +594,18 @@ async function startServer() {
     res.json(blob);
   });
 
-  // Persistent Account & Chats Backup Sync (Keyed by uid, phoneHash, and emailHash)
-  const cloudAccountBackups = new Map<string, { uid: string; username: string; phoneHash?: string; emailHash?: string; backupJson: string; updatedAt: number }>();
-
   app.post('/api/account/backup', (req, res) => {
-    const { uid, username, phoneHash, emailHash, backupJson } = req.body;
+    const { uid, username, phoneHash, emailHash, passwordHash, backupJson } = req.body;
     if (!uid || !backupJson) {
       res.status(400).json({ ok: false, error: 'uid and backupJson are required' });
       return;
     }
-    const record = {
+    const record: CloudAccountBackupRecord = {
       uid: String(uid),
       username: String(username || 'user'),
       phoneHash: phoneHash ? String(phoneHash) : undefined,
       emailHash: emailHash ? String(emailHash) : undefined,
+      passwordHash: passwordHash ? String(passwordHash) : undefined,
       backupJson: String(backupJson),
       updatedAt: Date.now(),
     };
@@ -587,6 +616,7 @@ async function startServer() {
     if (record.emailHash) {
       cloudAccountBackups.set(`em_${record.emailHash}`, record);
     }
+    savePersistentDatabase();
     res.json({ ok: true, updatedAt: record.updatedAt });
   });
 
@@ -625,6 +655,7 @@ async function startServer() {
 
         if (packet.type === 'chat:message') {
           routedMessages.push(packet);
+          savePersistentDatabase();
         }
 
         // Broadcast packet to all other connected clients (supports multi-tab/multi-user messaging by phone/username/email)

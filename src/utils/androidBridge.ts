@@ -20,6 +20,15 @@ export function isAndroidApkEnvironment(): boolean {
   return false;
 }
 
+export const isAndroidApkRuntime = isAndroidApkEnvironment;
+
+export function getRemoteServerOrigin(): string {
+  if (typeof window === 'undefined' || isAndroidApkEnvironment()) {
+    return CLOUD_BACKEND_ORIGIN;
+  }
+  return window.location.origin;
+}
+
 export function getRealtimeWebSocketUrl(): string {
   if (typeof window === 'undefined') return 'ws://localhost:3000/ws';
   if (isAndroidApkEnvironment()) {

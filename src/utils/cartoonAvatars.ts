@@ -824,31 +824,12 @@ export const AVATAR_3D_BY_ID: Record<string, string> = Object.fromEntries(
 /**
  * Automatically replaces any legacy real-life person Unsplash URL with a 3D Cartoon Avatar
  */
-export function ensure3DCartoonAvatarUrl(url?: string, nameOrId?: string): string {
-  const key = (nameOrId || '').toLowerCase();
-  const isLegacyUnsplash = !url || url.includes('images.unsplash.com');
-
-  if (!isLegacyUnsplash && url) {
-    return url;
+export function ensure3DCartoonAvatarUrl(url?: string, _nameOrId?: string): string | undefined {
+  if (!url) return undefined;
+  if (url.includes('images.unsplash.com')) {
+    return undefined;
   }
-
-  if (key.includes('elena')) return AVATAR_3D_BY_ID.elena_3d;
-  if (key.includes('marcus') || key.includes('mvance')) return AVATAR_3D_BY_ID.marcus_3d;
-  if (key.includes('sora')) return AVATAR_3D_BY_ID.sora_3d;
-  if (key.includes('priya')) return AVATAR_3D_BY_ID.priya_3d;
-  if (key.includes('david')) return AVATAR_3D_BY_ID.david_3d;
-  if (key.includes('team') || key.includes('group') || key.includes('archive')) {
-    return AVATAR_3D_BY_ID.team_group_3d;
-  }
-  if (key.includes('source') || key.includes('vault')) return AVATAR_3D_BY_ID.astro_3d;
-  if (key.includes('alex') || key.includes('usr_self')) return AVATAR_3D_BY_ID.alex_3d;
-
-  // Deterministic pick from CARTOON_3D_AVATARS
-  let hash = 0;
-  for (let i = 0; i < key.length; i++) {
-    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-  }
-  return CARTOON_3D_AVATARS[hash % CARTOON_3D_AVATARS.length].url;
+  return url;
 }
 
 export function getDeterministic3DAvatar(seed: string): CartoonAvatarPreset {

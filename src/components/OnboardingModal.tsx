@@ -125,6 +125,16 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     settings?: Partial<AppSettings>;
   } | null>(null);
   const [autoRestoreOnVerify, setAutoRestoreOnVerify] = useState(true);
+  const [accountMode, setAccountMode] = useState<'register' | 'login'>('register');
+  const [passwordInput, setPasswordInput] = useState('');
+
+  const sha256Hex = async (text: string): Promise<string> => {
+    const encoded = new TextEncoder().encode(text.trim());
+    const buf = await crypto.subtle.digest('SHA-256', encoded);
+    return Array.from(new Uint8Array(buf))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  };
 
   // Check database for existing account by phone or email
   const checkDatabaseForExistingAccount = async () => {
@@ -384,9 +394,109 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
   };
 
+  const finalizeAccountSetup = async (customCloudGmail?: string) => {
+    const trimmedName = nameInput.trim();
+    if (!trimmedName) {
+      setOtpErrorMsg('Please enter your display name to create your account.');
+      setStepIdx(4);
+      return;
+    }
+
+    const finalPhone = authMethod !== 'gmail_otp' ? phoneInput.trim() : '';
+    const normPhone = normalizePhone(finalPhone);
+    const finalEmail =
+      customCloudGmail ||
+      (authMethod !== 'phone_otp' ? emailInput.trim().toLowerCase() : '');
+    const finalUsername =
+      usernameInput.trim().toLowerCase().replace(/^@/, '') ||
+      generateDefaultUsername(trimmedName, finalPhone, finalEmail);
+
+    const deterministicUid =
+      account.id && account.id.trim().length > 0
+        ? account.id
+        : normPhone.length >= 7
+        ? `usr_${normPhone}`
+        : finalEmail
+        ? `usr_${finalEmail.replace(/[^a-z0-9]/g, '_')}`
+        : `usr_${Date.now().toString(36)}`;
+
+    const phoneHash = normPhone.length >= 7 ? await sha256Hex(normPhone) : '';
+    const phoneTailHash =
+      normPhone.length >= 7 ? await sha256Hex(normPhone.slice(-10)) : '';
+    const emailHash = finalEmail.includes('@') ? await sha256Hex(finalEmail) : '';
+    const passwordHash = passwordInput.trim()
+      ? await sha256Hex(passwordInput.trim())
+      : '';
+
+    try {
+      await apiFetch('/api/directory/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: deterministicUid,
+          name: trimmedName,
+          username: finalUsername,
+          phone: finalPhone,
+          normalizedPhone: normPhone,
+          phoneHash,
+          phoneTailHash,
+          email: finalEmail,
+          emailHash,
+          passwordHash,
+          about: aboutInput.trim() || 'Hey there! I am using Simple.',
+          avatarColor,
+          avatarUrl: avatarUrlInput,
+          identityFingerprint: localFingerprint,
+          allowUsernameDiscovery: allowDiscovery,
+          hidePhoneNumber: hidePhone,
+        }),
+      });
+    } catch {
+      // Offline fallback handled by App.tsx sync
+    }
+
+    onComplete(
+      {
+        ...account,
+        id: deterministicUid,
+        name: trimmedName,
+        username: finalUsername,
+        phone: finalPhone,
+        normalizedPhone: normPhone,
+        email: finalEmail,
+        authMethod:
+          finalPhone && finalEmail ? 'both' : finalPhone ? 'phone_otp' : 'gmail_otp',
+        phoneVerified: Boolean(finalPhone),
+        emailVerified: Boolean(finalEmail),
+        about: aboutInput.trim() || 'Hey there! I am using Simple.',
+        avatarColor,
+        avatarUrl: avatarUrlInput,
+        allowUsernameDiscovery: allowDiscovery,
+        hidePhoneNumber: hidePhone,
+        onboardingCompleted: true,
+      },
+      {
+        profilePhotoVisibility: photoVisibilityInput,
+        contactsPermissionGranted: contactsPerm,
+        notificationsPermissionGranted: notifPerm,
+        privateNotificationsMode: privateNotif,
+        microphonePermissionGranted: micPerm,
+        cameraPermissionGranted: camPerm,
+        biometricsEnabled: bioEnabled,
+        appLockPin: pinCode || '2580',
+        chatLockPin: pinCode || '2580',
+        appLockMethod: enableAppPin ? 'pin' : bioEnabled ? 'biometric' : 'none',
+        backupMode: backupChoice,
+        cloudBackupProvider,
+        cloudBackupGmail: customCloudGmail || settings.cloudBackupGmail,
+        cloudBackupGmailVerified: Boolean(customCloudGmail),
+      }
+    );
+  };
+
   const nextStep = async () => {
     if (stepIdx === 2) {
-      checkDatabaseForExistingAccount();
+      await checkDatabaseForExistingAccount();
       const dispatched = await handleDispatchOnboardingOtps();
       if (!dispatched) return;
       setStepIdx(3);
@@ -397,7 +507,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       const verified = await handleVerifyOnboardingOtps();
       if (!verified) return;
 
-      if (existingAccountFound && autoRestoreOnVerify) {
+      if (existingAccountFound && (autoRestoreOnVerify || accountMode === 'login')) {
         if (existingAccountFound.name) setNameInput(existingAccountFound.name);
         if (existingAccountFound.username) setUsernameInput(existingAccountFound.username);
         const cleanPhone = authMethod !== 'gmail_otp' ? phoneInput.trim() : '';
@@ -406,8 +516,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         onComplete(
           {
             ...account,
-            id: existingAccountFound.uid || account.id,
-            name: existingAccountFound.name || nameInput.trim() || 'User',
+            id:
+              existingAccountFound.uid ||
+              account.id ||
+              `usr_${normalizePhone(cleanPhone) || Date.now()}`,
+            name: existingAccountFound.name || nameInput.trim() || 'Simple User',
             username: existingAccountFound.username,
             phone: cleanPhone,
             normalizedPhone: normalizePhone(cleanPhone),
@@ -433,9 +546,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       return;
     }
 
-    if (stepIdx < STEPS.length - 1) {
-      // Auto-suggest username from phone/email when entering Step 6 (idx 5)
-      if (stepIdx === 4 && !usernameInput.trim()) {
+    if (stepIdx === 4) {
+      if (!nameInput.trim()) {
+        setOtpErrorMsg('Please enter your real display name to continue.');
+        return;
+      }
+      setOtpErrorMsg(null);
+      if (!usernameInput.trim()) {
         setUsernameInput(
           generateDefaultUsername(
             nameInput,
@@ -444,6 +561,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           )
         );
       }
+      setStepIdx(5);
+      return;
+    }
+
+    if (stepIdx < STEPS.length - 1) {
       setStepIdx((s) => s + 1);
     } else {
       // Step 13 (Final Step: Encrypted Backup)
@@ -454,56 +576,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
       if (backupChoice === 'cloud_e2ee') {
         if (!verifiedCloudGmail) {
-          // User created account with Phone Number only, so they MUST verify their Gmail for Cloud Backup!
           const ok = await handleVerifyBackupGmailOtp();
           if (!ok) return;
           verifiedCloudGmail = backupGmailInput.trim().toLowerCase();
         }
       }
 
-      const finalPhone = authMethod !== 'gmail_otp' ? phoneInput.trim() : '';
-      const finalEmail =
-        verifiedCloudGmail ||
-        (authMethod !== 'phone_otp' ? emailInput.trim().toLowerCase() : '');
-      const finalUsername =
-        usernameInput.trim().toLowerCase().replace(/^@/, '') ||
-        generateDefaultUsername(nameInput, finalPhone, finalEmail);
-
-      onComplete(
-        {
-          ...account,
-          name: nameInput.trim() || 'Alex Rivera',
-          username: finalUsername,
-          phone: finalPhone,
-          normalizedPhone: normalizePhone(finalPhone),
-          email: finalEmail,
-          authMethod: finalPhone && finalEmail ? 'both' : finalPhone ? 'phone_otp' : 'gmail_otp',
-          phoneVerified: Boolean(finalPhone),
-          emailVerified: Boolean(finalEmail),
-          about: aboutInput.trim() || 'Available on Simple E2EE',
-          avatarColor,
-          avatarUrl: avatarUrlInput,
-          allowUsernameDiscovery: allowDiscovery,
-          hidePhoneNumber: hidePhone,
-          onboardingCompleted: true,
-        },
-        {
-          profilePhotoVisibility: photoVisibilityInput,
-          contactsPermissionGranted: contactsPerm,
-          notificationsPermissionGranted: notifPerm,
-          privateNotificationsMode: privateNotif,
-          microphonePermissionGranted: micPerm,
-          cameraPermissionGranted: camPerm,
-          biometricsEnabled: bioEnabled,
-          appLockPin: pinCode || '2580',
-          chatLockPin: pinCode || '2580',
-          appLockMethod: enableAppPin ? 'pin' : bioEnabled ? 'biometric' : 'none',
-          backupMode: backupChoice,
-          cloudBackupProvider,
-          cloudBackupGmail: verifiedCloudGmail || settings.cloudBackupGmail,
-          cloudBackupGmailVerified: Boolean(verifiedCloudGmail),
-        }
-      );
+      await finalizeAccountSetup(verifiedCloudGmail);
     }
   };
 
@@ -552,10 +631,33 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               </div>
               <h2 className="text-2xl font-bold tracking-tight">Welcome to Simple</h2>
               <p className="text-sm text-slate-300 leading-relaxed">
-                A modern, fast, private native Android messenger created by <strong>Dr. M Verma</strong>. Enjoy 100% ad-free chatting, no tracking, and automatic end-to-end protection for all your messages, statuses, and calls.
+                A modern, fast, private native Android messenger created by <strong>Dr. M Verma</strong>. Create your real account or sign in to sync your phone contacts, chat with friends on Simple, or invite anyone via WhatsApp APK share.
               </p>
               <div className="rounded-xl bg-slate-950 border border-slate-800 p-3.5 text-xs text-emerald-400 font-medium">
-                🔒 Your messages & calls are private by default
+                🔒 End-to-End Encrypted · Real-Time Messaging & Calls
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAccountMode('register');
+                    setStepIdx(2);
+                  }}
+                  className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                >
+                  <span>Create New Account</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAccountMode('login');
+                    setStepIdx(2);
+                  }}
+                  className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white text-xs font-bold flex items-center justify-center gap-2"
+                >
+                  <span>Sign In to Existing Account</span>
+                </button>
               </div>
             </div>
           )}
@@ -580,30 +682,37 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
           {stepIdx === 2 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-xl font-bold tracking-tight">Create Account (Phone OTP or Gmail OTP)</h2>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPhoneInput('');
-                    setEmailInput('');
-                    setNameInput('');
-                    setUsernameInput('');
-                    setAvatarUrlInput(undefined);
-                    setIsPhoneOtpVerified(false);
-                    setIsEmailOtpVerified(false);
-                    setDispatchedPhoneOtp(null);
-                    setDispatchedEmailOtp(null);
-                    setExistingAccountFound(null);
-                    setOtpErrorMsg(null);
-                  }}
-                  className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-[11px] font-medium text-cyan-300"
-                >
-                  New Blank Account
-                </button>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-lg sm:text-xl font-bold tracking-tight">
+                  {accountMode === 'login' ? 'Sign In to Your Account' : 'Create Your Account'}
+                </h2>
+                <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setAccountMode('register')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${
+                      accountMode === 'register'
+                        ? 'bg-emerald-500 text-slate-950'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    New Account
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAccountMode('login')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${
+                      accountMode === 'login'
+                        ? 'bg-cyan-500 text-slate-950'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Sign In
+                  </button>
+                </div>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Choose how you want to create your account: <strong>Phone Number with SMS OTP</strong> or <strong>Gmail with Email OTP</strong> (or both). Note: If you choose Cloud Backup later, a verified <strong>@gmail.com</strong> account will be required to back up on Google Drive or Gmail.
+                Enter your real <strong>Mobile Phone Number</strong> or <strong>Gmail Address</strong>. Your account credentials are saved in the database so your contacts on Simple can find and message you immediately.
               </p>
 
               {/* Account Creation Method Selector */}
@@ -613,17 +722,17 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     {
                       id: 'phone_otp',
                       title: '📱 Phone + OTP',
-                      sub: 'Mobile number only',
+                      sub: 'Mobile number',
                     },
                     {
                       id: 'gmail_otp',
                       title: '✉️ Gmail + OTP',
-                      sub: '@gmail.com only',
+                      sub: '@gmail.com',
                     },
                     {
                       id: 'both',
                       title: '🔐 Phone & Gmail',
-                      sub: 'Verify both with OTP',
+                      sub: 'Verify both',
                     },
                   ] as const
                 ).map((mode) => (
@@ -650,7 +759,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 {(authMethod === 'phone_otp' || authMethod === 'both') && (
                   <div>
                     <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Mobile Phone Number (6-Digit SMS OTP Required)
+                      Mobile Phone Number (with Country Code)
                     </label>
                     <input
                       type="tel"
@@ -661,7 +770,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         setDispatchedPhoneOtp(null);
                         setOtpErrorMsg(null);
                       }}
-                      placeholder="+1 (415) 890-4319"
+                      placeholder="+91 98765 43210"
                       className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm font-mono text-cyan-300 focus:outline-none focus:border-emerald-500"
                     />
                   </div>
@@ -671,7 +780,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <div>
                     <div className="flex items-center justify-between mb-1">
                       <label className="block text-xs font-medium text-slate-300">
-                        Gmail Address (@gmail.com · 6-Digit Email OTP Required)
+                        Gmail Address (@gmail.com)
                       </label>
                       {emailInput && !emailInput.includes('@') && (
                         <button
@@ -695,11 +804,25 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       placeholder="yourname@gmail.com"
                       className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
                     />
-                    <p className="text-[11px] text-slate-400 mt-1">
-                      Also used for encrypted Cloud Backup to Google Drive & Gmail.
-                    </p>
                   </div>
                 )}
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Account Password (Saved Encrypted to Database)
+                  </label>
+                  <input
+                    type="password"
+                    value={passwordInput}
+                    onChange={(e) => setPasswordInput(e.target.value)}
+                    placeholder={
+                      accountMode === 'login'
+                        ? 'Enter your account password (or verify via OTP)'
+                        : 'Create a password for your account'
+                    }
+                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
               </div>
               {existingAccountFound && (
                 <div className="p-3.5 rounded-2xl bg-cyan-500/15 border border-cyan-500/40 text-xs space-y-1">
@@ -937,12 +1060,17 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
               <div className="space-y-3">
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Display Name</label>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Full Name / Display Name <span className="text-emerald-400">*</span>
+                  </label>
                   <input
                     type="text"
                     value={nameInput}
-                    onChange={(e) => setNameInput(e.target.value)}
-                    placeholder="Enter your name"
+                    onChange={(e) => {
+                      setNameInput(e.target.value);
+                      setOtpErrorMsg(null);
+                    }}
+                    placeholder="Enter your real name"
                     className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
                   />
                 </div>
@@ -952,10 +1080,27 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     type="text"
                     value={aboutInput}
                     onChange={(e) => setAboutInput(e.target.value)}
-                    placeholder="Available on Simple E2EE"
+                    placeholder="Hey there! I am using Simple."
                     className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
                   />
                 </div>
+              </div>
+
+              {otpErrorMsg && (
+                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300">
+                  {otpErrorMsg}
+                </div>
+              )}
+
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={() => finalizeAccountSetup()}
+                  className="w-full min-h-[44px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Save Account to Database & Open Chats</span>
+                </button>
               </div>
             </div>
           )}
@@ -1005,6 +1150,16 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   className="w-4 h-4 accent-emerald-500"
                 />
               </label>
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={() => finalizeAccountSetup()}
+                  className="w-full min-h-[44px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Complete Account & Start Chatting</span>
+                </button>
+              </div>
             </div>
           )}
 
