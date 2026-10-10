@@ -1,0 +1,135 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidSha256Hex(hash) {
+      return hash is string && hash.size() >= 16 && hash.size() <= 64 && hash.matches('^[a-fA-F0-9]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidDirectoryProfile(data) {
+      return data.keys().hasAll([
+        'uid', 'name', 'username', 'phone', 'normalizedPhone',
+        'about', 'avatarColor', 'identityFingerprint',
+        'allowUsernameDiscovery', 'hidePhoneNumber', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid', 'name', 'username', 'phone', 'normalizedPhone',
+        'phoneHash', 'phoneTailHash', 'email', 'emailHash',
+        'about', 'avatarColor', 'identityFingerprint',
+        'allowUsernameDiscovery', 'hidePhoneNumber', 'isOnline', 'lastSeen', 'updatedAt'
+      ]) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+      data.username is string && data.username.size() >= 1 && data.username.size() <= 40 &&
+      data.phone is string && data.phone.size() >= 1 && data.phone.size() <= 32 &&
+      data.normalizedPhone is string && data.normalizedPhone.size() >= 1 && data.normalizedPhone.size() <= 32 &&
+      (!('phoneHash' in data) || (data.phoneHash is string && data.phoneHash.size() <= 64)) &&
+      (!('phoneTailHash' in data) || (data.phoneTailHash is string && data.phoneTailHash.size() <= 64)) &&
+      (!('email' in data) || (data.email is string && data.email.size() <= 120)) &&
+      (!('emailHash' in data) || (data.emailHash is string && data.emailHash.size() <= 64)) &&
+      data.about is string && data.about.size() <= 160 &&
+      data.avatarColor is string && data.avatarColor.size() <= 16 &&
+      data.identityFingerprint is string && data.identityFingerprint.size() <= 128 &&
+      data.allowUsernameDiscovery is bool &&
+      data.hidePhoneNumber is bool &&
+      data.updatedAt is number;
+    }
+
+    function isValidPhoneIndexEntry(data) {
+      return data.keys().hasAll([
+        'phoneHash', 'phoneTailHash', 'targetUid', 'username',
+        'name', 'avatarColor', 'identityFingerprint', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'phoneHash', 'phoneTailHash', 'targetUid', 'username',
+        'name', 'avatarColor', 'identityFingerprint', 'updatedAt'
+      ]) &&
+      isValidSha256Hex(data.phoneHash) &&
+      isValidSha256Hex(data.phoneTailHash) &&
+      isValidId(data.targetUid) &&
+      data.username is string && data.username.size() >= 1 && data.username.size() <= 40 &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+      data.avatarColor is string && data.avatarColor.size() <= 16 &&
+      data.identityFingerprint is string && data.identityFingerprint.size() <= 128 &&
+      data.updatedAt is number;
+    }
+
+    function isValidRelayMessage(data) {
+      return data.keys().hasAll([
+        'id', 'threadKey', 'senderUid', 'senderName',
+        'recipientUid', 'text', 'timestamp', 'ciphertextBase64', 'ivHex'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'threadKey', 'senderUid', 'senderName',
+        'senderPhone', 'senderPhoneHash', 'senderUsername',
+        'recipientUid', 'recipientNormalizedPhone', 'recipientPhoneHash',
+        'text', 'timestamp', 'ciphertextBase64', 'ivHex'
+      ]) &&
+      data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+      data.threadKey is string && data.threadKey.size() >= 1 && data.threadKey.size() <= 160 &&
+      data.senderUid is string && data.senderUid.size() >= 1 && data.senderUid.size() <= 128 &&
+      data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 80 &&
+      data.recipientUid is string && data.recipientUid.size() >= 1 && data.recipientUid.size() <= 128 &&
+      (!('senderPhoneHash' in data) || (data.senderPhoneHash is string && data.senderPhoneHash.size() <= 64)) &&
+      (!('recipientPhoneHash' in data) || (data.recipientPhoneHash is string && data.recipientPhoneHash.size() <= 64)) &&
+      data.text is string && data.text.size() <= 4000 &&
+      data.timestamp is number &&
+      data.ciphertextBase64 is string && data.ciphertextBase64.size() <= 8000 &&
+      data.ivHex is string && data.ivHex.size() <= 64;
+    }
+
+    match /directory/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if request.query.limit == null || request.query.limit <= 500;
+      allow create: if isValidId(userId) && isValidDirectoryProfile(incoming()) && incoming().uid == userId;
+      allow update: if isValidId(userId) && isValidDirectoryProfile(incoming()) && incoming().uid == existing().uid;
+    }
+
+    match /phone_index/{phoneHash} {
+      allow get: if isValidSha256Hex(phoneHash);
+      allow list: if request.query.limit == null || request.query.limit <= 500;
+      allow create: if isValidSha256Hex(phoneHash) && isValidPhoneIndexEntry(incoming()) && incoming().phoneHash == phoneHash;
+      allow update: if isValidSha256Hex(phoneHash) && isValidPhoneIndexEntry(incoming()) && incoming().phoneHash == existing().phoneHash;
+    }
+
+    match /relay_messages/{messageId} {
+      allow get: if isValidId(messageId);
+      allow list: if request.query.limit == null || request.query.limit <= 500;
+      allow create: if isValidId(messageId) && isValidRelayMessage(incoming()) && incoming().id == messageId;
+      allow delete: if isValidId(messageId);
+    }
+
+    function isValidAccountBackup(data) {
+      return data.keys().hasAll(['uid', 'username', 'backupJson', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'phoneHash', 'emailHash', 'username', 'backupJson', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+        (!('phoneHash' in data) || (data.phoneHash is string && data.phoneHash.size() <= 64)) &&
+        (!('emailHash' in data) || (data.emailHash is string && data.emailHash.size() <= 64)) &&
+        data.username is string && data.username.size() >= 1 && data.username.size() <= 40 &&
+        data.backupJson is string && data.backupJson.size() >= 2 && data.backupJson.size() <= 950000 &&
+        data.updatedAt is number;
+    }
+
+    match /account_backups/{backupId} {
+      allow get: if isValidId(backupId);
+      allow list: if request.query.limit == null || request.query.limit <= 100;
+      allow create: if isValidId(backupId) && isValidAccountBackup(incoming());
+      allow update: if isValidId(backupId) && isValidAccountBackup(incoming());
+    }
+  }
+}

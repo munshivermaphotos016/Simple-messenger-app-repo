@@ -1,0 +1,296 @@
+{
+  "entities": {
+    "UserDirectoryProfile": {
+      "title": "UserDirectoryProfile",
+      "description": "Privacy-preserving public directory profile indexed by SHA-256 phoneHash, phoneTailHash, and emailHash without revealing raw phone numbers in plaintext.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "phone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Masked phone indicator (e.g., +•• •••• ••19) so raw phone numbers are never stored in plaintext in Firestore."
+        },
+        "normalizedPhone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Redacted token or masked suffix; raw normalized phone digits are replaced by phoneHash."
+        },
+        "phoneHash": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]+$",
+          "description": "SHA-256 hex digest of the normalized mobile phone number."
+        },
+        "phoneTailHash": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]+$",
+          "description": "SHA-256 hex digest of the last 10 digits for country-code-agnostic mobile matching."
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "emailHash": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "about": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "avatarColor": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "identityFingerprint": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "allowUsernameDiscovery": {
+          "type": "boolean"
+        },
+        "hidePhoneNumber": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "uid",
+        "name",
+        "username",
+        "phone",
+        "normalizedPhone",
+        "phoneHash",
+        "phoneTailHash",
+        "email",
+        "about",
+        "avatarColor",
+        "identityFingerprint",
+        "allowUsernameDiscovery",
+        "hidePhoneNumber",
+        "updatedAt"
+      ]
+    },
+    "PhoneHashIndexEntry": {
+      "title": "PhoneHashIndexEntry",
+      "description": "Maps a SHA-256 normalized phone number hash directly to the user's directory UID without storing plaintext phone numbers.",
+      "type": "object",
+      "properties": {
+        "phoneHash": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]+$"
+        },
+        "phoneTailHash": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]+$"
+        },
+        "targetUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "avatarColor": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "identityFingerprint": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "phoneHash",
+        "phoneTailHash",
+        "targetUid",
+        "username",
+        "name",
+        "avatarColor",
+        "identityFingerprint",
+        "updatedAt"
+      ]
+    },
+    "EncryptedRelayMessage": {
+      "title": "EncryptedRelayMessage",
+      "description": "End-to-end encrypted message envelope routed between users by UID or SHA-256 phoneHash.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "threadKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "senderUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "senderName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "senderPhone": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "senderPhoneHash": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "senderUsername": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "recipientUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "recipientNormalizedPhone": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "recipientPhoneHash": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "timestamp": {
+          "type": "number"
+        },
+        "ciphertextBase64": {
+          "type": "string",
+          "maxLength": 8000
+        },
+        "ivHex": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "id",
+        "threadKey",
+        "senderUid",
+        "senderName",
+        "recipientUid",
+        "text",
+        "timestamp",
+        "ciphertextBase64",
+        "ivHex"
+      ]
+    },
+    "AccountCloudBackup": {
+      "title": "AccountCloudBackup",
+      "description": "Cloud account and chat backup indexed by user UID or SHA-256 phone/email hash for seamless account recovery.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "phoneHash": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "emailHash": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "username": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "backupJson": {
+          "type": "string",
+          "maxLength": 900000
+        },
+        "updatedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "uid",
+        "username",
+        "backupJson",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/directory/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserDirectoryProfile"
+      },
+      "description": "Global user directory indexed by UID and SHA-256 phoneHash/emailHash without plaintext phone numbers."
+    },
+    "/phone_index/{phoneHash}": {
+      "schema": {
+        "$ref": "#/entities/PhoneHashIndexEntry"
+      },
+      "description": "O(1) privacy-preserving mapping from SHA-256 normalized phone hash to directory UID."
+    },
+    "/relay_messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/EncryptedRelayMessage"
+      },
+      "description": "End-to-end encrypted message relay queue."
+    },
+    "/account_backups/{backupId}": {
+      "schema": {
+        "$ref": "#/entities/AccountCloudBackup"
+      },
+      "description": "Account and chat recovery backup records."
+    }
+  }
+}

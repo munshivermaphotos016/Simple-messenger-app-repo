@@ -1,0 +1,56 @@
+{
+  "id": "/",
+  "name": "Simple — Private Encrypted Messenger",
+  "short_name": "Simple",
+  "description": "Signal-grade end-to-end encrypted messaging, voice/video calls, and private communication for Android. Created by Dr. M Verma.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "fullscreen"],
+  "orientation": "portrait",
+  "background_color": "#0A0E14",
+  "theme_color": "#0A0E14",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Chats",
+      "short_name": "Chats",
+      "description": "Open chat conversations",
+      "url": "/?tab=chats",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Calls",
+      "short_name": "Calls",
+      "description": "Open voice and video calls",
+      "url": "/?tab=calls",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Status",
+      "short_name": "Status",
+      "description": "View and share 24h status updates",
+      "url": "/?tab=status",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    }
+  ]
+}

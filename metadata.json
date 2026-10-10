@@ -1,0 +1,6 @@
+{
+  "name": "Simple",
+  "description": "Privacy-first end-to-end encrypted messaging, audio/video calling, and private communication application designed for Android and cross-platform security.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
