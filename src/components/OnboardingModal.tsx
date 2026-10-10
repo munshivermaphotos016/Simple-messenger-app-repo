@@ -18,6 +18,7 @@ import { AppSettings, AudienceVisibility, UserAccount } from '../types/simple';
 import { generateDefaultUsername, normalizePhone } from '../data/initialState';
 import { recoverCloudAccountBackup } from '../firebase';
 import { InlineProfilePhotoEditor, PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
+import { apiFetch } from '../utils/androidBridge';
 
 interface OnboardingModalProps {
   account: UserAccount;
@@ -135,7 +136,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       const qParams = new URLSearchParams();
       if (normPhone.length >= 7) qParams.set('phoneHash', normPhone);
       if (cleanEmail.includes('@')) qParams.set('emailHash', cleanEmail);
-      const res = await fetch(`/api/account/recover?${qParams.toString()}`);
+      const res = await apiFetch(`/api/account/recover?${qParams.toString()}`);
       if (res.ok) {
         const data = await res.json();
         if (data?.backupJson) {
@@ -197,7 +198,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     setIsBusyOtp(true);
     try {
       if (needPhone && !isPhoneOtpVerified) {
-        const res = await fetch('/api/auth/request-otp', {
+        const res = await apiFetch('/api/auth/request-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ channel: 'phone', target: phoneInput.trim() }),
@@ -212,7 +213,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       }
 
       if (needGmail && !isEmailOtpVerified) {
-        const res = await fetch('/api/auth/request-otp', {
+        const res = await apiFetch('/api/auth/request-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ channel: 'email', target: emailInput.trim().toLowerCase() }),
@@ -252,13 +253,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           setIsBusyOtp(false);
           return false;
         }
-        const res = await fetch('/api/auth/request-otp-check-or-verify', {
+        const res = await apiFetch('/api/auth/request-otp-check-or-verify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }).catch(() => null);
         void res;
-        const vRes = await fetch('/api/auth/verify-otp', {
+        const vRes = await apiFetch('/api/auth/verify-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -282,7 +283,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           setIsBusyOtp(false);
           return false;
         }
-        const vRes = await fetch('/api/auth/verify-otp', {
+        const vRes = await apiFetch('/api/auth/verify-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -322,7 +323,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
     setIsBusyOtp(true);
     try {
-      const res = await fetch('/api/auth/request-otp', {
+      const res = await apiFetch('/api/auth/request-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -356,7 +357,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
     setIsBusyOtp(true);
     try {
-      const res = await fetch('/api/auth/verify-otp', {
+      const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

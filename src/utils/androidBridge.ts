@@ -320,78 +320,100 @@ async function handleLocalApiFallback(
   return jsonResponse({ ok: true });
 }
 
+const nativeFetch: typeof fetch =
+  typeof window !== 'undefined' && typeof window.fetch === 'function'
+    ? window.fetch.bind(window)
+    : fetch;
+
+export async function apiFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  const urlStr =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+
+  const isApiCall = urlStr.startsWith('/api/') || urlStr.includes('/api/');
+  if (!isApiCall) {
+    return nativeFetch(input, init);
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(urlStr, 'https://simple.local');
+  } catch {
+    return nativeFetch(input, init);
+  }
+
+  if (!parsedUrl.pathname.startsWith('/api/')) {
+    return nativeFetch(input, init);
+  }
+
+  const method = (init?.method || 'GET').toUpperCase();
+  let bodyObj: Record<string, unknown> = {};
+  if (init?.body && typeof init.body === 'string') {
+    try {
+      bodyObj = JSON.parse(init.body);
+    } catch {
+      bodyObj = {};
+    }
+  }
+
+  // When running inside a native Android APK (file:// or Capacitor localhost),
+  // try the cloud backend first with a short timeout, then fall back to the local on-device handler.
+  if (isAndroidApkEnvironment()) {
+    try {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 3500);
+      const cloudUrl = `${CLOUD_BACKEND_ORIGIN}${parsedUrl.pathname}${parsedUrl.search}`;
+      const res = await nativeFetch(cloudUrl, {
+        ...init,
+        signal: controller.signal,
+      });
+      window.clearTimeout(timer);
+      if (res.ok || res.status === 400 || res.status === 429) {
+        return res;
+      }
+    } catch {
+      // Cloud backend unreachable or offline; fall back to local on-device handler below
+    }
+    return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
+  }
+
+  // When running in browser/web mode, call nativeFetch first, and fall back to local on-device handler if offline
+  try {
+    const res = await nativeFetch(input, init);
+    if (res.ok || res.status === 400 || res.status === 404 || res.status === 429) {
+      return res;
+    }
+    return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
+  } catch {
+    return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
+  }
+}
+
 let bridgeInstalled = false;
 
 export function installAndroidApkNetworkBridge(): void {
   if (typeof window === 'undefined' || bridgeInstalled) return;
   bridgeInstalled = true;
 
-  const originalFetch = window.fetch.bind(window);
-
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const urlStr =
-      typeof input === 'string'
-        ? input
-        : input instanceof URL
-        ? input.toString()
-        : input.url;
-
-    const isApiCall = urlStr.startsWith('/api/') || urlStr.includes('/api/');
-    if (!isApiCall) {
-      return originalFetch(input, init);
-    }
-
-    let parsedUrl: URL;
+  // Only attempt to override window.fetch inside native Android APK file:// runtime if writable
+  if (isAndroidApkEnvironment()) {
     try {
-      parsedUrl = new URL(urlStr, 'https://simple.local');
-    } catch {
-      return originalFetch(input, init);
-    }
-
-    if (!parsedUrl.pathname.startsWith('/api/')) {
-      return originalFetch(input, init);
-    }
-
-    const method = (init?.method || 'GET').toUpperCase();
-    let bodyObj: Record<string, unknown> = {};
-    if (init?.body && typeof init.body === 'string') {
-      try {
-        bodyObj = JSON.parse(init.body);
-      } catch {
-        bodyObj = {};
-      }
-    }
-
-    // When running inside a native Android APK (file:// or Capacitor localhost),
-    // try the cloud backend first with a short timeout, then fall back to the local on-device handler.
-    if (isAndroidApkEnvironment()) {
-      try {
-        const controller = new AbortController();
-        const timer = window.setTimeout(() => controller.abort(), 3500);
-        const cloudUrl = `${CLOUD_BACKEND_ORIGIN}${parsedUrl.pathname}${parsedUrl.search}`;
-        const res = await originalFetch(cloudUrl, {
-          ...init,
-          signal: controller.signal,
+      const desc = Object.getOwnPropertyDescriptor(window, 'fetch');
+      if (!desc || desc.writable || desc.configurable) {
+        Object.defineProperty(window, 'fetch', {
+          value: apiFetch,
+          configurable: true,
+          writable: true,
         });
-        window.clearTimeout(timer);
-        if (res.ok || res.status === 400 || res.status === 429) {
-          return res;
-        }
-      } catch {
-        // Cloud backend unreachable or offline; fall back to local on-device handler below
       }
-      return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
-    }
-
-    // When running in browser/web mode, call originalFetch first, and fall back to local on-device handler if offline
-    try {
-      const res = await originalFetch(input, init);
-      if (res.ok || res.status === 400 || res.status === 404 || res.status === 429) {
-        return res;
-      }
-      return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
     } catch {
-      return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
+      // Safe fallback: apiFetch is already called directly across all /api/* requests
     }
-  };
+  }
 }

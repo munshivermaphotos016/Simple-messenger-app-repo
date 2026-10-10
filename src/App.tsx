@@ -110,7 +110,7 @@ import {
 } from './utils/soundEffects';
 import { ensure3DCartoonAvatarUrl } from './utils/cartoonAvatars';
 import { AndroidInstallButton } from './hooks/usePWAInstall';
-import { getRealtimeWebSocketUrl } from './utils/androidBridge';
+import { apiFetch, getRealtimeWebSocketUrl } from './utils/androidBridge';
 
 const ACCENT_CLASSES: Record<
   AppSettings['accentColor'],
@@ -542,7 +542,7 @@ export default function App() {
     };
 
     // Sync to Express server directory
-    fetch('/api/directory/register', {
+    apiFetch('/api/directory/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(firestoreDirEntry),
@@ -590,7 +590,7 @@ export default function App() {
     });
 
     // Fetch existing server directory
-    fetch('/api/directory')
+    apiFetch('/api/directory')
       .then((r) => r.json())
       .then((data) => {
         if (Array.isArray(data.users)) {

@@ -20,6 +20,7 @@ import {
   limit,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
+import { apiFetch } from './utils/androidBridge';
 
 // Silence noisy internal WebChannel timeout logs when operating in offline/low-connectivity environments
 setLogLevel('silent');
@@ -316,7 +317,7 @@ export async function saveCloudAccountBackup(params: {
     updatedAt: Date.now(),
   };
 
-  fetch('/api/account/backup', {
+  apiFetch('/api/account/backup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -373,7 +374,7 @@ export async function recoverCloudAccountBackup(params: {
     if (params.uid) qParams.set('uid', params.uid);
     if (params.phoneHash) qParams.set('phoneHash', params.phoneHash);
     if (params.emailHash) qParams.set('emailHash', params.emailHash);
-    const res = await fetch(`/api/account/recover?${qParams.toString()}`);
+    const res = await apiFetch(`/api/account/recover?${qParams.toString()}`);
     if (res.ok) {
       const data = await res.json();
       if (data?.backupJson) return String(data.backupJson);

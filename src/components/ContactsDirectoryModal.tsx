@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { DirectoryUser, SavedContact, UserAccount } from '../types/simple';
 import { PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
+import { apiFetch } from '../utils/androidBridge';
 import {
   computeEmailHash,
   computePhoneHash,
@@ -313,7 +314,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
     setIsSendingRegOtp(true);
     try {
       if (hasPhone && !isRegPhoneVerified) {
-        const res = await fetch('/api/auth/request-otp', {
+        const res = await apiFetch('/api/auth/request-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ channel: 'phone', target: regPhone.trim() }),
@@ -328,7 +329,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
       }
 
       if (hasEmail && !isRegEmailVerified) {
-        const res = await fetch('/api/auth/request-otp', {
+        const res = await apiFetch('/api/auth/request-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ channel: 'email', target: regEmail.trim() }),
@@ -374,7 +375,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
           setIsSendingRegOtp(false);
           return;
         }
-        const res = await fetch('/api/auth/verify-otp', {
+        const res = await apiFetch('/api/auth/verify-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -400,7 +401,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
           setIsSendingRegOtp(false);
           return;
         }
-        const res = await fetch('/api/auth/verify-otp', {
+        const res = await apiFetch('/api/auth/verify-otp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -463,7 +464,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
     const target = useEmail ? u.email : u.phone;
 
     try {
-      const res = await fetch('/api/auth/request-otp', {
+      const res = await apiFetch('/api/auth/request-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel, target }),
@@ -489,7 +490,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
     const target = useEmail ? pendingSwitchUser.email : pendingSwitchUser.phone;
 
     try {
-      const res = await fetch('/api/auth/verify-otp', {
+      const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

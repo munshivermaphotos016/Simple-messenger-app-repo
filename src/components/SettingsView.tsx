@@ -78,6 +78,7 @@ import {
   DriveBackupFileMetadata,
 } from '../firebase';
 import { AndroidInstallButton } from '../hooks/usePWAInstall';
+import { apiFetch } from '../utils/androidBridge';
 
 interface SettingsViewProps {
   account: UserAccount;
@@ -212,7 +213,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const target = channel === 'phone' ? pendingPhone.trim() : pendingEmail.trim();
     setIsSendingOtp(true);
     try {
-      const res = await fetch('/api/auth/request-otp', {
+      const res = await apiFetch('/api/auth/request-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel, target }),
@@ -242,7 +243,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     setIsSendingOtp(true);
     try {
-      const res = await fetch('/api/auth/verify-otp', {
+      const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel, target, code }),
@@ -360,7 +361,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onUpdateSettings({ lastBackupTimestamp: Date.now() });
 
       if (settings.backupMode === 'cloud_e2ee') {
-        await fetch('/api/backup', {
+        await apiFetch('/api/backup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
