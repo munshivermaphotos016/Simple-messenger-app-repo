@@ -162,10 +162,12 @@ export const AndroidInstallButton: React.FC<{
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className="w-9 h-9 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
-                  <Smartphone className="w-5 h-5" />
-                </div>
+              <div className="flex items-center gap-2.5">
+                <img
+                  src="/icon-192.png"
+                  alt="Simple App Icon"
+                  className="w-10 h-10 rounded-2xl border border-emerald-500/40 object-cover bg-black shrink-0"
+                />
                 <div>
                   <h3 className="text-sm font-bold text-white">Install Native Android App</h3>
                   <p className="text-[11px] text-slate-400">Created by Dr. M Verma · v1.0.0 APK</p>

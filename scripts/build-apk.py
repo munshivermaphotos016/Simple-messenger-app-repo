@@ -16,6 +16,42 @@ import tempfile
 import zlib
 
 
+def make_utf16_string_pool(strings: list) -> bytes:
+    """
+    Builds a standard Android UTF-16LE ResStringPool_header chunk (0x0001).
+    """
+    encoded_strings = []
+    offsets = []
+    cur_offset = 0
+    for s in strings:
+        offsets.append(cur_offset)
+        u16 = s.encode("utf-16le")
+        char_len = len(s)
+        entry = struct.pack("<H", char_len) + u16 + struct.pack("<H", 0)
+        encoded_strings.append(entry)
+        cur_offset += len(entry)
+
+    string_data = b"".join(encoded_strings)
+    while len(string_data) % 4 != 0:
+        string_data += b"\x00"
+
+    strings_start = 28 + 4 * len(strings)
+    pool_chunk_size = strings_start + len(string_data)
+    pool_header = struct.pack(
+        "<HHIIIIII",
+        0x0001,  # RES_STRING_POOL_TYPE
+        28,  # header size
+        pool_chunk_size,
+        len(strings),
+        0,  # style count
+        0,  # flags (0 = UTF-16LE)
+        strings_start,
+        0,  # styles start
+    )
+    offsets_blob = b"".join(struct.pack("<I", off) for off in offsets)
+    return pool_header + offsets_blob + string_data
+
+
 # ============================================================================
 # 1. INLINE WEB BUNDLE BUILDER (dist/ -> self-contained assets/index.html)
 # ============================================================================
@@ -29,42 +65,168 @@ def build_inlined_index_html(dist_dir: str) -> bytes:
         css_name = os.path.basename(css_file)
         with open(css_file, "r", encoding="utf-8") as cf:
             css_content = cf.read()
+        css_content = css_content.replace('"/assets/', '"assets/').replace("'/assets/", "'assets/")
         pattern = re.compile(
             r'<link[^>]+href=["\'][^"\']*' + re.escape(css_name) + r'["\'][^>]*>',
             re.IGNORECASE,
         )
         html = pattern.sub(lambda _m: f"<style>\n{css_content}\n</style>", html)
 
-    # Inline JS bundle files from dist/assets/*.js
+    # Collect JS bundle files from dist/assets/*.js and place them at the end of <body>
+    # AFTER <div id="root"></div> so document.getElementById("root") is always defined
+    inlined_scripts = []
     for js_file in sorted(glob.glob(os.path.join(dist_dir, "assets", "*.js"))):
         js_name = os.path.basename(js_file)
         with open(js_file, "r", encoding="utf-8") as jf:
             js_content = jf.read()
-        # Escape any literal </script> sequences inside string literals safely
-        safe_js = js_content.replace("</script>", "<\\/script>")
+        # Rewrite absolute /assets/, /src/assets/images/, and /icon- paths to relative paths for file:///android_asset/
+        js_content = (
+            js_content.replace('"/assets/', '"assets/')
+            .replace("'/assets/", "'assets/")
+            .replace('"/src/assets/images/', '"src/assets/images/')
+            .replace("'/src/assets/images/", "'src/assets/images/")
+            .replace('"/icon-192.png"', '"icon-192.png"')
+            .replace('"/icon-512.png"', '"icon-512.png"')
+            .replace('"/apple-touch-icon.png"', '"apple-touch-icon.png"')
+        )
+        safe_js = re.sub(r"</script>", "<\\\\/script>", js_content, flags=re.IGNORECASE)
         pattern = re.compile(
             r'<script[^>]+src=["\'][^"\']*'
             + re.escape(js_name)
             + r'["\'][^>]*>\s*</script>',
             re.IGNORECASE,
         )
-        html = pattern.sub(
-            lambda _m: f'<script type="module">\n{safe_js}\n</script>', html
-        )
+        html = pattern.sub("", html)
+        inlined_scripts.append(f"<script>\n{safe_js}\n</script>")
 
-    # Remove service worker registration script in file:// APK mode to avoid URL scheme errors
+    # Remove service worker registration and webmanifest links in file:// APK mode
     html = re.sub(
         r'<script[^>]+src=["\'][^"\']*registerSW\.js["\'][^>]*>\s*</script>',
         "",
         html,
         flags=re.IGNORECASE,
     )
+    html = re.sub(
+        r'<link[^>]+rel=["\']manifest["\'][^>]*>',
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+    html = (
+        html.replace('href="/icon-192.png"', 'href="icon-192.png"')
+        .replace('href="/icon.svg"', 'href="icon.svg"')
+        .replace('href="/apple-touch-icon.png"', 'href="apple-touch-icon.png"')
+    )
+
+    scripts_block = "\n".join(inlined_scripts)
+    if "</body>" in html:
+        html = html.replace("</body>", f"{scripts_block}\n</body>", 1)
+    else:
+        html = html + "\n" + scripts_block
 
     return html.encode("utf-8")
 
 
 # ============================================================================
-# 2. BINARY ANDROIDMANIFEST.XML (AXML) COMPILER
+# 2. BINARY RESOURCES.ARSC COMPILER (@drawable/ic_launcher = 0x7F010000)
+# ============================================================================
+def compile_resources_arsc() -> bytes:
+    """
+    Compiles a valid binary resources.arsc table defining:
+      - 0x7F010000: @drawable/ic_launcher -> "res/drawable/ic_launcher.png"
+      - 0x7F020000: @string/app_name -> "Simple"
+    """
+    global_pool = make_utf16_string_pool(
+        ["res/drawable/ic_launcher.png", "Simple"]
+    )
+    type_pool = make_utf16_string_pool(["drawable", "string"])
+    key_pool = make_utf16_string_pool(["ic_launcher", "app_name"])
+
+    TYPE_STRING = 0x03
+
+    def make_type_chunks(type_id: int, key_idx: int, global_str_idx: int) -> bytes:
+        # ResTable_typeSpec (0x0202)
+        type_spec = struct.pack(
+            "<HHIBBHII",
+            0x0202,  # RES_TABLE_TYPE_SPEC_TYPE
+            16,  # headerSize
+            20,  # total size (16 + 4*1)
+            type_id,  # 1-based type ID
+            0,
+            0,
+            1,  # entryCount = 1
+            0,  # flags[0]
+        )
+        # ResTable_config (36 bytes, default config)
+        config = struct.pack("<I", 36) + (b"\x00" * 32)
+        # ResTable_entry (8 bytes) + Res_value (8 bytes) = 16 bytes
+        entry_and_val = struct.pack(
+            "<HHIHBBI",
+            8,  # ResTable_entry.size
+            0,  # ResTable_entry.flags
+            key_idx,  # key index in key_pool
+            8,  # Res_value.size
+            0,  # Res_value.res0
+            TYPE_STRING,
+            global_str_idx,  # index in global_pool
+        )
+        header_size = 20 + len(config)  # 56
+        entries_start = header_size + 4  # 60
+        total_size = entries_start + len(entry_and_val)  # 76
+        type_header = (
+            struct.pack(
+                "<HHIBBHII",
+                0x0201,  # RES_TABLE_TYPE_TYPE
+                header_size,
+                total_size,
+                type_id,
+                0,
+                0,
+                1,  # entryCount = 1
+                entries_start,
+            )
+            + config
+            + struct.pack("<I", 0)  # entry offset[0] = 0
+            + entry_and_val
+        )
+        return type_spec + type_header
+
+    drawable_chunks = make_type_chunks(1, 0, 0)
+    string_chunks = make_type_chunks(2, 1, 1)
+
+    pkg_name = "com.drmverma.simple.messenger"
+    pkg_name_u16 = pkg_name.encode("utf-16le")
+    pkg_name_padded = pkg_name_u16 + b"\x00" * (256 - len(pkg_name_u16))
+
+    pkg_header_size = 288
+    type_strings_off = pkg_header_size
+    key_strings_off = type_strings_off + len(type_pool)
+    pkg_body = type_pool + key_pool + drawable_chunks + string_chunks
+    pkg_total_size = pkg_header_size + len(pkg_body)
+
+    pkg_header = (
+        struct.pack("<HHI", 0x0200, pkg_header_size, pkg_total_size)
+        + struct.pack("<I", 0x7F)
+        + pkg_name_padded
+        + struct.pack(
+            "<IIIII",
+            type_strings_off,
+            2,  # lastPublicType
+            key_strings_off,
+            2,  # lastPublicKey
+            0,  # typeIdOffset
+        )
+    )
+    assert len(pkg_header) == pkg_header_size
+
+    pkg_chunk = pkg_header + pkg_body
+    table_total_size = 12 + len(global_pool) + len(pkg_chunk)
+    table_header = struct.pack("<HHII", 0x0002, 12, table_total_size, 1)
+    return table_header + global_pool + pkg_chunk
+
+
+# ============================================================================
+# 3. BINARY ANDROIDMANIFEST.XML (AXML) COMPILER
 # ============================================================================
 def compile_android_manifest() -> bytes:
     # Resource-mapped attribute names MUST appear first in the string pool,
@@ -72,6 +234,7 @@ def compile_android_manifest() -> bytes:
     attr_resources = [
         ("theme", 0x01010000),
         ("label", 0x01010001),
+        ("icon", 0x01010002),
         ("name", 0x01010003),
         ("exported", 0x01010010),
         ("configChanges", 0x0101001F),
@@ -81,6 +244,7 @@ def compile_android_manifest() -> bytes:
         ("targetSdkVersion", 0x01010270),
         ("hardwareAccelerated", 0x010102D3),
         ("usesCleartextTraffic", 0x010104EC),
+        ("roundIcon", 0x0101052C),
     ]
 
     other_strings = [
@@ -113,37 +277,7 @@ def compile_android_manifest() -> bytes:
     all_strings = [name for name, _ in attr_resources] + other_strings
     str_idx = {s: i for i, s in enumerate(all_strings)}
 
-    # Build UTF-16LE String Pool chunk (RES_STRING_POOL_TYPE = 0x0001)
-    encoded_strings = []
-    offsets = []
-    cur_offset = 0
-    for s in all_strings:
-        offsets.append(cur_offset)
-        u16 = s.encode("utf-16le")
-        char_len = len(s)
-        entry = struct.pack("<H", char_len) + u16 + struct.pack("<H", 0)
-        encoded_strings.append(entry)
-        cur_offset += len(entry)
-
-    string_data = b"".join(encoded_strings)
-    while len(string_data) % 4 != 0:
-        string_data += b"\x00"
-
-    strings_start = 28 + 4 * len(all_strings)
-    pool_chunk_size = strings_start + len(string_data)
-    pool_header = struct.pack(
-        "<HHIIIIII",
-        0x0001,  # RES_STRING_POOL_TYPE
-        28,  # header size
-        pool_chunk_size,
-        len(all_strings),
-        0,  # style count
-        0,  # flags (0 = UTF-16LE)
-        strings_start,
-        0,  # styles start
-    )
-    offsets_blob = b"".join(struct.pack("<I", off) for off in offsets)
-    string_pool_chunk = pool_header + offsets_blob + string_data
+    string_pool_chunk = make_utf16_string_pool(all_strings)
 
     # Build Resource Map chunk (RES_XML_RESOURCE_MAP_TYPE = 0x0180)
     res_ids_blob = b"".join(struct.pack("<I", res_id) for _, res_id in attr_resources)
@@ -277,6 +411,8 @@ def compile_android_manifest() -> bytes:
 
     # <application android:theme="@android:style/Theme.DeviceDefault.NoActionBar" (0x01030129)
     #              android:label="Simple"
+    #              android:icon="@drawable/ic_launcher" (0x7F010000)
+    #              android:roundIcon="@drawable/ic_launcher" (0x7F010000)
     #              android:hardwareAccelerated="true"
     #              android:usesCleartextTraffic="true">
     xml_chunks.append(
@@ -286,17 +422,21 @@ def compile_android_manifest() -> bytes:
             [
                 make_attr(NS_ANDROID, "theme", TYPE_REFERENCE, 0x01030129),
                 make_attr(NS_ANDROID, "label", TYPE_STRING, str_idx["Simple"]),
+                make_attr(NS_ANDROID, "icon", TYPE_REFERENCE, 0x7F010000),
                 make_attr(
                     NS_ANDROID, "hardwareAccelerated", TYPE_INT_BOOLEAN, 0xFFFFFFFF
                 ),
                 make_attr(
                     NS_ANDROID, "usesCleartextTraffic", TYPE_INT_BOOLEAN, 0xFFFFFFFF
                 ),
+                make_attr(NS_ANDROID, "roundIcon", TYPE_REFERENCE, 0x7F010000),
             ],
         )
     )
 
     # <activity android:name="com.drmverma.simple.messenger.MainActivity"
+    #           android:label="Simple"
+    #           android:icon="@drawable/ic_launcher" (0x7F010000)
     #           android:exported="true"
     #           android:configChanges="orientation|screenSize|keyboardHidden" (0x04a0)>
     xml_chunks.append(
@@ -304,6 +444,8 @@ def compile_android_manifest() -> bytes:
             20,
             "activity",
             [
+                make_attr(NS_ANDROID, "label", TYPE_STRING, str_idx["Simple"]),
+                make_attr(NS_ANDROID, "icon", TYPE_REFERENCE, 0x7F010000),
                 make_attr(
                     NS_ANDROID,
                     "name",
@@ -361,7 +503,7 @@ def compile_android_manifest() -> bytes:
 
 
 # ============================================================================
-# 3. DALVIK EXECUTABLE (classes.dex) COMPILER & VERIFIER
+# 4. DALVIK EXECUTABLE (classes.dex) COMPILER & VERIFIER
 # ============================================================================
 def uleb128(value: int) -> bytes:
     out = bytearray()
@@ -419,8 +561,8 @@ def compile_classes_dex() -> bytes:
         "setWebViewClient",
         "webView",
     ]
-    # Strings in DEX MUST be sorted strictly in UTF-8 code unit order
-    strings = sorted(set(raw_strings))
+    # Strings in DEX MUST be sorted strictly in UTF-8 byte order
+    strings = sorted(set(raw_strings), key=lambda s: s.encode("utf-8"))
     s_idx = {s: i for i, s in enumerate(strings)}
 
     type_descriptors = [
@@ -437,7 +579,6 @@ def compile_classes_dex() -> bytes:
         "V",
         "Z",
     ]
-    # Sort types by their string descriptor index
     type_descriptors.sort(key=lambda t: s_idx[t])
     t_idx = {t: i for i, t in enumerate(type_descriptors)}
 
@@ -454,7 +595,6 @@ def compile_classes_dex() -> bytes:
         ("VZ", "V", ("Z",)),
         ("Z", "Z", ()),
     ]
-    # Sort protos by (return_type_idx, param_type_idxs)
     raw_protos.sort(
         key=lambda p: (t_idx[p[1]], tuple(t_idx[pt] for pt in p[2]))
     )
@@ -537,7 +677,6 @@ def compile_classes_dex() -> bytes:
             ("V", ("Landroid/os/Bundle;",)),
         ),
     ]
-    # Sort methods by (class_idx, name_idx, proto_idx)
     raw_methods.sort(
         key=lambda m: (t_idx[m[0]], s_idx[m[1]], p_idx[m[2]])
     )
@@ -578,44 +717,45 @@ def compile_classes_dex() -> bytes:
             "Landroid/webkit/WebView;",
         )
     ]
-    # iget-object v0, v1, MainActivity.webView (0x54, B<<4|A = 1<<4|0 = 0x10, field_idx)
-    # if-eqz v0, :call_super (+10 code units)
-    # invoke-virtual {v0}, WebView.canGoBack()Z
-    # move-result v0
-    # if-eqz v0, :call_super (+5 code units)
-    # iget-object v0, v1, MainActivity.webView
-    # invoke-virtual {v0}, WebView.goBack()V
-    # return-void
-    # :call_super
-    # invoke-super {v1}, Activity.onBackPressed()V
-    # return-void
+    # Exact instruction unit offsets:
+    # unit 0..1  (2 units): iget-object v0, v1, MainActivity.webView
+    # unit 2..3  (2 units): if-eqz v0, +14 -> unit 16 (:call_super)
+    # unit 4..6  (3 units): invoke-virtual {v0}, WebView.canGoBack()Z
+    # unit 7     (1 unit):  move-result v0
+    # unit 8..9  (2 units): if-eqz v0, +8 -> unit 16 (:call_super)
+    # unit 10..11(2 units): iget-object v0, v1, MainActivity.webView
+    # unit 12..14(3 units): invoke-virtual {v0}, WebView.goBack()V
+    # unit 15    (1 unit):  return-void
+    # unit 16..18(3 units): :call_super -> invoke-super {v1}, Activity.onBackPressed()V
+    # unit 19    (1 unit):  return-void
     onback_insns = (
-        struct.pack("<BBH", 0x54, 0x10, f_webview)  # 2 units
-        + struct.pack("<BBh", 0x38, 0x00, 12)  # if-eqz v0, +12 -> :call_super (2 units)
+        struct.pack("<BBH", 0x54, 0x10, f_webview)  # unit 0 (2 units)
+        + struct.pack("<BBh", 0x38, 0x00, 14)  # unit 2 (2 units) -> target 2 + 14 = 16
         + invoke_35c(
             0x6E,
             1,
             m_idx[("Landroid/webkit/WebView;", "canGoBack", ("Z", ()))],
             [0],
-        )  # 3 units
-        + struct.pack("<BB", 0x0A, 0x00)  # move-result v0 (1 unit)
-        + struct.pack("<BBh", 0x38, 0x00, 6)  # if-eqz v0, +6 -> :call_super (2 units)
-        + struct.pack("<BBH", 0x54, 0x10, f_webview)  # 2 units
+        )  # unit 4 (3 units)
+        + struct.pack("<BB", 0x0A, 0x00)  # unit 7 (1 unit)
+        + struct.pack("<BBh", 0x38, 0x00, 8)  # unit 8 (2 units) -> target 8 + 8 = 16
+        + struct.pack("<BBH", 0x54, 0x10, f_webview)  # unit 10 (2 units)
         + invoke_35c(
             0x6E,
             1,
             m_idx[("Landroid/webkit/WebView;", "goBack", ("V", ()))],
             [0],
-        )  # 3 units
-        + struct.pack("<BB", 0x0E, 0x00)  # return-void (1 unit)
+        )  # unit 12 (3 units)
+        + struct.pack("<BB", 0x0E, 0x00)  # unit 15 (1 unit)
         + invoke_35c(
             0x6F,
             1,
             m_idx[("Landroid/app/Activity;", "onBackPressed", ("V", ()))],
             [1],
-        )  # :call_super (3 units)
-        + struct.pack("<BB", 0x0E, 0x00)  # return-void (1 unit)
+        )  # unit 16 (3 units)
+        + struct.pack("<BB", 0x0E, 0x00)  # unit 19 (1 unit)
     )
+    assert len(onback_insns) == 40  # 20 code units
 
     # Method 3: MainActivity.onCreate(Landroid/os/Bundle;)V
     # registers=6 (v0, v1, v2, v3 = locals; v4 = this, v5 = bundle), ins=2, outs=2
@@ -1053,7 +1193,7 @@ def compile_classes_dex() -> bytes:
 
 
 # ============================================================================
-# 4. APK SIGNATURE SCHEME V1 (JAR) + V2 (APK SIGNING BLOCK 42) SIGNER
+# 5. APK SIGNATURE SCHEME V1 (JAR) + V2 (APK SIGNING BLOCK 42) SIGNER
 # ============================================================================
 def generate_signing_credentials(tmp_dir: str):
     key_pem = os.path.join(tmp_dir, "signer_key.pem")
@@ -1174,7 +1314,7 @@ def build_jar_v1_signature_files(
 def build_zip_sections(all_entries: list):
     """
     Constructs ZIP Section 1 (local file entries with 4-byte alignment for stored entries),
-    Section 3 (Central Directory), and Section 4 (EOCD) without extra fields bugs.
+    Section 3 (Central Directory), and Section 4 (EOCD).
     """
     local_chunks = bytearray()
     central_chunks = bytearray()
@@ -1270,7 +1410,6 @@ def compute_apk_v2_signing_block(
 ) -> bytes:
     """
     Computes the official Android APK Signature Scheme v2 Signing Block (ID 0x7109871a).
-    Specification: https://source.android.com/docs/security/features/apksigning/v2
     """
     CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
     chunk_digests = []
@@ -1310,14 +1449,14 @@ def compute_apk_v2_signing_block(
     certs_seq = lp_slice(cert_der)
     additional_attrs_seq = struct.pack("<I", 0)  # empty
 
-    signed_data_bytes = (
-        lp_slice(digests_seq) + lp_slice(certs_seq) + additional_attrs_seq
-    )
+    signed_data = digests_seq + certs_seq + additional_attrs_seq
 
     signed_data_path = os.path.join(tmp_dir, "v2_signed_data.bin")
     sig_out_path = os.path.join(tmp_dir, "v2_sig.bin")
+    pubkey_der_path = os.path.join(tmp_dir, "pubkey.der")
+
     with open(signed_data_path, "wb") as f:
-        f.write(signed_data_bytes)
+        f.write(signed_data)
 
     subprocess.run(
         [
@@ -1335,8 +1474,6 @@ def compute_apk_v2_signing_block(
     with open(sig_out_path, "rb") as f:
         signature_bytes = f.read()
 
-    # Read SubjectPublicKeyInfo (DER) for the signer block
-    pubkey_der_path = os.path.join(tmp_dir, "pubkey.der")
     subprocess.run(
         [
             "openssl",
@@ -1354,62 +1491,105 @@ def compute_apk_v2_signing_block(
         stderr=subprocess.DEVNULL,
     )
     with open(pubkey_der_path, "rb") as f:
-        public_key_der = f.read()
+        pubkey_der = f.read()
 
     signature_entry = struct.pack(
         "<I", SIG_ALGO_RSA_PKCS1_V1_5_SHA256
     ) + lp_slice(signature_bytes)
     signatures_seq = lp_slice(signature_entry)
 
-    signer_bytes = (
-        lp_slice(signed_data_bytes)
-        + lp_slice(signatures_seq)
-        + lp_slice(public_key_der)
+    signer_block = (
+        lp_slice(signed_data) + signatures_seq + lp_slice(pubkey_der)
     )
-    signers_seq = lp_slice(signer_bytes)
-    v2_block_value = lp_slice(signers_seq)
+    signers_seq = lp_slice(lp_slice(signer_block))
 
-    # ID-value pair: uint64_le(len(id + value)) + uint32_le(0x7109871a) + value
-    pair_payload = struct.pack("<I", 0x7109871A) + v2_block_value
-    pair_entry = struct.pack("<Q", len(pair_payload)) + pair_payload
+    # ID-value pair: ID = 0x7109871a (APK Signature Scheme v2 Block ID)
+    pair_payload = struct.pack("<I", 0x7109871A) + signers_seq
+    id_value_pair = struct.pack("<Q", len(pair_payload)) + pair_payload
 
-    # APK Signing Block header + pairs + footer (uint64_le size_of_block + "APK Sig Block 42")
-    # size_of_block = len(pairs) + 8 (footer size) + 16 (magic)
-    size_of_block = len(pair_entry) + 24
+    # Pad APK Signing Block to a multiple of 4096 bytes with Android's VERITY_PADDING_BLOCK_ID (0x42726577)
+    raw_block_len = 8 + len(id_value_pair) + 8 + 16
+    remainder = raw_block_len % 4096
+    padding_pair = b""
+    if remainder != 0:
+        needed = (4096 - remainder) % 4096
+        if needed < 12:
+            needed += 4096
+        pad_val_len = needed - 12
+        pad_payload = struct.pack("<I", 0x42726577) + (b"\x00" * pad_val_len)
+        padding_pair = struct.pack("<Q", len(pad_payload)) + pad_payload
+
+    pairs_blob = id_value_pair + padding_pair
+    size_of_block = len(pairs_blob) + 8 + 16
+
     signing_block = (
         struct.pack("<Q", size_of_block)
-        + pair_entry
+        + pairs_blob
         + struct.pack("<Q", size_of_block)
         + b"APK Sig Block 42"
     )
+    assert len(signing_block) % 4096 == 0
     return signing_block
 
 
 def main():
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     dist_dir = os.path.join(root_dir, "dist")
+    public_dir = os.path.join(root_dir, "public")
+
     if not os.path.exists(os.path.join(dist_dir, "index.html")):
         raise RuntimeError("dist/index.html not found. Run 'npm run build' first.")
 
     inlined_html = build_inlined_index_html(dist_dir)
     manifest_axml = compile_android_manifest()
+    resources_arsc = compile_resources_arsc()
     classes_dex = compile_classes_dex()
+
+    # Load launcher icon PNG (generated from user's Simple app icon)
+    icon_192_path = os.path.join(public_dir, "icon-192.png")
+    icon_512_path = os.path.join(public_dir, "icon-512.png")
+    with open(icon_192_path, "rb") as f:
+        icon_192_bytes = f.read()
+    with open(icon_512_path, "rb") as f:
+        icon_512_bytes = f.read()
 
     payload_entries = [
         ("AndroidManifest.xml", manifest_axml, True),
+        ("resources.arsc", resources_arsc, False),
+        ("res/drawable/ic_launcher.png", icon_192_bytes, False),
         ("classes.dex", classes_dex, False),
         ("assets/index.html", inlined_html, True),
+        ("assets/icon-192.png", icon_192_bytes, False),
+        ("assets/icon-512.png", icon_512_bytes, False),
     ]
 
-    # Also include icons and manifest assets inside assets/
-    for asset_name in ("icon.svg", "pwa-192x192.png", "pwa-512x512.png", "manifest.json"):
-        asset_path = os.path.join(dist_dir, asset_name)
-        if os.path.exists(asset_path):
-            with open(asset_path, "rb") as af:
-                payload_entries.append((f"assets/{asset_name}", af.read(), False))
+    # Bundle all compiled media/wallpaper assets from dist/assets/ into assets/ inside the APK
+    for asset_file in sorted(glob.glob(os.path.join(dist_dir, "assets", "*"))):
+        ext = os.path.splitext(asset_file)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".svg", ".webp"):
+            asset_name = os.path.basename(asset_file)
+            with open(asset_file, "rb") as af:
+                payload_entries.append((f"assets/assets/{asset_name}", af.read(), False))
 
-    tmp_dir = tempfile.mkdtemp(prefix="simple_apk_")
-    try:
+    # Bundle all wallpaper & brand images from src/assets/images/ into assets/src/assets/images/
+    src_images_dir = os.path.join(root_dir, "src", "assets", "images")
+    for img_file in sorted(glob.glob(os.path.join(src_images_dir, "*"))):
+        ext = os.path.splitext(img_file)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".svg", ".webp"):
+            img_name = os.path.basename(img_file)
+            with open(img_file, "rb") as imf:
+                payload_entries.append(
+                    (f"assets/src/assets/images/{img_name}", imf.read(), False)
+                )
+
+    # Also bundle public icons at root of assets/
+    for pub_name in ("apple-touch-icon.png", "icon.svg"):
+        pub_path = os.path.join(public_dir, pub_name)
+        if os.path.exists(pub_path):
+            with open(pub_path, "rb") as pf:
+                payload_entries.append((f"assets/{pub_name}", pf.read(), False))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
         key_pem, cert_pem, cert_der = generate_signing_credentials(tmp_dir)
         v1_sig_entries = build_jar_v1_signature_files(
             payload_entries, key_pem, cert_pem, tmp_dir
@@ -1417,36 +1597,43 @@ def main():
         all_entries = payload_entries + v1_sig_entries
 
         section1, section3_cd, section4_eocd = build_zip_sections(all_entries)
-        signing_block = compute_apk_v2_signing_block(
+
+        # Compute APK Signature Scheme v2 Block using EOCD with updated CD offset
+        # First pass to get exact size of v2 signing block (multiple of 4096)
+        dummy_v2 = compute_apk_v2_signing_block(
             section1, section3_cd, section4_eocd, key_pem, cert_der, tmp_dir
         )
-
-        # Update Central Directory offset in EOCD to account for inserted APK Signing Block
-        new_cd_offset = len(section1) + len(signing_block)
+        new_cd_offset = len(section1) + len(dummy_v2)
         updated_eocd = (
             section4_eocd[:16]
             + struct.pack("<I", new_cd_offset)
             + section4_eocd[20:]
         )
 
-        final_apk = section1 + signing_block + section3_cd + updated_eocd
-
-        out_paths = [
-            os.path.join(root_dir, "Simple-Android.apk"),
-            os.path.join(root_dir, "releases", "Simple-v1.0.0.apk"),
-            os.path.join(root_dir, "public", "Simple-Android.apk"),
-            os.path.join(dist_dir, "Simple-Android.apk"),
-        ]
-        for out_p in out_paths:
-            os.makedirs(os.path.dirname(out_p), exist_ok=True)
-            with open(out_p, "wb") as f:
-                f.write(final_apk)
-
-        print(
-            f"Successfully built & signed Simple-Android.apk ({len(final_apk):,} bytes) with JAR v1 + APK Signature Scheme v2."
+        # Final v2 signing block over (section1, section3_cd, updated_eocd)
+        v2_signing_block = compute_apk_v2_signing_block(
+            section1, section3_cd, updated_eocd, key_pem, cert_der, tmp_dir
         )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        final_apk = section1 + v2_signing_block + section3_cd + updated_eocd
+
+    # Output to repository root, releases/, public/, and dist/
+    out_paths = [
+        os.path.join(root_dir, "Simple-Android.apk"),
+        os.path.join(root_dir, "releases", "Simple-v1.0.0.apk"),
+        os.path.join(root_dir, "public", "Simple-Android.apk"),
+        os.path.join(dist_dir, "Simple-Android.apk"),
+    ]
+    for path in out_paths:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(final_apk)
+
+    size_kb = len(final_apk) / 1024.0
+    print(
+        f"[Simple APK Builder] Built & signed Simple-Android.apk ({size_kb:.1f} KB) -> "
+        + ", ".join(os.path.relpath(p, root_dir) for p in out_paths)
+    )
 
 
 if __name__ == "__main__":

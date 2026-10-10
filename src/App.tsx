@@ -111,6 +111,7 @@ import {
 import { ensure3DCartoonAvatarUrl } from './utils/cartoonAvatars';
 import { AndroidInstallButton } from './hooks/usePWAInstall';
 import { apiFetch, getRealtimeWebSocketUrl } from './utils/androidBridge';
+import simpleAppIcon from './assets/images/simple_app_icon.png';
 
 const ACCENT_CLASSES: Record<
   AppSettings['accentColor'],
@@ -2086,9 +2087,14 @@ export default function App() {
               setSelectedChatId(null);
               setActiveTab('chats');
             }}
-            className="font-display text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+            className="font-display text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 flex items-center gap-2"
           >
-            Simple
+            <img
+              src={simpleAppIcon}
+              alt="Simple"
+              className="w-7 h-7 rounded-lg border border-emerald-500/40 object-cover bg-black shrink-0"
+            />
+            <span>Simple</span>
           </a>
           <button
             onClick={() => setShowContactsDirectoryModal(true)}

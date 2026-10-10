@@ -4259,9 +4259,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="p-5 rounded-3xl bg-gradient-to-br from-emerald-950/60 via-slate-900 to-slate-950 border border-emerald-500/40 shadow-xl space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-3.5">
-                  <div className="w-14 h-14 rounded-2xl bg-emerald-500/20 border border-emerald-400/40 flex items-center justify-center text-emerald-400 shadow-lg shrink-0">
-                    <Shield className="w-7 h-7" />
-                  </div>
+                  <img
+                    src="/icon-192.png"
+                    alt="Simple App Icon"
+                    className="w-14 h-14 rounded-2xl border border-emerald-400/40 shadow-lg shrink-0 object-cover bg-black"
+                  />
                   <div>
                     <div className="flex items-center gap-2">
                       <h4 className="text-base sm:text-lg font-bold text-white">
