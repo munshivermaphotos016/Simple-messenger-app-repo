@@ -9,8 +9,10 @@ Created by Dr. M Verma (com.drmverma.simple).
 import base64
 import glob
 import hashlib
+import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -19,8 +21,30 @@ import zlib
 PACKAGE_NAME = "com.drmverma.simple"
 MAIN_ACTIVITY_CLASS = "com.drmverma.simple.MainActivity"
 MAIN_ACTIVITY_DESC = "Lcom/drmverma/simple/MainActivity;"
-VERSION_CODE = 2
-VERSION_NAME = "2.0.0"
+
+
+def load_version_info() -> tuple[int, str]:
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    pkg_json_path = os.path.join(root_dir, "package.json")
+    ver_name = "3.0.0"
+    try:
+        with open(pkg_json_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+            if isinstance(pkg.get("version"), str) and pkg["version"].strip():
+                ver_name = pkg["version"].strip()
+    except Exception:
+        pass
+    parts = [int(p) for p in re.findall(r"\d+", ver_name)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    if parts[1] == 0 and parts[2] == 0:
+        ver_code = max(3, parts[0])
+    else:
+        ver_code = parts[0] * 100 + parts[1] * 10 + parts[2]
+    return ver_code, ver_name
+
+
+VERSION_CODE, VERSION_NAME = load_version_info()
 
 
 def make_utf16_string_pool(strings: list) -> bytes:
@@ -1753,14 +1777,39 @@ def main():
 
     # Bundle all chat theme wallpapers from src/assets/images/chat_bg_* into assets/wallpapers/
     src_images_dir = os.path.join(root_dir, "src", "assets", "images")
+    has_convert = shutil.which("convert") is not None
     for img_file in sorted(glob.glob(os.path.join(src_images_dir, "chat_bg_*"))):
         ext = os.path.splitext(img_file)[1].lower()
+        img_name = os.path.basename(img_file)
+        if img_name == "chat_bg_theme_3_1791569123658.jpg":
+            continue
         if ext in (".jpg", ".jpeg", ".png", ".webp"):
-            img_name = os.path.basename(img_file)
-            with open(img_file, "rb") as imf:
-                payload_entries.append(
-                    (f"assets/wallpapers/{img_name}", imf.read(), False)
-                )
+            img_bytes = None
+            if has_convert and ext in (".jpg", ".jpeg"):
+                try:
+                    proc = subprocess.run(
+                        [
+                            "convert",
+                            img_file,
+                            "-resize",
+                            "1080x1920>",
+                            "-strip",
+                            "-quality",
+                            "76",
+                            "jpeg:-",
+                        ],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if proc.stdout:
+                        img_bytes = proc.stdout
+                except Exception:
+                    img_bytes = None
+            if img_bytes is None:
+                with open(img_file, "rb") as imf:
+                    img_bytes = imf.read()
+            payload_entries.append((f"assets/wallpapers/{img_name}", img_bytes, False))
 
     # Also bundle public icons at root of assets/
     for pub_name in ("apple-touch-icon.png", "icon.svg"):
@@ -1799,11 +1848,34 @@ def main():
         # Cryptographically & structurally verify the generated APK before writing
         verify_apk_package(final_apk, cert_pem, tmp_dir)
 
+    # Remove older versioned APKs so only the latest versioned APK is present
+    for old_apk in glob.glob(os.path.join(root_dir, "Simple-Android-v*.apk")):
+        try:
+            os.remove(old_apk)
+        except OSError:
+            pass
+    for old_apk in glob.glob(os.path.join(root_dir, "releases", "Simple-v*.apk")):
+        try:
+            os.remove(old_apk)
+        except OSError:
+            pass
+    for old_apk in glob.glob(os.path.join(root_dir, "public", "Simple-Android-v*.apk")):
+        try:
+            os.remove(old_apk)
+        except OSError:
+            pass
+
+    versioned_root_name = f"Simple-Android-v{VERSION_NAME}.apk"
+    versioned_release_name = f"Simple-v{VERSION_NAME}.apk"
+
     # Output to repository root, releases/, public/, and dist/
     out_paths = [
+        os.path.join(root_dir, versioned_root_name),
         os.path.join(root_dir, "Simple-Android.apk"),
-        os.path.join(root_dir, "releases", "Simple-v1.0.0.apk"),
+        os.path.join(root_dir, "releases", versioned_release_name),
+        os.path.join(root_dir, "public", versioned_root_name),
         os.path.join(root_dir, "public", "Simple-Android.apk"),
+        os.path.join(dist_dir, versioned_root_name),
         os.path.join(dist_dir, "Simple-Android.apk"),
     ]
     for path in out_paths:
@@ -1813,7 +1885,7 @@ def main():
 
     size_kb = len(final_apk) / 1024.0
     print(
-        f"[Simple APK Builder] Built & verified Simple-Android.apk ({size_kb:.1f} KB) [v1 JAR + v2 Block 42 OK] -> "
+        f"[Simple APK Builder] Built & verified {versioned_root_name} (v{VERSION_NAME}, code {VERSION_CODE}, {size_kb:.1f} KB) [v1 JAR + v2 Block 42 OK] -> "
         + ", ".join(os.path.relpath(p, root_dir) for p in out_paths)
     )
 
