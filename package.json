@@ -2,13 +2,13 @@
   "name": "simple-encrypted-messenger-android",
   "author": "Dr. M Verma",
   "private": true,
-  "version": "6.0.0",
+  "version": "7.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
-    "build": "vite build && python3 scripts/build-apk.py",
-    "build:apk": "vite build && python3 scripts/build-apk.py",
+    "build": "python3 scripts/ensure-assets.py && vite build && python3 scripts/build-apk.py",
+    "build:apk": "python3 scripts/ensure-assets.py && vite build && python3 scripts/build-apk.py",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

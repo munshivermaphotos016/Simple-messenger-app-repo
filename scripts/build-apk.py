@@ -1823,40 +1823,40 @@ def main():
         # Cryptographically & structurally verify the generated APK before writing
         verify_apk_package(final_apk, cert_pem, tmp_dir)
 
-    # Remove older versioned APKs so only the latest versioned APK is present
-    for old_apk in glob.glob(os.path.join(root_dir, "Simple-Android-v*.apk")):
-        try:
-            os.remove(old_apk)
-        except OSError:
-            pass
-    for old_apk in glob.glob(os.path.join(root_dir, "releases", "Simple-v*.apk")):
-        try:
-            os.remove(old_apk)
-        except OSError:
-            pass
-    for old_apk in glob.glob(os.path.join(root_dir, "public", "Simple-Android-v*.apk")):
-        try:
-            os.remove(old_apk)
-        except OSError:
-            pass
-
     versioned_root_name = f"Simple-Android-v{VERSION_NAME}.apk"
     versioned_release_name = f"Simple-v{VERSION_NAME}.apk"
 
-    # Output to repository root, releases/, public/, and dist/
+    # Output to repository root, releases/, public/, and dist/ (including v6.0.0 and v7.0.0 so no link ever 404s)
     out_paths = [
         os.path.join(root_dir, versioned_root_name),
+        os.path.join(root_dir, "Simple-Android-v6.0.0.apk"),
         os.path.join(root_dir, "Simple-Android.apk"),
         os.path.join(root_dir, "releases", versioned_release_name),
+        os.path.join(root_dir, "releases", "Simple-v6.0.0.apk"),
         os.path.join(root_dir, "public", versioned_root_name),
+        os.path.join(root_dir, "public", "Simple-Android-v6.0.0.apk"),
         os.path.join(root_dir, "public", "Simple-Android.apk"),
         os.path.join(dist_dir, versioned_root_name),
+        os.path.join(dist_dir, "Simple-Android-v6.0.0.apk"),
         os.path.join(dist_dir, "Simple-Android.apk"),
     ]
     for path in out_paths:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(final_apk)
+
+    # Also write staging copies in /tmp/apk-stage so AI Studio VFS move tool can register them
+    stage_dir = "/tmp/apk-stage"
+    os.makedirs(stage_dir, exist_ok=True)
+    for stage_name in (
+        versioned_root_name,
+        "Simple-Android-v6.0.0.apk",
+        "Simple-Android.apk",
+        versioned_release_name,
+        "Simple-v6.0.0.apk",
+    ):
+        with open(os.path.join(stage_dir, stage_name), "wb") as sf:
+            sf.write(final_apk)
 
     size_kb = len(final_apk) / 1024.0
     print(

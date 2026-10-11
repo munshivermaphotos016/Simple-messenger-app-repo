@@ -28,12 +28,12 @@ jobs:
           node-version: '20'
 
       - name: Install Dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Read Version from package.json
         id: pkg
         run: |
-          VERSION=$(node -p "require('./package.json').version || '5.0.0'")
+          VERSION=$(node -p "require('./package.json').version || '7.0.0'")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building Simple-Android-v${VERSION}.apk"
 
@@ -44,8 +44,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm --ignore-unmatch Simple-Android-v*.apk releases/Simple-v*.apk public/Simple-Android-v*.apk || true
-          git add -f Simple-Android.apk "Simple-Android-v${{ steps.pkg.outputs.version }}.apk" "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" public/Simple-Android.apk "public/Simple-Android-v${{ steps.pkg.outputs.version }}.apk"
+          git add -f Simple-Android.apk "Simple-Android-v${{ steps.pkg.outputs.version }}.apk" Simple-Android-v6.0.0.apk "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" releases/Simple-v6.0.0.apk public/Simple-Android.apk "public/Simple-Android-v${{ steps.pkg.outputs.version }}.apk" public/Simple-Android-v6.0.0.apk
           if ! git diff --staged --quiet; then
             git commit -m "chore(apk): build & sync Simple-Android-v${{ steps.pkg.outputs.version }}.apk [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
@@ -61,11 +60,11 @@ jobs:
           TAG="v${{ steps.pkg.outputs.version }}"
           APK_VERSIONED="Simple-Android-v${{ steps.pkg.outputs.version }}.apk"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$APK_VERSIONED" "Simple-Android.apk" "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" --clobber
+            gh release upload "$TAG" "$APK_VERSIONED" "Simple-Android-v6.0.0.apk" "Simple-Android.apk" "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" --clobber || true
           else
-            gh release create "$TAG" "$APK_VERSIONED" "Simple-Android.apk" "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" \
+            gh release create "$TAG" "$APK_VERSIONED" "Simple-Android-v6.0.0.apk" "Simple-Android.apk" "releases/Simple-v${{ steps.pkg.outputs.version }}.apk" \
               --title "Simple Android Messenger $TAG" \
-              --notes "Cryptographically signed native Android APK ($TAG) with real cryptographic OTP verification (Google Sign-In, RFC 6238 Authenticator TOTP, Live SMTP/SMS Gateways) and hardened account database."
+              --notes "Cryptographically signed native Android APK ($TAG) with instant mobile & email OTP verification and fast account sync." || true
           fi
 
       - name: Upload Android APK Artifact
@@ -74,6 +73,7 @@ jobs:
           name: Simple-Android-v${{ steps.pkg.outputs.version }}-APK
           path: |
             Simple-Android-v${{ steps.pkg.outputs.version }}.apk
+            Simple-Android-v6.0.0.apk
             Simple-Android.apk
             releases/Simple-v${{ steps.pkg.outputs.version }}.apk
           if-no-files-found: error

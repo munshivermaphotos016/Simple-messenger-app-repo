@@ -560,29 +560,34 @@ async function startServer() {
   });
 
   const sendApkFile = (_req: express.Request, res: express.Response) => {
-    const versionedPath = path.join(process.cwd(), 'Simple-Android-v6.0.0.apk');
+    const v7Path = path.join(process.cwd(), 'Simple-Android-v7.0.0.apk');
+    const v6Path = path.join(process.cwd(), 'Simple-Android-v6.0.0.apk');
     const fallbackPath = path.join(process.cwd(), 'Simple-Android.apk');
-    const apkPath = fs.existsSync(versionedPath) ? versionedPath : fallbackPath;
+    const apkPath = fs.existsSync(v7Path) ? v7Path : (fs.existsSync(v6Path) ? v6Path : fallbackPath);
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v6.0.0.apk"');
+    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v7.0.0.apk"');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.sendFile(apkPath);
   };
 
+  app.get('/Simple-Android-v7.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v6.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v5.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v4.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v3.0.0.apk', sendApkFile);
   app.get('/Simple-Android.apk', sendApkFile);
   app.get('/Simple-Messenger.apk', sendApkFile);
+  app.get('/releases/Simple-v7.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v6.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v5.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v4.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v3.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v1.0.0.apk', sendApkFile);
   app.get('/api/download/apk', sendApkFile);
+  app.get('/api/download-apk', sendApkFile);
+  app.get('/api/download-apk/:filename', sendApkFile);
 
   app.get('/api/health', (_req, res) => {
     const eff = getEffectiveGatewayConfig();
