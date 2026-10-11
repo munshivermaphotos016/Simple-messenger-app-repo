@@ -34,6 +34,7 @@ import {
   deriveUidFromEmail,
   deriveUidFromPhone,
   normalizePhone,
+  sha256HexSync,
 } from './data/initialState';
 import { ChatConversation, UserAccount } from './types/simple';
 
@@ -775,17 +776,19 @@ export async function createPendingFirestoreAuthenticatorChallenge(params: {
   email?: string;
   passwordHash: string;
   totpSecret: string;
+  twoStepPinHash?: string;
 }): Promise<void> {
   const safeUid = (params.uid || `usr_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
   const resolvedPhoneHash = ensureSha256PhoneHash(params.phone);
   const resolvedEmailHash = ensureSha256EmailHash(params.email);
 
   const challengeJson = JSON.stringify({
-    version: '6.0.0',
+    version: '8.0.0',
     totpVerified: false,
     onboardingCompleted: false,
     passwordHash: params.passwordHash,
     totpSecret: params.totpSecret,
+    twoStepPinHash: params.twoStepPinHash,
     createdAt: Date.now(),
     account: {
       id: safeUid,
@@ -796,6 +799,7 @@ export async function createPendingFirestoreAuthenticatorChallenge(params: {
       email: (params.email || '').trim().toLowerCase(),
       passwordHash: params.passwordHash,
       totpSecret: params.totpSecret,
+      twoStepPinHash: params.twoStepPinHash,
       onboardingCompleted: false,
     },
   });
@@ -819,6 +823,7 @@ export async function createPendingFirestoreAuthenticatorChallenge(params: {
       email: (params.email || '').trim().toLowerCase(),
       passwordHash: params.passwordHash,
       totpSecret: params.totpSecret,
+      twoStepPinHash: params.twoStepPinHash,
     };
     backups[safeUid] = localEntry;
     if (resolvedPhoneHash) backups[`ph_${resolvedPhoneHash.slice(0, 48)}`] = localEntry;
@@ -865,16 +870,18 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   code: string;
   mode: 'register' | 'login';
   expectedTotpSecret?: string;
+  expectedTwoStepPinHash?: string;
 }): Promise<{
   ok: boolean;
   verificationToken?: string;
   totpSecret?: string;
+  twoStepPinHash?: string;
   recoveredBundle?: RecoveredAccountBundle | null;
   error?: string;
 }> {
   const cleanCode = (params.code || '').trim();
   if (!/^\d{6}$/.test(cleanCode)) {
-    return { ok: false, error: 'Please enter the 6-digit code from your Authenticator app.' };
+    return { ok: false, error: 'Please enter a valid 6-digit verification code.' };
   }
 
   const rawPhone = normalizePhone(params.phone || '');
@@ -944,6 +951,7 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
 
   let storedPwdHash = '';
   let storedTotpSecret = '';
+  let storedPinHash = '';
   let parsedBackup: any = null;
 
   if (dbRecordData && typeof dbRecordData.backupJson === 'string') {
@@ -952,6 +960,7 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
       const acct = parsedBackup.account || parsedBackup;
       storedPwdHash = parsedBackup.passwordHash || acct?.passwordHash || '';
       storedTotpSecret = parsedBackup.totpSecret || acct?.totpSecret || '';
+      storedPinHash = parsedBackup.twoStepPinHash || acct?.twoStepPinHash || '';
     } catch {
       parsedBackup = null;
     }
@@ -965,17 +974,16 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   }
 
   const secretToVerify = storedTotpSecret || params.expectedTotpSecret || '';
-  if (!secretToVerify) {
-    return {
-      ok: false,
-      error: 'No Authenticator key is linked to this account. Please verify by Mobile or Email OTP.',
-    };
-  }
+  const pinHashToVerify = storedPinHash || (params.mode === 'register' ? params.expectedTwoStepPinHash || '' : '');
+  const codePinHash = sha256HexSync(cleanCode);
 
-  if (!verifyTotpCodeSync(secretToVerify, cleanCode)) {
+  const matchesPin = Boolean(pinHashToVerify && codePinHash === pinHashToVerify);
+  const matchesTotp = Boolean(secretToVerify && verifyTotpCodeSync(secretToVerify, cleanCode));
+
+  if (!matchesPin && !matchesTotp) {
     return {
       ok: false,
-      error: 'Invalid 6-digit code. Please open your Authenticator app and enter the current code.',
+      error: 'Invalid 6-digit verification code. Please check your code and try again.',
     };
   }
 
@@ -1002,7 +1010,8 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   return {
     ok: true,
     verificationToken: vToken,
-    totpSecret: secretToVerify,
+    totpSecret: secretToVerify || undefined,
+    twoStepPinHash: pinHashToVerify || undefined,
     recoveredBundle:
       parsedBackup && params.mode === 'login'
         ? {

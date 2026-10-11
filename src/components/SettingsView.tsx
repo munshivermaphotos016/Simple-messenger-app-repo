@@ -276,6 +276,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           code,
           mode: 'change_identifier',
           totpSecret: account.totpSecret,
+          twoStepPinHash: account.twoStepPinHash,
         }),
       });
       const data = await res.json();
@@ -4309,19 +4310,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div className="space-y-1">
                   <div className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
                     <Smartphone className="w-4 h-4 text-emerald-400" />
-                    <span>Native Android Package Included: Simple-Android-v7.0.0.apk (v7.0.0)</span>
+                    <span>Native Android Package Included: Simple-Android-v8.0.0.apk (v8.0.0)</span>
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    Available directly in your synced GitHub repository root (<code>/Simple-Android-v7.0.0.apk</code> &amp; <code>/Simple-Android-v6.0.0.apk</code>) and <code>/releases/</code>, or download directly below.
+                    Available directly in your synced GitHub repository root (<code>/Simple-Android-v8.0.0.apk</code>, <code>/Simple-Android-v7.0.0.apk</code> &amp; <code>/Simple-Android-v6.0.0.apk</code>) and <code>/releases/</code>, or download directly below.
                   </p>
                 </div>
                 <a
-                  href="/Simple-Android-v7.0.0.apk"
-                  download="Simple-Android-v7.0.0.apk"
+                  href="/Simple-Android-v8.0.0.apk"
+                  download="Simple-Android-v8.0.0.apk"
                   className="min-h-[38px] px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-2 shrink-0 shadow-lg shadow-emerald-500/20"
                 >
                   <Download className="w-4 h-4" />
-                  <span>Download Simple-Android-v7.0.0.apk</span>
+                  <span>Download Simple-Android-v8.0.0.apk</span>
                 </a>
               </div>
             </div>

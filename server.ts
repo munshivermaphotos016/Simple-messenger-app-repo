@@ -15,6 +15,7 @@ interface OtpGatewayConfig {
   smtpUser?: string;
   smtpPass?: string;
   smtpFrom?: string;
+  resendApiKey?: string;
   fast2smsApiKey?: string;
   twilioAccountSid?: string;
   twilioAuthToken?: string;
@@ -316,6 +317,7 @@ function getEffectiveGatewayConfig(): OtpGatewayConfig {
       process.env.SMTP_USER ||
       process.env.GMAIL_USER ||
       '',
+    resendApiKey: gatewayConfig.resendApiKey || process.env.RESEND_API_KEY || '',
     fast2smsApiKey: gatewayConfig.fast2smsApiKey || process.env.FAST2SMS_API_KEY || '',
     twilioAccountSid: gatewayConfig.twilioAccountSid || process.env.TWILIO_ACCOUNT_SID || '',
     twilioAuthToken: gatewayConfig.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN || '',
@@ -324,59 +326,53 @@ function getEffectiveGatewayConfig(): OtpGatewayConfig {
   };
 }
 
-let cachedFreeEmailAccount: nodemailer.TestAccount | null = null;
-let cachedFreeTransporter: nodemailer.Transporter | null = null;
-
-async function getFreeCloudEmailTransporter(): Promise<nodemailer.Transporter | null> {
-  if (cachedFreeTransporter) return cachedFreeTransporter;
-  try {
-    cachedFreeEmailAccount = await nodemailer.createTestAccount();
-    cachedFreeTransporter = nodemailer.createTransport({
-      host: cachedFreeEmailAccount.smtp.host,
-      port: cachedFreeEmailAccount.smtp.port,
-      secure: cachedFreeEmailAccount.smtp.secure,
-      auth: {
-        user: cachedFreeEmailAccount.user,
-        pass: cachedFreeEmailAccount.pass,
-      },
-      connectionTimeout: 3500,
-      greetingTimeout: 3500,
-      socketTimeout: 4500,
-    });
-    return cachedFreeTransporter;
-  } catch {
-    return null;
-  }
-}
-
-// Pre-warm free cloud email transporter in background
-getFreeCloudEmailTransporter().catch(() => {});
-
 async function dispatchRealEmailOtp(
   toEmail: string,
   otpCode: string,
   mode: string
-): Promise<{ delivered: boolean; provider?: string; emailPreviewUrl?: string; error?: string }> {
+): Promise<{ delivered: boolean; provider?: string; error?: string }> {
   const cfg = getEffectiveGatewayConfig();
-  const mailOptions = {
-    from: `"Simple Messenger" <${cfg.smtpFrom || cfg.smtpUser || 'verify@simplemessenger.app'}>`,
-    to: toEmail,
-    subject: `${otpCode} is your Simple verification code`,
-    text: `Your Simple 6-digit verification code for ${
-      mode === 'login' ? 'Sign In' : 'Create Account'
-    } is: ${otpCode}\n\nThis code expires in 5 minutes. Never share this code with anyone.`,
-    html: `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px; border: 1px solid #1e293b;">
-        <h2 style="color: #10b981; margin-top: 0;">Simple Messenger</h2>
-        <p style="color: #cbd5e1; font-size: 14px;">Your 6-digit verification code is:</p>
-        <div style="background: #020617; border: 1px solid #10b981; border-radius: 12px; padding: 16px; text-align: center; font-family: monospace; font-size: 28px; letter-spacing: 8px; color: #34d399; font-weight: bold; margin: 20px 0;">
-          ${otpCode}
-        </div>
-        <p style="color: #94a3b8; font-size: 12px;">Valid for 5 minutes. Do not share this code with anyone.</p>
+  const subjectText = `${otpCode} is your Simple verification code`;
+  const plainText = `Your Simple 6-digit verification code for ${
+    mode === 'login' ? 'Sign In' : 'Create Account'
+  } is: ${otpCode}\n\nThis code expires in 5 minutes. Never share this code with anyone.`;
+  const htmlBody = `
+    <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px; border: 1px solid #1e293b;">
+      <h2 style="color: #10b981; margin-top: 0;">Simple Messenger</h2>
+      <p style="color: #cbd5e1; font-size: 14px;">Your 6-digit verification code is:</p>
+      <div style="background: #020617; border: 1px solid #10b981; border-radius: 12px; padding: 16px; text-align: center; font-family: monospace; font-size: 28px; letter-spacing: 8px; color: #34d399; font-weight: bold; margin: 20px 0;">
+        ${otpCode}
       </div>
-    `,
-  };
+      <p style="color: #94a3b8; font-size: 12px;">Valid for 5 minutes. Do not share this code with anyone.</p>
+    </div>
+  `;
 
+  // 1. Resend Email API (if configured)
+  if (cfg.resendApiKey) {
+    try {
+      const resp = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cfg.resendApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: cfg.smtpFrom || 'Simple Messenger <onboarding@resend.dev>',
+          to: [toEmail],
+          subject: subjectText,
+          html: htmlBody,
+          text: plainText,
+        }),
+      });
+      if (resp.ok) {
+        return { delivered: true, provider: 'Resend Email Service' };
+      }
+    } catch {
+      // Fall through to SMTP
+    }
+  }
+
+  // 2. Real SMTP Email Delivery (Gmail App Password / Custom SMTP)
   if (cfg.smtpUser && cfg.smtpPass) {
     try {
       const transporter = nodemailer.createTransport({
@@ -387,40 +383,29 @@ async function dispatchRealEmailOtp(
           user: cfg.smtpUser,
           pass: cfg.smtpPass,
         },
-        connectionTimeout: 4000,
+        connectionTimeout: 5000,
       });
 
-      await transporter.sendMail(mailOptions);
+      await transporter.sendMail({
+        from: `"Simple Messenger" <${cfg.smtpFrom || cfg.smtpUser}>`,
+        to: toEmail,
+        subject: subjectText,
+        text: plainText,
+        html: htmlBody,
+      });
       return { delivered: true, provider: 'SMTP Email' };
-    } catch {
-      // Fall through to free cloud email transporter
+    } catch (err) {
+      return {
+        delivered: false,
+        error: err instanceof Error ? err.message : 'SMTP delivery failed',
+      };
     }
   }
 
-  try {
-    const freeTransporter = await Promise.race([
-      getFreeCloudEmailTransporter(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
-    ]);
-    if (freeTransporter) {
-      const info = await Promise.race([
-        freeTransporter.sendMail(mailOptions),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
-      ]);
-      if (info) {
-        const previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
-        return {
-          delivered: true,
-          provider: 'Cloud Mail OTP Service',
-          emailPreviewUrl: typeof previewUrl === 'string' ? previewUrl : undefined,
-        };
-      }
-    }
-  } catch {
-    // Safe fallback
-  }
-
-  return { delivered: true, provider: 'Simple Email OTP Service' };
+  return {
+    delivered: false,
+    error: 'Outgoing email server (SMTP / Resend) is not configured yet.',
+  };
 }
 
 async function dispatchRealSmsOtp(
@@ -486,29 +471,27 @@ async function dispatchRealSmsOtp(
     }
   }
 
-  // 3. Textbelt SMS Gateway
-  if (cfg.textbeltApiKey) {
-    try {
-      const e164 = rawPhone.trim().startsWith('+') ? rawPhone.trim() : `+${normPhone}`;
-      const resp = await fetch('https://textbelt.com/text', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phone: e164,
-          message: `Your Simple Messenger verification code is ${otpCode}`,
-          key: cfg.textbeltApiKey,
-        }),
-      });
-      const data = (await resp.json()) as Record<string, unknown>;
-      if (data.success === true) {
-        return { delivered: true, provider: 'Textbelt SMS Gateway' };
-      }
-    } catch {
-      // Fall through
+  // 3. Textbelt SMS Gateway (uses configured key or free-tier 'textbelt' key)
+  try {
+    const e164 = rawPhone.trim().startsWith('+') ? rawPhone.trim() : `+${normPhone}`;
+    const resp = await fetch('https://textbelt.com/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        phone: e164,
+        message: `Your Simple Messenger verification code is ${otpCode}`,
+        key: cfg.textbeltApiKey || 'textbelt',
+      }),
+    });
+    const data = (await resp.json()) as Record<string, unknown>;
+    if (data.success === true) {
+      return { delivered: true, provider: 'Textbelt SMS Gateway' };
     }
+  } catch {
+    // Fall through
   }
 
-  return { delivered: false, error: 'External SMS gateway not configured' };
+  return { delivered: false, error: 'Carrier SMS gateway not configured' };
 }
 
 async function startServer() {
@@ -560,18 +543,26 @@ async function startServer() {
   });
 
   const sendApkFile = (_req: express.Request, res: express.Response) => {
+    const v8Path = path.join(process.cwd(), 'Simple-Android-v8.0.0.apk');
     const v7Path = path.join(process.cwd(), 'Simple-Android-v7.0.0.apk');
     const v6Path = path.join(process.cwd(), 'Simple-Android-v6.0.0.apk');
     const fallbackPath = path.join(process.cwd(), 'Simple-Android.apk');
-    const apkPath = fs.existsSync(v7Path) ? v7Path : (fs.existsSync(v6Path) ? v6Path : fallbackPath);
+    const apkPath = fs.existsSync(v8Path)
+      ? v8Path
+      : fs.existsSync(v7Path)
+      ? v7Path
+      : fs.existsSync(v6Path)
+      ? v6Path
+      : fallbackPath;
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v7.0.0.apk"');
+    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v8.0.0.apk"');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.sendFile(apkPath);
   };
 
+  app.get('/Simple-Android-v8.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v7.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v6.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v5.0.0.apk', sendApkFile);
@@ -579,6 +570,7 @@ async function startServer() {
   app.get('/Simple-Android-v3.0.0.apk', sendApkFile);
   app.get('/Simple-Android.apk', sendApkFile);
   app.get('/Simple-Messenger.apk', sendApkFile);
+  app.get('/releases/Simple-v8.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v7.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v6.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v5.0.0.apk', sendApkFile);
@@ -636,6 +628,7 @@ async function startServer() {
       smtpPort,
       smtpUser,
       smtpPass,
+      resendApiKey,
       fast2smsApiKey,
       twilioAccountSid,
       twilioAuthToken,
@@ -649,6 +642,7 @@ async function startServer() {
       ...(smtpPort !== undefined ? { smtpPort: Number(smtpPort) || 465 } : {}),
       ...(smtpUser !== undefined ? { smtpUser: String(smtpUser).trim() } : {}),
       ...(smtpPass !== undefined ? { smtpPass: String(smtpPass).trim() } : {}),
+      ...(resendApiKey !== undefined ? { resendApiKey: String(resendApiKey).trim() } : {}),
       ...(fast2smsApiKey !== undefined ? { fast2smsApiKey: String(fast2smsApiKey).trim() } : {}),
       ...(twilioAccountSid !== undefined
         ? { twilioAccountSid: String(twilioAccountSid).trim() }
@@ -666,7 +660,7 @@ async function startServer() {
     const eff = getEffectiveGatewayConfig();
     res.json({
       ok: true,
-      smtpConfigured: Boolean(eff.smtpUser && eff.smtpPass),
+      smtpConfigured: Boolean((eff.smtpUser && eff.smtpPass) || eff.resendApiKey),
       smsGatewayConfigured: Boolean(
         eff.fast2smsApiKey || (eff.twilioAccountSid && eff.twilioAuthToken) || eff.textbeltApiKey
       ),
@@ -983,23 +977,21 @@ async function startServer() {
 
     let deliveryStatus: OtpChallengeRecord['externalDeliveryStatus'] = 'authenticator_or_pin';
     let deliveryProvider: string | null = null;
-    let emailPreviewUrl: string | undefined;
+    let externalDelivered = false;
 
     if (channel === 'email') {
       const emailResult = await dispatchRealEmailOtp(normTarget, otpCode, mode);
       if (emailResult.delivered) {
         deliveryStatus = 'delivered_smtp';
         deliveryProvider = emailResult.provider || 'Email OTP';
-        emailPreviewUrl = emailResult.emailPreviewUrl;
+        externalDelivered = true;
       }
     } else {
       const smsResult = await dispatchRealSmsOtp(rawTarget, normTarget, otpCode);
       if (smsResult.delivered) {
         deliveryStatus = 'delivered_sms';
-        deliveryProvider = smsResult.provider || 'Mobile SMS';
-      } else {
-        deliveryStatus = 'delivered_sms';
-        deliveryProvider = 'Mobile OTP Service';
+        deliveryProvider = smsResult.provider || 'Carrier SMS';
+        externalDelivered = true;
       }
     }
 
@@ -1026,6 +1018,7 @@ async function startServer() {
         ? `otpauth://totp/${label}?secret=${accountTotpSecret}&issuer=Simple&algorithm=SHA1&digits=6&period=30`
         : undefined;
 
+    // SECURITY GUARANTEE: Never return `deliveredCode`, `otpCode`, or any inbox preview URL in the response!
     res.json({
       ok: true,
       channel,
@@ -1034,10 +1027,10 @@ async function startServer() {
       normalizedTarget: normTarget,
       expiresAt,
       expiresInSec: 300,
-      externalDelivered: true,
+      externalDelivered,
       deliveryProvider,
-      emailPreviewUrl,
-      deliveredCode: otpCode,
+      hasTwoStepPin: Boolean(existingUser?.twoStepPinHash || existingBackup?.twoStepPinHash),
+      hasTotp: Boolean(existingUser?.totpSecret || existingBackup?.totpSecret),
       totpEnrollment:
         !isAlreadyRegistered && mode !== 'login'
           ? {
@@ -1048,10 +1041,13 @@ async function startServer() {
               digits: 6,
             }
           : null,
-      message:
-        channel === 'email'
-          ? `6-digit verification code sent to ${rawTarget}.`
-          : `6-digit verification code sent to ${rawTarget}.`,
+      message: externalDelivered
+        ? `6-digit verification code sent to ${rawTarget} via ${
+            channel === 'email' ? 'email' : 'text message (SMS)'
+          }.`
+        : channel === 'email'
+        ? `Verify ${rawTarget} using your email code, Google Sign-In, 6-Digit Security PIN, or Authenticator.`
+        : `Verify ${rawTarget} using your SMS code, 6-Digit Security PIN, or Authenticator.`,
     });
   });
 
@@ -1064,6 +1060,7 @@ async function startServer() {
     const code = String(req.body.code || '').trim();
     const passwordHash = String(req.body.passwordHash || '').trim();
     const clientTotpSecret = String(req.body.totpSecret || '').trim();
+    const clientTwoStepPinHash = String(req.body.twoStepPinHash || '').trim();
     const normTarget = normalizeTargetForOtp(channel, rawTarget);
     const challengeKey = `${channel}:${normTarget}`;
 
@@ -1089,11 +1086,13 @@ async function startServer() {
       ? verifyTotpCode(activeTotpSecret, code)
       : false;
 
-    // 2. For existing account login, check against registered 6-Digit Two-Step Verification PIN
+    // 2. Check against 6-Digit Security PIN (stored on account for login, or chosen by user during new registration)
     const storedPasswordHash =
       existingUser?.passwordHash || existingBackup?.passwordHash || '';
     const storedPinHash =
-      existingUser?.twoStepPinHash || existingBackup?.twoStepPinHash || '';
+      existingUser?.twoStepPinHash ||
+      existingBackup?.twoStepPinHash ||
+      (mode === 'register' ? clientTwoStepPinHash : '');
     const candidatePinHash = computeSha256Hex(code);
     const matchesTwoStepPin =
       Boolean(storedPinHash) &&

@@ -209,36 +209,6 @@ export function generateSixDigitOtp(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-export function dispatchDeviceOtpNotification(
-  channel: 'phone' | 'email',
-  target: string,
-  otpCode: string
-): void {
-  if (typeof window === 'undefined') return;
-  try {
-    if ('Notification' in window) {
-      const title =
-        channel === 'phone'
-          ? `SMS Verification Code • ${target}`
-          : `Email Verification Code • ${target}`;
-      const body = `${otpCode} is your Simple verification code. Do not share this code with anyone.`;
-      if (Notification.permission === 'granted') {
-        new Notification(title, { body, tag: `simple-otp-${channel}` });
-      } else if (Notification.permission !== 'denied') {
-        Notification.requestPermission()
-          .then((perm) => {
-            if (perm === 'granted') {
-              new Notification(title, { body, tag: `simple-otp-${channel}` });
-            }
-          })
-          .catch(() => {});
-      }
-    }
-  } catch {
-    // Ignore notification restrictions in WebView
-  }
-}
-
 async function handleLocalApiFallback(
   pathName: string,
   searchParams: URLSearchParams,
@@ -251,6 +221,15 @@ async function handleLocalApiFallback(
       headers: { 'Content-Type': 'application/json' },
     });
 
+  const getLocalGatewayConfig = (): Record<string, any> => {
+    try {
+      const raw = window.localStorage.getItem('simple_gateway_config_v1');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  };
+
   if (pathName === '/api/health') {
     return jsonResponse({
       status: 'ok',
@@ -261,14 +240,34 @@ async function handleLocalApiFallback(
   }
 
   if (pathName === '/api/auth/gateway-status' && method === 'GET') {
+    const cfg = getLocalGatewayConfig();
     return jsonResponse({
       ok: true,
-      smtpConfigured: true,
-      smtpUserMasked: 'verify@simplemessenger.app',
-      smsGatewayConfigured: true,
+      smtpConfigured: Boolean((cfg.smtpUser && cfg.smtpPass) || cfg.resendApiKey),
+      smtpUserMasked: cfg.smtpUser ? `${String(cfg.smtpUser).slice(0, 3)}***` : null,
+      smsGatewayConfigured: Boolean(cfg.fast2smsApiKey || cfg.textbeltApiKey),
       totpSupported: true,
       googleOAuthSupported: true,
     });
+  }
+
+  if (
+    (pathName === '/api/auth/configure-gateway' || pathName === '/api/auth/gateway-config') &&
+    method === 'POST'
+  ) {
+    try {
+      const prev = getLocalGatewayConfig();
+      const next = { ...prev, ...bodyObj };
+      window.localStorage.setItem('simple_gateway_config_v1', JSON.stringify(next));
+      return jsonResponse({
+        ok: true,
+        smtpConfigured: Boolean((next.smtpUser && next.smtpPass) || next.resendApiKey),
+        smsGatewayConfigured: Boolean(next.fast2smsApiKey || next.textbeltApiKey),
+        smsConfigured: Boolean(next.fast2smsApiKey || next.textbeltApiKey),
+      });
+    } catch {
+      return jsonResponse({ ok: false, error: 'Failed to save gateway settings.' }, 500);
+    }
   }
 
   if (pathName === '/api/auth/setup-totp' && method === 'POST') {
@@ -447,20 +446,102 @@ async function handleLocalApiFallback(
       attempts: 0,
     };
     saveLocalOtpChallenges(challenges);
-    dispatchDeviceOtpNotification(channel, rawTarget, otpCode);
 
+    const nativeFetch = window.__simpleNativeFetch || window.fetch.bind(window);
+    const cfg = getLocalGatewayConfig();
+    let externalDelivered = false;
+    let deliveryProvider: string | null = null;
+
+    if (channel === 'phone') {
+      if (cfg.fast2smsApiKey) {
+        try {
+          const indianTenDigit = normTarget.length >= 10 ? normTarget.slice(-10) : normTarget;
+          const resp = await nativeFetch('https://www.fast2sms.com/dev/bulkV2', {
+            method: 'POST',
+            headers: {
+              authorization: String(cfg.fast2smsApiKey),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              route: 'q',
+              message: `Your Simple Messenger verification OTP is ${otpCode}. Do not share this code with anyone.`,
+              language: 'english',
+              flash: 0,
+              numbers: indianTenDigit,
+            }),
+          });
+          const data = await resp.json();
+          if (resp.ok && data?.return === true) {
+            externalDelivered = true;
+            deliveryProvider = 'Fast2SMS Carrier Gateway';
+          }
+        } catch {
+          // Continue
+        }
+      }
+      if (!externalDelivered) {
+        try {
+          const e164 = rawTarget.startsWith('+') ? rawTarget.replace(/\s+/g, '') : `+${normTarget}`;
+          const resp = await nativeFetch('https://textbelt.com/text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              phone: e164,
+              message: `Your Simple Messenger verification code is ${otpCode}`,
+              key: cfg.textbeltApiKey || 'textbelt',
+            }),
+          });
+          const data = await resp.json();
+          if (data?.success === true) {
+            externalDelivered = true;
+            deliveryProvider = 'Textbelt SMS Gateway';
+          }
+        } catch {
+          // Continue
+        }
+      }
+    } else if (channel === 'email' && cfg.resendApiKey) {
+      try {
+        const resp = await nativeFetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${cfg.resendApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: 'Simple Messenger <onboarding@resend.dev>',
+            to: [normTarget],
+            subject: `${otpCode} is your Simple verification code`,
+            text: `Your Simple verification code is: ${otpCode}. Valid for 5 minutes.`,
+          }),
+        });
+        if (resp.ok) {
+          externalDelivered = true;
+          deliveryProvider = 'Resend Email Service';
+        }
+      } catch {
+        // Continue
+      }
+    }
+
+    // SECURITY GUARANTEE: Never return `deliveredCode` or `otpCode`, and never trigger a local device notification!
     return jsonResponse({
       ok: true,
       channel,
       target: rawTarget,
       normalizedTarget: normTarget,
       expiresInSec: 300,
-      externalDelivered: true,
-      deliveredCode: otpCode,
-      message:
-        channel === 'phone'
-          ? `6-digit verification code sent to ${rawTarget}.`
-          : `6-digit verification code sent to ${rawTarget}.`,
+      externalDelivered,
+      deliveryProvider,
+      hasTwoStepPin: Boolean(found?.twoStepPinHash),
+      hasTotp: Boolean(found?.totpSecret),
+      message: externalDelivered
+        ? `6-digit verification code sent to ${rawTarget} via ${
+            channel === 'email' ? 'email' : 'text message (SMS)'
+          }.`
+        : channel === 'email'
+        ? `Verify ${rawTarget} using your email code, Google Sign-In, 6-Digit Security PIN, or Authenticator.`
+        : `Verify ${rawTarget} using your SMS code, 6-Digit Security PIN, or Authenticator.`,
     });
   }
 

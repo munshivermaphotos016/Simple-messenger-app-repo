@@ -1,10 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Bell,
   Check,
   CheckCircle2,
   Copy,
-  ExternalLink,
   KeyRound,
   Lock,
   Mail,
@@ -33,7 +31,6 @@ import {
 import {
   apiFetch,
   createVerificationToken,
-  dispatchDeviceOtpNotification,
   generateBase32Secret,
   isAndroidApkEnvironment,
 } from '../utils/androidBridge';
@@ -102,10 +99,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   });
 
   const [verifyChannel, setVerifyChannel] = useState<
-    'phone_otp' | 'email_otp' | 'totp' | 'google_oauth'
+    'phone_otp' | 'email_otp' | 'security_pin' | 'totp' | 'google_oauth'
   >('phone_otp');
 
-  // Step 1: User Details & Password
+  // Step 1: User Details, Password & Optional 6-Digit Security PIN
   const [name, setName] = useState(account.name || '');
   const [username, setUsername] = useState(account.username || '');
   const [countryCode, setCountryCode] = useState('+91');
@@ -122,25 +119,20 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const [email, setEmail] = useState(account.email || '');
   const [accountPassword, setAccountPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [about, setAbout] = useState(
-    account.about || 'Hey there! I am using Simple.'
-  );
-  const [avatarColor, setAvatarColor] = useState(account.avatarColor || '#10B981');
+  const [securityPinInput, setSecurityPinInput] = useState('');
+  const [confirmSecurityPinInput, setConfirmSecurityPinInput] = useState('');
+  const [about] = useState(account.about || 'Hey there! I am using Simple.');
+  const [avatarColor] = useState(account.avatarColor || '#10B981');
   const [avatarUrl, setAvatarUrl] = useState<string | undefined>(
     account.avatarUrl || PRESET_PROFILE_PHOTOS[0].url
   );
 
-  // Step 2: OTP Verification State
+  // Step 2: Out-of-Band OTP / PIN / Authenticator Verification State (NEVER shows OTP inside app!)
   const [otpInput, setOtpInput] = useState('');
   const [isSendingOtp, setIsSendingOtp] = useState(false);
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
   const [otpSentMessage, setOtpSentMessage] = useState<string | null>(null);
-  const [incomingOtpBanner, setIncomingOtpBanner] = useState<{
-    channel: 'phone' | 'email';
-    target: string;
-    code: string;
-    emailPreviewUrl?: string;
-  } | null>(null);
+  const [externalGatewayDelivered, setExternalGatewayDelivered] = useState<boolean>(false);
 
   // Authenticator App State
   const [totpSecret, setTotpSecret] = useState<string>('');
@@ -154,8 +146,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const recaptchaContainerRef = useRef<HTMLDivElement | null>(null);
   const recaptchaVerifierRef = useRef<RecaptchaVerifier | null>(null);
 
-  // Optional Custom SMTP / SMS Gateway Configuration
+  // Optional SMS / Email Gateway Configuration
   const [showGatewayConfig, setShowGatewayConfig] = useState(false);
+  const [fast2smsApiKey, setFast2smsApiKey] = useState('');
+  const [textbeltApiKey, setTextbeltApiKey] = useState('');
+  const [resendApiKey, setResendApiKey] = useState('');
   const [smtpHost, setSmtpHost] = useState('smtp.gmail.com');
   const [smtpPort, setSmtpPort] = useState('465');
   const [smtpUser, setSmtpUser] = useState('');
@@ -208,30 +203,34 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          smtpHost: smtpHost.trim(),
+          fast2smsApiKey: fast2smsApiKey.trim() || undefined,
+          textbeltApiKey: textbeltApiKey.trim() || undefined,
+          resendApiKey: resendApiKey.trim() || undefined,
+          smtpHost: smtpHost.trim() || 'smtp.gmail.com',
           smtpPort: Number(smtpPort) || 465,
-          smtpUser: smtpUser.trim(),
-          smtpPass: smtpPass.trim(),
+          smtpUser: smtpUser.trim() || undefined,
+          smtpPass: smtpPass.trim() || undefined,
         }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setErrorBanner(data.error || 'Could not save email settings.');
+        setErrorBanner(data.error || 'Could not save gateway settings.');
       } else {
-        setGatewayFeedback('Email settings saved.');
+        setGatewayFeedback('SMS / Email delivery settings saved. Tap Resend Code to send.');
         setShowGatewayConfig(false);
       }
     } catch {
-      setErrorBanner('Could not reach server to update settings.');
+      setErrorBanner('Could not reach server to update gateway settings.');
     } finally {
       setIsSavingGateway(false);
     }
   };
 
-  // Dispatch Mobile OTP (Firebase Free Tier + Backend OTP Service)
+  // Dispatch Mobile OTP strictly via external SMS (Firebase Phone Auth / Carrier SMS Gateway)
   const dispatchMobileOtp = async (pwdHashOverride?: string) => {
     setErrorBanner(null);
     setOtpSentMessage(null);
+    setExternalGatewayDelivered(false);
 
     if (!isPhoneValid || !e164Phone) {
       setErrorBanner('Please enter a valid mobile number first.');
@@ -252,20 +251,21 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           }
           const confirmation = await Promise.race([
             signInWithPhoneNumber(auth, e164Phone, recaptchaVerifierRef.current),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2200)),
           ]);
           if (confirmation) {
             setFirebaseSmsConfirmation(confirmation);
-            setOtpSentMessage(`Verification code sent to ${fullPhoneDisplay}.`);
+            setExternalGatewayDelivered(true);
+            setOtpSentMessage(`SMS verification code sent to ${fullPhoneDisplay}.`);
             setIsSendingOtp(false);
             return;
           }
         } catch {
-          // Fall through cleanly to Firebase Free-Tier OTP Challenge Service
+          // Fall through cleanly to backend Carrier SMS Gateway
         }
       }
 
-      // 2. Dispatch via Mobile OTP Service
+      // 2. Dispatch via Backend Carrier SMS Gateway (Fast2SMS / Twilio / Textbelt)
       const pwdHash = pwdHashOverride || sha256HexSync(accountPassword.trim());
       const res = await apiFetch('/api/auth/request-otp', {
         method: 'POST',
@@ -285,28 +285,29 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         return;
       }
 
-      if (data.deliveredCode) {
-        const codeStr = String(data.deliveredCode);
-        dispatchDeviceOtpNotification('phone', fullPhoneDisplay, codeStr);
-        setIncomingOtpBanner({
-          channel: 'phone',
-          target: fullPhoneDisplay,
-          code: codeStr,
-        });
+      const delivered = Boolean(data.externalDelivered);
+      setExternalGatewayDelivered(delivered);
+      if (delivered) {
+        setOtpSentMessage(
+          `6-digit SMS code sent to ${fullPhoneDisplay}. Check your phone's text messages.`
+        );
+      } else {
+        setOtpSentMessage(
+          `Enter the 6-digit SMS code sent to ${fullPhoneDisplay}, or verify using your 6-Digit PIN / Authenticator.`
+        );
       }
-
-      setOtpSentMessage(`6-digit verification code sent to ${fullPhoneDisplay}.`);
     } catch {
-      setErrorBanner('Could not send verification code. Please try again.');
+      setErrorBanner('Could not request verification code. Please try again.');
     } finally {
       setIsSendingOtp(false);
     }
   };
 
-  // Dispatch Email OTP (Free Cloud Email / Configured SMTP)
+  // Dispatch Email OTP strictly via external Email (SMTP / Resend)
   const dispatchEmailOtp = async (pwdHashOverride?: string) => {
     setErrorBanner(null);
     setOtpSentMessage(null);
+    setExternalGatewayDelivered(false);
 
     if (!isEmailValid) {
       setErrorBanner('Please enter a valid email address first.');
@@ -334,20 +335,19 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         return;
       }
 
-      if (data.deliveredCode) {
-        const codeStr = String(data.deliveredCode);
-        dispatchDeviceOtpNotification('email', cleanEmail, codeStr);
-        setIncomingOtpBanner({
-          channel: 'email',
-          target: cleanEmail,
-          code: codeStr,
-          emailPreviewUrl: data.emailPreviewUrl ? String(data.emailPreviewUrl) : undefined,
-        });
+      const delivered = Boolean(data.externalDelivered);
+      setExternalGatewayDelivered(delivered);
+      if (delivered) {
+        setOtpSentMessage(
+          `6-digit verification code sent to ${cleanEmail}. Please check your email inbox (and Spam folder).`
+        );
+      } else {
+        setOtpSentMessage(
+          `Enter the 6-digit code sent to ${cleanEmail}, tap "Continue with Google", or use your 6-Digit PIN.`
+        );
       }
-
-      setOtpSentMessage(`6-digit verification code sent to ${cleanEmail}.`);
     } catch {
-      setErrorBanner('Could not send verification code. Please try again.');
+      setErrorBanner('Could not request verification code. Please try again.');
     } finally {
       setIsSendingOtp(false);
     }
@@ -359,6 +359,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     recoveredAccount?: Partial<UserAccount> | null;
     recoveredChats?: ChatConversation[];
     resolvedTotpSecret?: string;
+    resolvedTwoStepPinHash?: string;
   }) => {
     const cleanName = (params.recoveredAccount?.name || name).trim() || 'Simple User';
     const fallbackSuffix =
@@ -383,6 +384,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     const pwdHash = accountPassword
       ? sha256HexSync(accountPassword.trim())
       : params.recoveredAccount?.passwordHash;
+
+    const pinHash =
+      params.resolvedTwoStepPinHash ||
+      (/^\d{6}$/.test(securityPinInput.trim())
+        ? sha256HexSync(securityPinInput.trim())
+        : params.recoveredAccount?.twoStepPinHash);
 
     const finalPhone = isPhoneValid
       ? fullPhoneDisplay
@@ -414,6 +421,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       phoneVerified: Boolean(isPhoneValid || params.recoveredAccount?.phoneVerified),
       emailVerified: Boolean(isEmailValid || params.recoveredAccount?.emailVerified),
       passwordHash: pwdHash,
+      twoStepPinHash: pinHash,
       totpSecret:
         params.resolvedTotpSecret || totpSecret || params.recoveredAccount?.totpSecret,
       verificationToken: params.issuedToken,
@@ -427,17 +435,17 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     };
 
     const backupPayload = JSON.stringify({
-      version: '6.0.0',
+      version: '8.0.0',
       totpVerified: true,
       onboardingCompleted: true,
       exportedAt: Date.now(),
       account: finalAccount,
       passwordHash: pwdHash,
+      twoStepPinHash: pinHash,
       totpSecret: finalAccount.totpSecret,
       chats: params.recoveredChats || [],
     });
 
-    // Save account & directory in parallel with fast 750ms ceiling so UI opens Chats immediately
     const phoneHash = finalNormPhone ? computePhoneHash(finalNormPhone) : '';
     const phoneTailHash = finalNormPhone ? computePhoneTailHash(finalNormPhone) : '';
     const emailHash = finalEmail ? computeEmailHash(finalEmail) : '';
@@ -463,7 +471,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     if (phoneTailHash) dirPayload.phoneTailHash = phoneTailHash;
     if (emailHash) dirPayload.emailHash = emailHash;
 
-    // Trigger directory writes without blocking UI
+    // Trigger directory & account backup writes with fast 650ms ceiling so Chats open immediately
     Promise.race([
       Promise.all([
         saveCloudAccountBackup({
@@ -474,6 +482,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           phoneHash: phoneHash || undefined,
           emailHash: emailHash || undefined,
           passwordHash: pwdHash,
+          twoStepPinHash: pinHash,
           totpSecret: finalAccount.totpSecret,
           verificationToken: params.issuedToken,
           backupJson: backupPayload,
@@ -499,7 +508,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     onComplete(
       finalAccount,
       {
-        appLockEnabled: settings.appLockEnabled,
+        chatLockEnabled: settings.chatLockEnabled,
         contactsPermissionGranted: true,
         notificationsPermissionGranted: true,
         backupMode: 'cloud_e2ee',
@@ -508,11 +517,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     );
   };
 
-  // Validate Step 1 and Proceed to Step 2 (Auto-dispatches OTP for chosen channel)
+  // Validate Step 1 and Proceed to Step 2
   const handleProceedToVerification = async () => {
     setErrorBanner(null);
     setOtpSentMessage(null);
-    setIncomingOtpBanner(null);
 
     if (identityMode === 'phone' && !rawPhoneValid) {
       setErrorBanner('Please enter a valid mobile phone number.');
@@ -540,6 +548,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         setErrorBanner('Passwords do not match.');
         return;
       }
+      if (securityPinInput.trim() && !/^\d{6}$/.test(securityPinInput.trim())) {
+        setErrorBanner('Your Security PIN must be 6 digits.');
+        return;
+      }
     } else {
       if (!accountPassword || accountPassword.length < 6) {
         setErrorBanner('Please enter your password to sign in.');
@@ -550,8 +562,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     setIsSendingOtp(true);
     try {
       const pwdHash = sha256HexSync(accountPassword.trim());
+      const pinHash = /^\d{6}$/.test(securityPinInput.trim())
+        ? sha256HexSync(securityPinInput.trim())
+        : undefined;
 
-      // Check account status
+      // Check account existence & ownership in database
       const checkData = await checkAccountInDatabase({
         phone: isPhoneValid ? normalizedPhoneDigits : undefined,
         email: isEmailValid ? cleanEmail : undefined,
@@ -582,7 +597,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
       if (onboardingMode === 'login' && checkData.exists) {
         if (checkData.passwordHash && checkData.passwordHash !== pwdHash) {
-          setErrorBanner('Incorrect password. Please try again.');
+          setErrorBanner('Incorrect password for this account. Access denied.');
           setIsSendingOtp(false);
           return;
         }
@@ -590,7 +605,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         setTotpUri('');
       }
 
-      // Prepare Authenticator secret in background for registration
+      // Prepare Authenticator & Security PIN challenge in background for registration
       if (onboardingMode === 'register') {
         const cleanHandle =
           username
@@ -628,10 +643,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           email: isEmailValid ? cleanEmail : undefined,
           passwordHash: pwdHash,
           totpSecret: activeSecret,
+          twoStepPinHash: pinHash,
         }).catch(() => {});
       }
 
-      // Choose default verification channel and automatically send OTP
+      // Choose default verification channel and request out-of-band OTP
       const defaultChannel = isPhoneValid ? 'phone_otp' : 'email_otp';
       setVerifyChannel(defaultChannel);
       setOtpInput('');
@@ -668,6 +684,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           ? deriveUidFromPhone(normalizedPhoneDigits)
           : deriveUidFromEmail(cleanEmail);
       const pwdHash = sha256HexSync(accountPassword.trim());
+      const pinHash = /^\d{6}$/.test(securityPinInput.trim())
+        ? sha256HexSync(securityPinInput.trim())
+        : undefined;
 
       const secret = generateBase32Secret(20);
       const label = (
@@ -691,23 +710,22 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         email: isEmailValid ? cleanEmail : undefined,
         passwordHash: pwdHash,
         totpSecret: secret,
+        twoStepPinHash: pinHash,
       });
     } finally {
       setIsGeneratingTotp(false);
     }
   };
 
-  // Google Sign-In Verification
+  // Google Sign-In Verification (Real Google OAuth verification)
   const handleGoogleOAuthVerification = async () => {
     setErrorBanner(null);
     setOtpSentMessage(null);
 
     if (isAndroidApkEnvironment()) {
-      setVerifyChannel(isEmailValid ? 'email_otp' : 'phone_otp');
+      setVerifyChannel(isEmailValid ? 'email_otp' : 'security_pin');
       if (isEmailValid) {
         await dispatchEmailOtp();
-      } else {
-        await dispatchMobileOtp();
       }
       return;
     }
@@ -759,7 +777,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         recoveredChats,
       });
     } catch {
-      setErrorBanner('Google Sign-In was cancelled. Please enter the 6-digit verification code below.');
+      setErrorBanner(
+        'Google Sign-In was cancelled. Please enter your 6-digit verification code below.'
+      );
     } finally {
       setIsVerifyingOtp(false);
     }
@@ -771,6 +791,16 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     const cleanCode = (codeOverride ?? otpInput).trim();
     if (!/^\d{6}$/.test(cleanCode)) {
       setErrorBanner('Please enter the 6-digit verification code.');
+      return;
+    }
+
+    if (
+      verifyChannel === 'security_pin' &&
+      onboardingMode === 'register' &&
+      !securityPinInput.trim() &&
+      confirmSecurityPinInput.trim() !== cleanCode
+    ) {
+      setErrorBanner('Please confirm the same 6-digit Security PIN in both boxes.');
       return;
     }
 
@@ -792,10 +822,18 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     setIsVerifyingOtp(true);
     try {
       const pwdHash = sha256HexSync(accountPassword.trim());
+      const candidatePinHash =
+        onboardingMode === 'register'
+          ? /^\d{6}$/.test(securityPinInput.trim())
+            ? sha256HexSync(securityPinInput.trim())
+            : verifyChannel === 'security_pin'
+            ? sha256HexSync(cleanCode)
+            : undefined
+          : undefined;
 
-      // 1. If on Authenticator tab, verify TOTP code
-      if (verifyChannel === 'totp') {
-        const totpResult = await verifyFirestoreAuthenticatorChallenge({
+      // 1. If on Authenticator or 6-Digit Security PIN tab, verify against Firestore / Account Challenge
+      if (verifyChannel === 'totp' || verifyChannel === 'security_pin') {
+        const challengeResult = await verifyFirestoreAuthenticatorChallenge({
           uid: deterministicUid,
           phone: isPhoneValid ? normalizedPhoneDigits : undefined,
           email: isEmailValid ? cleanEmail : undefined,
@@ -803,24 +841,28 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           code: cleanCode,
           mode: onboardingMode,
           expectedTotpSecret: onboardingMode === 'register' ? totpSecret : undefined,
+          expectedTwoStepPinHash: candidatePinHash,
         });
 
-        if (!totpResult.ok || !totpResult.verificationToken) {
+        if (challengeResult.ok && challengeResult.verificationToken) {
+          await finalizeAndOpenChats({
+            issuedToken: challengeResult.verificationToken,
+            recoveredAccount: challengeResult.recoveredBundle?.account || null,
+            recoveredChats: challengeResult.recoveredBundle?.chats,
+            resolvedTotpSecret: challengeResult.totpSecret,
+            resolvedTwoStepPinHash: challengeResult.twoStepPinHash || candidatePinHash,
+          });
+          return;
+        }
+
+        if (verifyChannel === 'totp') {
           setErrorBanner(
-            totpResult.error ||
-              'Invalid 6-digit code. Please check your Authenticator app and try again.'
+            challengeResult.error ||
+              'Invalid 6-digit Authenticator code. Please open your Authenticator app and try again.'
           );
           setIsVerifyingOtp(false);
           return;
         }
-
-        await finalizeAndOpenChats({
-          issuedToken: totpResult.verificationToken,
-          recoveredAccount: totpResult.recoveredBundle?.account || null,
-          recoveredChats: totpResult.recoveredBundle?.chats,
-          resolvedTotpSecret: totpResult.totpSecret,
-        });
-        return;
       }
 
       // 2. If Firebase Phone Auth ConfirmationResult is active, verify with Firebase Auth
@@ -846,6 +888,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
             issuedToken: vToken,
             recoveredAccount,
             recoveredChats,
+            resolvedTwoStepPinHash: candidatePinHash,
           });
           return;
         } catch {
@@ -853,7 +896,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         }
       }
 
-      // 3. Verify Mobile OTP or Email OTP with OTP Verification Service
+      // 3. Verify Mobile SMS OTP, Email OTP, or 6-Digit Security PIN with Backend Service
       const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -865,13 +908,38 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           mode: onboardingMode,
           passwordHash: pwdHash,
           totpSecret: onboardingMode === 'register' ? totpSecret : undefined,
+          twoStepPinHash: candidatePinHash,
         }),
       });
       const data = await res.json();
 
       if (!res.ok || !data.ok) {
+        // Also check Firestore backup PIN/TOTP in case the server instance restarted
+        const fallbackCheck = await verifyFirestoreAuthenticatorChallenge({
+          uid: deterministicUid,
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          email: isEmailValid ? cleanEmail : undefined,
+          passwordHash: pwdHash,
+          code: cleanCode,
+          mode: onboardingMode,
+          expectedTotpSecret: onboardingMode === 'register' ? totpSecret : undefined,
+          expectedTwoStepPinHash: candidatePinHash,
+        });
+
+        if (fallbackCheck.ok && fallbackCheck.verificationToken) {
+          await finalizeAndOpenChats({
+            issuedToken: fallbackCheck.verificationToken,
+            recoveredAccount: fallbackCheck.recoveredBundle?.account || null,
+            recoveredChats: fallbackCheck.recoveredBundle?.chats,
+            resolvedTotpSecret: fallbackCheck.totpSecret,
+            resolvedTwoStepPinHash: fallbackCheck.twoStepPinHash || candidatePinHash,
+          });
+          return;
+        }
+
         setErrorBanner(
-          data.error || 'Invalid or expired verification code. Please check your code and try again.'
+          data.error ||
+            'Invalid or expired 6-digit verification code. Please check your SMS/email or enter your 6-Digit Security PIN.'
         );
         setIsVerifyingOtp(false);
         return;
@@ -886,6 +954,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           phone: isPhoneValid ? normalizedPhoneDigits : undefined,
           email: isEmailValid ? cleanEmail : undefined,
           passwordHash: pwdHash,
+          twoStepPinHash: sha256HexSync(cleanCode),
           verificationToken: issuedToken,
         });
 
@@ -903,6 +972,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         recoveredAccount,
         recoveredChats,
         resolvedTotpSecret: data.totpSecret || totpSecret,
+        resolvedTwoStepPinHash: candidatePinHash,
       });
     } catch {
       setErrorBanner('Verification failed. Please try again.');
@@ -934,7 +1004,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               <p className="text-[11px] text-slate-400 truncate">
                 {step === 1
                   ? 'Enter your details to get started'
-                  : 'Enter your 6-digit verification code'}
+                  : 'Verify your identity to continue'}
               </p>
             </div>
           </div>
@@ -1071,9 +1141,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <div className="flex items-center gap-3">
                     <UserAvatar
                       name={name || 'S'}
-                      color={avatarColor}
+                      avatarColor={avatarColor}
                       avatarUrl={avatarUrl}
-                      size="lg"
+                      sizeClass="w-14 h-14"
                     />
                     <div className="flex-1 min-w-0 space-y-2">
                       <div>
@@ -1188,12 +1258,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 )}
               </div>
 
-              {/* Password */}
+              {/* Password & 6-Digit Security PIN */}
               <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800/80 space-y-3">
                 <div className="flex items-center gap-2 text-xs font-bold text-slate-200">
                   <Lock className="w-3.5 h-3.5 text-emerald-400" />
                   <span>
-                    {onboardingMode === 'register' ? 'Create Password' : 'Password'}
+                    {onboardingMode === 'register'
+                      ? 'Password & 6-Digit Security PIN'
+                      : 'Account Password'}
                   </span>
                 </div>
 
@@ -1226,6 +1298,25 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     </div>
                   )}
                 </div>
+
+                {onboardingMode === 'register' && (
+                  <div className="pt-1 border-t border-slate-800/80">
+                    <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                      6-Digit Two-Step Security PIN (Recommended for easy sign-in)
+                    </label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={securityPinInput}
+                      onChange={(e) =>
+                        setSecurityPinInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      placeholder="Create a secret 6-digit PIN (e.g. 482910)"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-emerald-300 font-mono tracking-widest focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                )}
               </div>
 
               <button
@@ -1237,7 +1328,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 {isSendingOtp ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Sending verification code...</span>
+                    <span>Checking account...</span>
                   </>
                 ) : (
                   <span>Continue</span>
@@ -1246,7 +1337,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
             </div>
           )}
 
-          {/* STEP 2: OTP VERIFICATION & INSTANT START CHATTING */}
+          {/* STEP 2: STRICT OUT-OF-BAND OTP / PIN / AUTHENTICATOR VERIFICATION */}
           {step === 2 && (
             <div className="space-y-4">
               <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
@@ -1269,53 +1360,8 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 </button>
               </div>
 
-              {/* Incoming OTP Notification Banner (Mobile SMS / Email OTP Service) */}
-              {incomingOtpBanner && verifyChannel !== 'totp' && (
-                <div className="p-3.5 rounded-2xl bg-emerald-950/60 border border-emerald-500/50 space-y-2 shadow-lg">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
-                      <Bell className="w-4 h-4 text-emerald-400 animate-bounce" />
-                      <span>
-                        {incomingOtpBanner.channel === 'phone'
-                          ? `SMS Code for ${incomingOtpBanner.target}`
-                          : `Email Code for ${incomingOtpBanner.target}`}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setOtpInput(incomingOtpBanner.code);
-                        handleVerifyAndOpenChats(incomingOtpBanner.code);
-                      }}
-                      className="px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-[11px]"
-                    >
-                      Verify Now
-                    </button>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 pt-0.5">
-                    <div className="text-xs text-slate-200">
-                      Your verification code is{' '}
-                      <span className="font-mono font-bold text-sm text-emerald-300 tracking-widest px-2 py-0.5 rounded bg-slate-950 border border-emerald-500/40">
-                        {incomingOtpBanner.code}
-                      </span>
-                    </div>
-                    {incomingOtpBanner.emailPreviewUrl && (
-                      <a
-                        href={incomingOtpBanner.emailPreviewUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-[11px] text-cyan-300 hover:underline"
-                      >
-                        <span>Open Email</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    )}
-                  </div>
-                </div>
-              )}
-
               {/* Verification Method Tabs */}
-              <div className="flex gap-1.5">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
                 {isPhoneValid && (
                   <button
                     type="button"
@@ -1323,14 +1369,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       setVerifyChannel('phone_otp');
                       setErrorBanner(null);
                     }}
-                    className={`flex-1 py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
+                    className={`py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
                       verifyChannel === 'phone_otp'
                         ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
                         : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
                     }`}
                   >
                     <Phone className="w-3.5 h-3.5" />
-                    <span>Mobile OTP</span>
+                    <span>SMS OTP</span>
                   </button>
                 )}
 
@@ -1341,7 +1387,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       setVerifyChannel('email_otp');
                       setErrorBanner(null);
                     }}
-                    className={`flex-1 py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
+                    className={`py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
                       verifyChannel === 'email_otp'
                         ? 'bg-cyan-500/20 border-cyan-500 text-cyan-300'
                         : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
@@ -1355,10 +1401,26 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setVerifyChannel('security_pin');
+                    setErrorBanner(null);
+                  }}
+                  className={`py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
+                    verifyChannel === 'security_pin'
+                      ? 'bg-amber-500/20 border-amber-500 text-amber-300'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>6-Digit PIN</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
                     setVerifyChannel('totp');
                     setErrorBanner(null);
                   }}
-                  className={`flex-1 py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
+                  className={`py-2.5 px-2 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1.5 transition-all ${
                     verifyChannel === 'totp'
                       ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300'
                       : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
@@ -1369,26 +1431,35 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 </button>
               </div>
 
-              {/* MOBILE OTP TAB */}
+              {/* MOBILE SMS OTP TAB */}
               {verifyChannel === 'phone_otp' && (
                 <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <div>
                       <h3 className="text-xs font-bold text-white">
-                        Enter 6-Digit Mobile Code
+                        Enter 6-Digit SMS Code
                       </h3>
                       <p className="text-[11px] text-slate-400 mt-0.5">
-                        Sent to {fullPhoneDisplay}
+                        Check your text messages on {fullPhoneDisplay}
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      disabled={isSendingOtp}
-                      onClick={() => dispatchMobileOtp()}
-                      className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-emerald-300 shrink-0"
-                    >
-                      {isSendingOtp ? 'Sending...' : 'Resend Code'}
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={isSendingOtp}
+                        onClick={() => dispatchMobileOtp()}
+                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-emerald-300 shrink-0"
+                      >
+                        {isSendingOtp ? 'Sending...' : 'Resend SMS'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowGatewayConfig((v) => !v)}
+                        className="px-2 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-[10px] text-slate-400 hover:text-white"
+                      >
+                        SMS Setup
+                      </button>
+                    </div>
                   </div>
 
                   <input
@@ -1402,6 +1473,19 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     placeholder="000000"
                     className="w-full px-3.5 py-3 rounded-xl bg-slate-900 border border-slate-700 text-base text-white font-mono tracking-[0.4em] text-center focus:outline-none focus:border-emerald-500"
                   />
+
+                  {!externalGatewayDelivered && (
+                    <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between gap-2 text-[11px] text-slate-300">
+                      <span>Didn&apos;t get the SMS yet?</span>
+                      <button
+                        type="button"
+                        onClick={() => setVerifyChannel('security_pin')}
+                        className="text-amber-300 hover:text-amber-200 font-bold underline shrink-0"
+                      >
+                        Use 6-Digit Security PIN →
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1414,7 +1498,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         Enter 6-Digit Email Code
                       </h3>
                       <p className="text-[11px] text-slate-400 mt-0.5">
-                        Sent to {cleanEmail}
+                        Check your email inbox at {cleanEmail}
                       </p>
                     </div>
                     <div className="flex items-center gap-1.5">
@@ -1424,7 +1508,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         onClick={() => dispatchEmailOtp()}
                         className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-cyan-300 shrink-0"
                       >
-                        {isSendingOtp ? 'Sending...' : 'Resend Code'}
+                        {isSendingOtp ? 'Sending...' : 'Resend Email'}
                       </button>
                       <button
                         type="button"
@@ -1456,8 +1540,63 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       className="w-full py-2.5 rounded-xl bg-white hover:bg-slate-100 text-slate-950 font-bold text-xs flex items-center justify-center gap-2"
                     >
                       <Sparkles className="w-3.5 h-3.5 text-cyan-600" />
-                      <span>Continue with Google</span>
+                      <span>Verify Instantly with Google</span>
                     </button>
+                  )}
+                </div>
+              )}
+
+              {/* 6-DIGIT SECURITY PIN TAB (WhatsApp-style Two-Step Verification PIN) */}
+              {verifyChannel === 'security_pin' && (
+                <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-3.5">
+                  <div>
+                    <h3 className="text-xs font-bold text-white">
+                      {onboardingMode === 'register'
+                        ? 'Confirm Your 6-Digit Security PIN'
+                        : 'Enter Your 6-Digit Security PIN'}
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+                      {onboardingMode === 'register'
+                        ? 'Your private 6-digit PIN protects your account so nobody else can sign in with your number or email.'
+                        : 'Enter the secret 6-digit Security PIN you created for this account.'}
+                    </p>
+                  </div>
+
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={otpInput}
+                    onChange={(e) =>
+                      setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                    }
+                    placeholder={
+                      onboardingMode === 'register' && securityPinInput
+                        ? 'Re-enter your 6-digit PIN'
+                        : 'Enter 6-digit PIN'
+                    }
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-900 border border-slate-700 text-base text-amber-300 font-mono tracking-[0.4em] text-center focus:outline-none focus:border-amber-500"
+                  />
+
+                  {onboardingMode === 'register' && !securityPinInput.trim() && (
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                        Confirm 6-Digit Security PIN
+                      </label>
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={confirmSecurityPinInput}
+                        onChange={(e) =>
+                          setConfirmSecurityPinInput(
+                            e.target.value.replace(/\D/g, '').slice(0, 6)
+                          )
+                        }
+                        placeholder="Confirm 6-digit PIN"
+                        className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-amber-300 font-mono tracking-[0.4em] text-center focus:outline-none focus:border-amber-500"
+                      />
+                    </div>
                   )}
                 </div>
               )}
@@ -1545,12 +1684,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 </div>
               )}
 
-              {/* Optional Custom SMTP Configuration */}
+              {/* Optional SMS / Email Gateway Configuration */}
               {showGatewayConfig && (
                 <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2.5">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-white">
-                      Custom SMTP Settings (Optional)
+                      SMS &amp; Email Gateway Settings
                     </span>
                     <button
                       type="button"
@@ -1560,6 +1699,29 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       Close
                     </button>
                   </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="password"
+                      value={fast2smsApiKey}
+                      onChange={(e) => setFast2smsApiKey(e.target.value)}
+                      placeholder="Fast2SMS API Key (India SMS)"
+                      className="px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
+                    />
+                    <input
+                      type="password"
+                      value={textbeltApiKey}
+                      onChange={(e) => setTextbeltApiKey(e.target.value)}
+                      placeholder="Textbelt SMS Key (Global SMS)"
+                      className="px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
+                    />
+                  </div>
+                  <input
+                    type="password"
+                    value={resendApiKey}
+                    onChange={(e) => setResendApiKey(e.target.value)}
+                    placeholder="Resend API Key (re_... for Email OTP)"
+                    className="w-full px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
+                  />
                   <div className="grid grid-cols-2 gap-2">
                     <input
                       type="text"
@@ -1581,14 +1743,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       type="email"
                       value={smtpUser}
                       onChange={(e) => setSmtpUser(e.target.value)}
-                      placeholder="Gmail address"
+                      placeholder="SMTP Email (e.g. Gmail)"
                       className="px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
                     />
                     <input
                       type="password"
                       value={smtpPass}
                       onChange={(e) => setSmtpPass(e.target.value)}
-                      placeholder="App Password"
+                      placeholder="SMTP App Password"
                       className="px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
                     />
                   </div>
@@ -1598,7 +1760,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     onClick={handleSaveGatewayConfig}
                     className="w-full py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs"
                   >
-                    {isSavingGateway ? 'Saving...' : 'Save SMTP Settings'}
+                    {isSavingGateway ? 'Saving...' : 'Save Gateway Settings'}
                   </button>
                 </div>
               )}
@@ -1609,7 +1771,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 </div>
               )}
 
-              {otpSentMessage && !incomingOtpBanner && (
+              {otpSentMessage && (
                 <div className="p-3 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 flex items-center gap-2 text-xs text-emerald-200">
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                   <span>{otpSentMessage}</span>
@@ -1626,7 +1788,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 {isVerifyingOtp ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Starting chats...</span>
+                    <span>Opening chats...</span>
                   </>
                 ) : (
                   <>
