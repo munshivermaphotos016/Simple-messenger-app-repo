@@ -182,6 +182,41 @@ const otpChallenges = new Map<string, OtpChallengeRecord>();
 const verifiedOwnershipTokens = new Map<string, VerifiedOwnershipToken>();
 let gatewayConfig: OtpGatewayConfig = {};
 
+export interface FriendRequestRecord {
+  id: string;
+  fromUid: string;
+  fromUsername: string;
+  fromName: string;
+  fromAvatarUrl?: string;
+  fromAvatarColor?: string;
+  toUid: string;
+  toUsername: string;
+  status: 'pending' | 'accepted' | 'declined';
+  createdAt: number;
+}
+
+const friendships = new Set<string>();
+const friendRequests = new Map<string, FriendRequestRecord>();
+const acceptedChatRequests = new Set<string>();
+
+function isFriend(uidA?: string, uidB?: string): boolean {
+  if (!uidA || !uidB || uidA === uidB) return false;
+  return friendships.has(`${uidA}:${uidB}`) || friendships.has(`${uidB}:${uidA}`);
+}
+
+function addFriendship(uidA: string, uidB: string): void {
+  if (!uidA || !uidB || uidA === uidB) return;
+  friendships.add(`${uidA}:${uidB}`);
+  friendships.add(`${uidB}:${uidA}`);
+  savePersistentDatabase();
+}
+
+function removeFriendship(uidA: string, uidB: string): void {
+  friendships.delete(`${uidA}:${uidB}`);
+  friendships.delete(`${uidB}:${uidA}`);
+  savePersistentDatabase();
+}
+
 function sanitizePublicUserRecord(u: DirectoryUserRecord): Omit<DirectoryUserRecord, 'passwordHash' | 'twoStepPinHash' | 'totpSecret'> {
   const { passwordHash: _pw, twoStepPinHash: _pin, totpSecret: _totp, ...publicFields } = u;
   void _pw;
@@ -210,6 +245,21 @@ function loadPersistentDatabase(): void {
         routedMessages.push(m);
       });
     }
+    if (Array.isArray(parsed.friendships)) {
+      parsed.friendships.forEach((f: string) => {
+        if (typeof f === 'string') friendships.add(f);
+      });
+    }
+    if (Array.isArray(parsed.friendRequests)) {
+      parsed.friendRequests.forEach((r: FriendRequestRecord) => {
+        if (r && r.id) friendRequests.set(r.id, r);
+      });
+    }
+    if (Array.isArray(parsed.acceptedChatRequests)) {
+      parsed.acceptedChatRequests.forEach((c: string) => {
+        if (typeof c === 'string') acceptedChatRequests.add(c);
+      });
+    }
     if (parsed.gatewayConfig && typeof parsed.gatewayConfig === 'object') {
       gatewayConfig = parsed.gatewayConfig;
     }
@@ -227,6 +277,9 @@ function savePersistentDatabase(): void {
       users: Array.from(userDirectory.values()),
       accountBackups: Array.from(cloudAccountBackups.entries()),
       routedMessages: routedMessages.slice(-500),
+      friendships: Array.from(friendships),
+      friendRequests: Array.from(friendRequests.values()),
+      acceptedChatRequests: Array.from(acceptedChatRequests),
       gatewayConfig,
       updatedAt: Date.now(),
     };
@@ -757,6 +810,624 @@ async function startServer() {
       accountLabel,
       otpauthUri,
     });
+  });
+
+  // ============================================================================
+  // GOOGLE AUTHENTICATOR USERNAME + PASSWORD AUTHENTICATION ENGINE
+  // ============================================================================
+
+  // Check username availability
+  app.get('/api/auth/check-username', (req, res) => {
+    const raw = String(req.query.username || '').toLowerCase().trim().replace(/^@/, '');
+    const clean = raw.replace(/[^a-z0-9._-]/g, '');
+    if (!clean || clean.length < 3) {
+      res.json({ available: false, error: 'Username must be at least 3 characters.' });
+      return;
+    }
+    let taken = false;
+    for (const u of userDirectory.values()) {
+      if (u.username.toLowerCase() === clean) {
+        taken = true;
+        break;
+      }
+    }
+    res.json({ available: !taken, username: clean });
+  });
+
+  // Pre-check credentials for login (Step 1)
+  app.post('/api/auth/check-user-for-login', (req, res) => {
+    const cleanUsername = String(req.body.username || '')
+      .toLowerCase()
+      .trim()
+      .replace(/^@/, '');
+    const passwordHash = String(req.body.passwordHash || '').trim();
+
+    if (!cleanUsername) {
+      res.status(400).json({ ok: false, error: 'Username is required.' });
+      return;
+    }
+
+    let matched: DirectoryUserRecord | undefined;
+    for (const u of userDirectory.values()) {
+      if (u.username.toLowerCase() === cleanUsername) {
+        matched = u;
+        break;
+      }
+    }
+
+    if (!matched) {
+      res.status(404).json({
+        ok: false,
+        error: `No Simple account found with username @${cleanUsername}. Check your username or create an account.`,
+      });
+      return;
+    }
+
+    if (matched.passwordHash && passwordHash && matched.passwordHash !== passwordHash) {
+      res.status(401).json({
+        ok: false,
+        error: 'Incorrect account password. Access denied.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      username: matched.username,
+      name: matched.name,
+      avatarUrl: matched.avatarUrl,
+      avatarColor: matched.avatarColor,
+      hasTotp: Boolean(matched.totpSecret),
+    });
+  });
+
+  // Register account with Google Authenticator TOTP
+  app.post('/api/auth/register-totp', (req, res) => {
+    const {
+      username,
+      name,
+      passwordHash,
+      totpSecret,
+      code,
+      avatarUrl,
+      avatarColor,
+      about,
+      identityFingerprint,
+    } = req.body;
+
+    const cleanUsername = String(username || '')
+      .toLowerCase()
+      .trim()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9._-]/g, '');
+
+    if (!cleanUsername || cleanUsername.length < 3) {
+      res.status(400).json({
+        ok: false,
+        error: 'Username must be at least 3 characters (letters, numbers, dots, dashes).',
+      });
+      return;
+    }
+
+    // Verify username uniqueness
+    for (const u of userDirectory.values()) {
+      if (u.username.toLowerCase() === cleanUsername) {
+        res.status(409).json({
+          ok: false,
+          error: `@${cleanUsername} is already registered by another user. Please choose another username.`,
+        });
+        return;
+      }
+    }
+
+    const pwdHash = String(
+      passwordHash ||
+      (req.body.password ? crypto.createHash('sha256').update(String(req.body.password)).digest('hex') : '')
+    );
+    if (!pwdHash) {
+      res.status(400).json({ ok: false, error: 'Password or password hash is required.' });
+      return;
+    }
+
+    if (!totpSecret) {
+      res.status(400).json({ ok: false, error: 'Google Authenticator secret key is required.' });
+      return;
+    }
+
+    const rawCode = String(code || req.body.totpCode || '').trim();
+    if (!/^\d{6}$/.test(rawCode)) {
+      res.status(400).json({
+        ok: false,
+        error: 'Please enter a valid 6-digit numeric code from Google Authenticator.',
+      });
+      return;
+    }
+
+    const isTotpValid = verifyTotpCode(String(totpSecret), rawCode);
+    if (!isTotpValid) {
+      res.status(400).json({
+        ok: false,
+        error: 'Invalid 6-digit Google Authenticator code. Ensure your device time is synchronized and enter the current code shown in Google Authenticator.',
+      });
+      return;
+    }
+
+    const uid = `usr_${crypto.randomBytes(8).toString('hex')}`;
+    const record: DirectoryUserRecord = {
+      uid,
+      name: String(name || cleanUsername).trim(),
+      username: cleanUsername,
+      phone: '',
+      normalizedPhone: '',
+      email: '',
+      passwordHash: pwdHash,
+      totpSecret: String(totpSecret),
+      about: String(about || 'Hey there! I am using Simple.').trim(),
+      avatarColor: String(avatarColor || '#10B981'),
+      avatarUrl: avatarUrl ? String(avatarUrl) : undefined,
+      identityFingerprint: String(
+        identityFingerprint || crypto.randomBytes(16).toString('hex').toUpperCase()
+      ),
+      allowUsernameDiscovery: true,
+      hidePhoneNumber: true,
+      isOnline: true,
+      lastSeen: 'Online',
+      updatedAt: Date.now(),
+    };
+
+    userDirectory.set(uid, record);
+    savePersistentDatabase();
+
+    const publicUser = sanitizePublicUserRecord(record);
+    const sessionToken = `stok_${crypto.randomBytes(24).toString('hex')}`;
+    verifiedOwnershipTokens.set(sessionToken, {
+      token: sessionToken,
+      channel: 'email',
+      normalizedTarget: cleanUsername,
+      verifiedAt: Date.now(),
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    });
+
+    // Broadcast new user to all clients
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        c.send(JSON.stringify({ type: 'directory:user_updated', user: publicUser }));
+      }
+    });
+
+    res.json({
+      ok: true,
+      user: publicUser,
+      sessionToken,
+      message: `Account created successfully! Google Authenticator is linked.`,
+    });
+  });
+
+  // Login with Google Authenticator TOTP
+  app.post('/api/auth/login-totp', (req, res) => {
+    const { username, passwordHash, code } = req.body;
+    const cleanUsername = String(username || '')
+      .toLowerCase()
+      .trim()
+      .replace(/^@/, '');
+
+    if (!cleanUsername) {
+      res.status(400).json({ ok: false, error: 'Username is required.' });
+      return;
+    }
+
+    let matchedUser: DirectoryUserRecord | undefined;
+    for (const u of userDirectory.values()) {
+      if (u.username.toLowerCase() === cleanUsername) {
+        matchedUser = u;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
+      res.status(404).json({
+        ok: false,
+        error: `No Simple account found with username @${cleanUsername}.`,
+      });
+      return;
+    }
+
+    const pwdHash = String(
+      passwordHash ||
+      (req.body.password ? crypto.createHash('sha256').update(String(req.body.password)).digest('hex') : '')
+    );
+    if (matchedUser.passwordHash && matchedUser.passwordHash !== pwdHash) {
+      res.status(401).json({ ok: false, error: 'Incorrect account password.' });
+      return;
+    }
+
+    const rawCode = String(code || req.body.totpCode || '').trim();
+    if (!/^\d{6}$/.test(rawCode)) {
+      res.status(400).json({
+        ok: false,
+        error: 'Please enter a valid 6-digit numeric code from Google Authenticator.',
+      });
+      return;
+    }
+
+    const isTotpValid = verifyTotpCode(matchedUser.totpSecret, rawCode);
+    if (!isTotpValid) {
+      res.status(400).json({
+        ok: false,
+        error: 'Invalid Google Authenticator code. Make sure your clock is accurate and enter the active 6-digit code.',
+      });
+      return;
+    }
+
+    const sessionToken = `stok_${crypto.randomBytes(24).toString('hex')}`;
+    verifiedOwnershipTokens.set(sessionToken, {
+      token: sessionToken,
+      channel: 'email',
+      normalizedTarget: cleanUsername,
+      verifiedAt: Date.now(),
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    });
+
+    const backupRecord = cloudAccountBackups.get(matchedUser.uid);
+
+    res.json({
+      ok: true,
+      user: sanitizePublicUserRecord(matchedUser),
+      sessionToken,
+      backupJson: backupRecord?.backupJson,
+    });
+  });
+
+  // ============================================================================
+  // INSTAGRAM-LIKE FRIENDS, RECOMMENDATIONS & CHAT REQUESTS ENGINE
+  // ============================================================================
+
+  // Search users by @username or profile name
+  app.get('/api/users/search', (req, res) => {
+    const q = String(req.query.q || '').toLowerCase().trim().replace(/^@/, '');
+    const myUid = String(req.query.myUid || '').trim();
+    if (!q) {
+      res.json({ users: [] });
+      return;
+    }
+
+    const matches = Array.from(userDirectory.values())
+      .filter((u) => {
+        if (myUid && u.uid === myUid) return false;
+        return (
+          u.username.toLowerCase().includes(q) ||
+          u.name.toLowerCase().includes(q)
+        );
+      })
+      .slice(0, 25)
+      .map((u) => {
+        const publicUser = sanitizePublicUserRecord(u);
+        const areFriends = myUid ? isFriend(myUid, u.uid) : false;
+        let requestSent = false;
+        let hasIncoming = false;
+        let reqId: string | undefined;
+
+        if (myUid) {
+          for (const req of friendRequests.values()) {
+            if (req.fromUid === myUid && req.toUid === u.uid && req.status === 'pending') {
+              requestSent = true;
+            }
+            if (req.fromUid === u.uid && req.toUid === myUid && req.status === 'pending') {
+              hasIncoming = true;
+              reqId = req.id;
+            }
+          }
+        }
+
+        return {
+          ...publicUser,
+          isFriend: areFriends,
+          requestSent,
+          hasIncomingRequest: hasIncoming,
+          incomingRequestId: reqId,
+        };
+      });
+
+    res.json({ users: matches });
+  });
+
+  // Suggested / Recommended users (Instagram-style "Suggested for you")
+  app.get('/api/friends/recommendations', (req, res) => {
+    const myUid = String(req.query.myUid || '').trim();
+    const allUsers = Array.from(userDirectory.values()).filter((u) => u.uid !== myUid);
+
+    const recs = allUsers.map((u) => {
+      const areFriends = myUid ? isFriend(myUid, u.uid) : false;
+      let requestSent = false;
+      let hasIncoming = false;
+      let reqId: string | undefined;
+
+      if (myUid) {
+        for (const req of friendRequests.values()) {
+          if (req.fromUid === myUid && req.toUid === u.uid && req.status === 'pending') {
+            requestSent = true;
+          }
+          if (req.fromUid === u.uid && req.toUid === myUid && req.status === 'pending') {
+            hasIncoming = true;
+            reqId = req.id;
+          }
+        }
+      }
+
+      // Count mutual friends
+      let mutualCount = 0;
+      if (myUid) {
+        for (const other of userDirectory.values()) {
+          if (other.uid !== myUid && other.uid !== u.uid) {
+            if (isFriend(myUid, other.uid) && isFriend(u.uid, other.uid)) {
+              mutualCount++;
+            }
+          }
+        }
+      }
+
+      let reason = 'Suggested for you';
+      if (mutualCount > 0) {
+        reason = `${mutualCount} mutual friend${mutualCount === 1 ? '' : 's'}`;
+      } else if (u.isOnline) {
+        reason = 'Active in Simple';
+      } else {
+        reason = 'New to Simple';
+      }
+
+      return {
+        user: sanitizePublicUserRecord(u),
+        mutualFriendsCount: mutualCount,
+        reason,
+        isFriend: areFriends,
+        requestSent,
+        hasIncomingRequest: hasIncoming,
+        incomingRequestId: reqId,
+      };
+    });
+
+    // Filter out users who are already friends from the suggestions
+    const suggestions = recs.filter((r) => !r.isFriend).slice(0, 30);
+    res.json({ recommendations: suggestions });
+  });
+
+  // Get user's friends list & pending requests
+  app.get('/api/friends/list', (req, res) => {
+    const myUid = String(req.query.myUid || '').trim();
+    if (!myUid) {
+      res.json({ friends: [], incomingRequests: [], outgoingRequests: [] });
+      return;
+    }
+
+    const friendsList: Array<Omit<DirectoryUserRecord, 'passwordHash' | 'twoStepPinHash' | 'totpSecret'>> = [];
+    for (const u of userDirectory.values()) {
+      if (u.uid !== myUid && isFriend(myUid, u.uid)) {
+        friendsList.push(sanitizePublicUserRecord(u));
+      }
+    }
+
+    const incoming: FriendRequestRecord[] = [];
+    const outgoing: FriendRequestRecord[] = [];
+
+    for (const req of friendRequests.values()) {
+      if (req.toUid === myUid && req.status === 'pending') {
+        incoming.push(req);
+      }
+      if (req.fromUid === myUid && req.status === 'pending') {
+        outgoing.push(req);
+      }
+    }
+
+    res.json({
+      friends: friendsList,
+      incomingRequests: incoming,
+      outgoingRequests: outgoing,
+    });
+  });
+
+  // Query Friend Requests
+  app.get('/api/friends/requests', (req, res) => {
+    const myUid = String(req.query.myUid || '').trim();
+    if (!myUid) {
+      res.json({ incoming: [], outgoing: [] });
+      return;
+    }
+    const incoming: FriendRequestRecord[] = [];
+    const outgoing: FriendRequestRecord[] = [];
+    for (const reqRecord of friendRequests.values()) {
+      if (reqRecord.toUid === myUid && reqRecord.status === 'pending') {
+        incoming.push(reqRecord);
+      }
+      if (reqRecord.fromUid === myUid && reqRecord.status === 'pending') {
+        outgoing.push(reqRecord);
+      }
+    }
+    res.json({ incoming, outgoing });
+  });
+
+  // Send a Friend Request (by UID or by username)
+  app.post('/api/friends/request', (req, res) => {
+    const { fromUid, toUid, toUsername, targetUsername } = req.body;
+    if (!fromUid) {
+      res.status(400).json({ ok: false, error: 'fromUid is required' });
+      return;
+    }
+
+    let targetUser: DirectoryUserRecord | undefined;
+    if (toUid) {
+      targetUser = userDirectory.get(String(toUid));
+    } else if (toUsername || targetUsername) {
+      const cleanTo = String(toUsername || targetUsername).toLowerCase().replace(/^@/, '').trim();
+      for (const u of userDirectory.values()) {
+        if (u.username.toLowerCase() === cleanTo) {
+          targetUser = u;
+          break;
+        }
+      }
+    }
+
+    if (!targetUser) {
+      res.status(404).json({ ok: false, error: 'Target user not found' });
+      return;
+    }
+
+    if (targetUser.uid === fromUid) {
+      res.status(400).json({ ok: false, error: 'You cannot add yourself as a friend' });
+      return;
+    }
+
+    if (isFriend(fromUid, targetUser.uid)) {
+      res.json({ ok: true, alreadyFriends: true, message: 'You are already friends!' });
+      return;
+    }
+
+    // Check if the other user already sent a request to me: auto-accept!
+    for (const [id, r] of friendRequests.entries()) {
+      if (r.fromUid === targetUser.uid && r.toUid === fromUid && r.status === 'pending') {
+        r.status = 'accepted';
+        addFriendship(fromUid, targetUser.uid);
+        savePersistentDatabase();
+
+        wss.clients.forEach((c) => {
+          if (c.readyState === WebSocket.OPEN) {
+            c.send(
+              JSON.stringify({
+                type: 'friend:accepted',
+                userA: fromUid,
+                userB: targetUser?.uid,
+              })
+            );
+          }
+        });
+
+        res.json({
+          ok: true,
+          acceptedInstantly: true,
+          message: `You and @${targetUser.username} are now friends!`,
+        });
+        return;
+      }
+    }
+
+    // Check existing pending request
+    for (const r of friendRequests.values()) {
+      if (r.fromUid === fromUid && r.toUid === targetUser.uid && r.status === 'pending') {
+        res.json({ ok: true, requestId: r.id, alreadyRequested: true });
+        return;
+      }
+    }
+
+    const sender = userDirectory.get(String(fromUid));
+    const newReq: FriendRequestRecord = {
+      id: `freq_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      fromUid: String(fromUid),
+      fromUsername: sender?.username || 'user',
+      fromName: sender?.name || sender?.username || 'User',
+      fromAvatarUrl: sender?.avatarUrl,
+      fromAvatarColor: sender?.avatarColor,
+      toUid: targetUser.uid,
+      toUsername: targetUser.username,
+      status: 'pending',
+      createdAt: Date.now(),
+    };
+
+    friendRequests.set(newReq.id, newReq);
+    savePersistentDatabase();
+
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        c.send(JSON.stringify({ type: 'friend:request_received', request: newReq }));
+      }
+    });
+
+    res.json({
+      ok: true,
+      request: newReq,
+      message: `Friend request sent to @${targetUser.username}!`,
+    });
+  });
+
+  // Respond to friend request (Accept or Decline)
+  app.post('/api/friends/respond', (req, res) => {
+    const { requestId, action, myUid } = req.body;
+    const request = friendRequests.get(String(requestId));
+    if (!request) {
+      res.status(404).json({ ok: false, error: 'Friend request not found' });
+      return;
+    }
+
+    if (request.toUid !== myUid && request.fromUid !== myUid) {
+      res.status(403).json({ ok: false, error: 'Unauthorized to respond to this request' });
+      return;
+    }
+
+    if (action === 'accept') {
+      request.status = 'accepted';
+      addFriendship(request.fromUid, request.toUid);
+      savePersistentDatabase();
+
+      wss.clients.forEach((c) => {
+        if (c.readyState === WebSocket.OPEN) {
+          c.send(
+            JSON.stringify({
+              type: 'friend:accepted',
+              requestId,
+              fromUid: request.fromUid,
+              toUid: request.toUid,
+            })
+          );
+        }
+      });
+
+      res.json({ ok: true, action: 'accepted', message: 'Friend request accepted!' });
+    } else {
+      request.status = 'declined';
+      friendRequests.delete(request.id);
+      savePersistentDatabase();
+
+      wss.clients.forEach((c) => {
+        if (c.readyState === WebSocket.OPEN) {
+          c.send(JSON.stringify({ type: 'friend:declined', requestId }));
+        }
+      });
+
+      res.json({ ok: true, action: 'declined', message: 'Friend request declined.' });
+    }
+  });
+
+  // Remove a friend
+  app.post('/api/friends/remove', (req, res) => {
+    const { myUid, friendUid } = req.body;
+    if (!myUid || !friendUid) {
+      res.status(400).json({ ok: false, error: 'myUid and friendUid are required' });
+      return;
+    }
+    removeFriendship(String(myUid), String(friendUid));
+    res.json({ ok: true, message: 'Friend removed' });
+  });
+
+  // Accept a chat request (moves from Requests to Primary messages)
+  app.post('/api/chats/accept-request', (req, res) => {
+    const { myUid, peerUid } = req.body;
+    if (!myUid || !peerUid) {
+      res.status(400).json({ ok: false, error: 'myUid and peerUid are required' });
+      return;
+    }
+    acceptedChatRequests.add(`${myUid}:${peerUid}`);
+    savePersistentDatabase();
+    res.json({ ok: true, message: 'Chat request accepted' });
+  });
+
+  // Decline a chat request
+  app.post('/api/chats/decline-request', (req, res) => {
+    const { myUid, peerUid } = req.body;
+    if (!myUid || !peerUid) {
+      res.status(400).json({ ok: false, error: 'myUid and peerUid are required' });
+      return;
+    }
+    acceptedChatRequests.delete(`${myUid}:${peerUid}`);
+    savePersistentDatabase();
+    res.json({ ok: true, message: 'Chat request declined' });
   });
 
   // Safe Account Existence & Credential Pre-Check (Never leaks backupJson or private data)
@@ -1780,6 +2451,13 @@ async function startServer() {
         const packet = JSON.parse(raw.toString());
 
         if (packet.type === 'chat:message') {
+          const senderUid = String(packet.senderId || packet.fromUid || packet.message?.senderId || '');
+          const targetUid = String(packet.targetUid || packet.peerUid || packet.toUid || '');
+          if (senderUid && targetUid) {
+            const areFriends = isFriend(senderUid, targetUid);
+            const chatAccepted = acceptedChatRequests.has(`${targetUid}:${senderUid}`);
+            packet.isChatRequest = !areFriends && !chatAccepted;
+          }
           routedMessages.push(packet);
           savePersistentDatabase();
         }

@@ -1639,6 +1639,77 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         </div>
       )}
 
+      {/* Instagram-style Message Request Banner for non-friends */}
+      {chat.isChatRequest && chat.chatRequestStatus !== 'accepted' && (
+        <div className="px-4 py-3 bg-gradient-to-r from-purple-950/90 via-slate-900 to-purple-950/90 border-b border-purple-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3 z-20 shadow-md">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-8 h-8 rounded-full bg-purple-500/20 border border-purple-500/40 flex items-center justify-center text-purple-300 shrink-0">
+              <Sparkles className="w-4 h-4 text-purple-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-white flex items-center gap-1.5 truncate">
+                <span>Message Request from</span>
+                <span className="text-purple-300 font-mono">@{chat.username || chat.name}</span>
+              </p>
+              <p className="text-[11px] text-slate-300 leading-tight">
+                They are not in your friends list. They won't know you've seen this message until you accept.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+            <button
+              onClick={() => {
+                if (onToggleBlockContact) onToggleBlockContact();
+                showToast(`Blocked @${chat.username || chat.name}`);
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+            >
+              Block
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  await fetch('/api/chats/decline-request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ myUid: currentUserId, peerUid: chat.peerUid || chat.id }),
+                  });
+                } catch {}
+                onUpdateChatConfig({
+                  isChatRequest: true,
+                  chatRequestStatus: 'declined',
+                });
+                showToast(`Declined request from @${chat.username || chat.name}`);
+                if (onBackToMobileList) onBackToMobileList();
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/30 text-rose-300 text-xs font-semibold transition-colors"
+            >
+              Decline
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  await fetch('/api/chats/accept-request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ myUid: currentUserId, peerUid: chat.peerUid || chat.id }),
+                  });
+                } catch {}
+                onUpdateChatConfig({
+                  isChatRequest: false,
+                  chatRequestStatus: 'accepted',
+                });
+                showToast(`Accepted message request from @${chat.username || chat.name}!`);
+              }}
+              className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 text-xs font-bold shadow-md shadow-emerald-500/20 transition-all flex items-center gap-1"
+            >
+              <Check className="w-3.5 h-3.5" />
+              <span>Accept</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Batch Emoji Reaction Strip for Selected Messages */}
       {hasSelection && showBatchReactionBar && selectedMessages.length > 0 && (
         <div className="px-4 py-2 bg-emerald-950/90 border-b border-emerald-500/30 flex items-center justify-between gap-2 z-20 animate-in fade-in duration-150">

@@ -36,6 +36,7 @@ import {
   Bookmark,
   Smile,
   CheckSquare,
+  Share2,
 } from 'lucide-react';
 import {
   AppSettings,
@@ -91,6 +92,8 @@ import { CallOverlay, ActiveCallSession } from './components/CallOverlay';
 import { SafetyNumberModal } from './components/SafetyNumberModal';
 import { OnboardingModal } from './components/OnboardingModal';
 import { SettingsView } from './components/SettingsView';
+import { FriendsDiscoveryView } from './components/FriendsDiscoveryView';
+import { ShareMeModal } from './components/ShareMeModal';
 import { ContactsDirectoryModal } from './components/ContactsDirectoryModal';
 import { EmojiPickerPanel } from './components/EmojiPickerPanel';
 import { StatusSectionView } from './components/StatusSectionView';
@@ -342,6 +345,21 @@ export default function App() {
     body: string;
   } | null>(null);
 
+  const [showShareModal, setShowShareModal] = useState<boolean>(false);
+  const [pendingInviteModalUser, setPendingInviteModalUser] = useState<string | null>(null);
+
+  // Check URL or session for direct friend invite (?invite=<username>)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const inviteParam = params.get('invite') || params.get('add_friend');
+    if (inviteParam) {
+      const clean = inviteParam.toLowerCase().replace(/^@/, '').trim();
+      if (clean && clean !== account.username?.toLowerCase()) {
+        setPendingInviteModalUser(clean);
+      }
+    }
+  }, [account.username]);
+
   // Status Creator
   const [newStatusText, setNewStatusText] = useState('');
   const [newStatusPrivacy, setNewStatusPrivacy] = useState<StatusPost['privacy']>('all_contacts');
@@ -466,21 +484,17 @@ export default function App() {
     }
   };
 
-  // Register current user in Express Server + Firebase Firestore Directory & /phone_index/{phoneHash} without plaintext phone exposure
+  // Register current user in Express Server + Firebase Firestore Directory
   const syncUserAccountToDirectory = async (acc: UserAccount, fp: string) => {
-    if (!acc.id || !acc.onboardingCompleted || (!acc.phone && !acc.email)) {
+    if (!acc.id || !acc.onboardingCompleted || !acc.username) {
       return;
     }
-    const normPhone = normalizePhone(acc.phone);
+    const normPhone = normalizePhone(acc.phone || '');
     const phoneHash = normPhone ? computePhoneHash(normPhone) : '';
     const phoneTailHash = normPhone ? computePhoneTailHash(normPhone) : '';
     const emailHash = computeEmailHash(acc.email);
-    const cleanUsername =
-      acc.username.trim().toLowerCase().replace(/^@/, '') ||
-      generateDefaultUsername(acc.name, acc.phone, acc.email);
-    const safeUid =
-      acc.id.replace(/[^a-zA-Z0-9_-]/g, '_') ||
-      (normPhone ? deriveUidFromPhone(normPhone) : `usr_${Date.now()}`);
+    const cleanUsername = acc.username.trim().toLowerCase().replace(/^@/, '') || 'user';
+    const safeUid = acc.id.replace(/[^a-zA-Z0-9_-]/g, '_') || `usr_${Date.now()}`;
 
     const localDirEntry: DirectoryUser = {
       uid: safeUid,
@@ -1065,6 +1079,11 @@ export default function App() {
     () => chats.filter((c) => c.hasShortcut && !c.locked),
     [chats]
   );
+  const chatRequestsCount = useMemo(
+    () =>
+      chats.filter((c) => c.isChatRequest && c.chatRequestStatus !== 'accepted').length,
+    [chats]
+  );
 
   // Filter & Search Chat List Locally
   const visibleChats = useMemo(() => {
@@ -1075,6 +1094,15 @@ export default function App() {
 
         if (chatFilter === 'archived') return c.archived;
         if (c.archived && chatFilter === 'all') return false;
+
+        // Instagram-style Message Requests Section
+        if (chatFilter === 'requests') {
+          return Boolean(c.isChatRequest && c.chatRequestStatus !== 'accepted');
+        }
+        // Chats with pending request status are kept in the separate Requests section!
+        if (c.isChatRequest && c.chatRequestStatus !== 'accepted') {
+          return false;
+        }
 
         if (chatFilter === 'unread') return c.unreadCount > 0;
         if (chatFilter === 'favorites') return c.favorite;
@@ -2009,7 +2037,7 @@ export default function App() {
 
   const isMobileChatOpen = activeTab === 'chats' && Boolean(selectedChatId);
   const requiresAccountSetup =
-    !account.id || !account.onboardingCompleted || (!account.phone && !account.email);
+    !account.id || !account.username || !account.onboardingCompleted;
 
   // 1. First-Launch Loading Screen
   if (isAppBooting) {
@@ -2138,11 +2166,12 @@ export default function App() {
           </button>
         </div>
 
-        {/* Zone 2: 4 clean text navigation links (Desktop) */}
+        {/* Zone 2: 5 clean text navigation links (Desktop) */}
         <nav className="hidden md:flex items-center gap-6 text-xs font-medium">
           {(
             [
               { id: 'chats', label: 'Chats & Directory' },
+              { id: 'friends', label: 'Friends & Discover' },
               { id: 'calls', label: 'Calls' },
               { id: 'status', label: 'Status' },
               { id: 'settings', label: 'Settings' },
@@ -2165,7 +2194,7 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Zone 3: Compact Single-Line Action Icons (Search, Select, New Group, Vault, Directory) */}
+        {/* Zone 3: Compact Single-Line Action Icons (Search, Select, New Group, Vault, Share Me, Directory) */}
         <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
           {activeTab === 'chats' && (
             <>
@@ -2236,6 +2265,16 @@ export default function App() {
               <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
             )}
             <span>{lockedChatsCount}</span>
+          </button>
+
+          {/* Share Profile / Share Me Button */}
+          <button
+            onClick={() => setShowShareModal(true)}
+            className="h-8 px-2.5 rounded-xl bg-gradient-to-r from-emerald-500/20 via-teal-500/20 to-purple-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 border border-emerald-500/30 text-emerald-300 text-[11px] font-semibold flex items-center gap-1.5 transition-all shrink-0 shadow-sm active:scale-95"
+            title="Share Your Profile / Direct Friend Link"
+          >
+            <Share2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden sm:inline">Share Me</span>
           </button>
 
           <button
@@ -2493,6 +2532,9 @@ export default function App() {
                   {(
                     [
                       { id: 'all', label: 'All' },
+                      ...(chatRequestsCount > 0
+                        ? [{ id: 'requests' as const, label: `Requests (${chatRequestsCount})` }]
+                        : []),
                       { id: 'unread', label: 'Unread' },
                       { id: 'favorites', label: 'Favorites' },
                       { id: 'groups', label: 'Groups' },
@@ -2508,12 +2550,14 @@ export default function App() {
                           setPendingVaultChatId(null);
                           setVaultPinModalOpen(true);
                         } else {
-                          setChatFilter(tab.id);
+                          setChatFilter(tab.id as ChatFilter);
                         }
                       }}
                       className={`h-7 px-2.5 rounded-lg text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 ${
                         chatFilter === tab.id
                           ? 'bg-emerald-500 text-slate-950 font-semibold'
+                          : tab.id === 'requests'
+                          ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40 hover:bg-purple-500/30'
                           : tab.id === 'locked'
                           ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20'
                           : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800/80'
@@ -2524,6 +2568,32 @@ export default function App() {
                     </button>
                   ))}
                 </div>
+
+                {/* Instagram-style Message Requests Banner */}
+                {chatRequestsCount > 0 && chatFilter !== 'requests' && (
+                  <button
+                    onClick={() => setChatFilter('requests')}
+                    className="w-full mt-1.5 p-2.5 rounded-xl bg-gradient-to-r from-purple-950/70 via-slate-900 to-slate-950 border border-purple-500/40 flex items-center justify-between text-left hover:border-purple-500/60 transition-all shadow-md group"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span className="w-2.5 h-2.5 rounded-full bg-pink-500 animate-pulse shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                          <span>Message Requests</span>
+                          <span className="px-1.5 py-0.2 rounded-full bg-pink-500 text-white text-[10px] font-extrabold">
+                            {chatRequestsCount}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-400 truncate">
+                          Messages from users not in your friends list
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[11px] font-bold text-purple-400 shrink-0 ml-2 group-hover:translate-x-0.5 transition-transform">
+                      View ›
+                    </span>
+                  </button>
+                )}
               </div>
 
               {/* Slim 1-Line Bar ONLY when actively viewing Locked Vault */}
@@ -3206,7 +3276,21 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: CALLS */}
+        {/* TAB 2: FRIENDS & DISCOVER (Instagram-like Recommendations, Requests & Search) */}
+        {activeTab === 'friends' && (
+          <div className="flex-1 overflow-y-auto">
+            <FriendsDiscoveryView
+              account={account}
+              onOpenChatWithUser={async (user) => {
+                await handleStartOrOpenChatWithDirectoryUser(user);
+                setActiveTab('chats');
+              }}
+              onShowShareModal={() => setShowShareModal(true)}
+            />
+          </div>
+        )}
+
+        {/* TAB 3: CALLS */}
         {activeTab === 'calls' && (
           <div className="flex-1 overflow-y-auto p-4 sm:p-6 max-w-4xl mx-auto w-full space-y-5">
             {hasCallMultiSelection ? (
@@ -3726,11 +3810,12 @@ export default function App() {
       <nav
         className={`${
           isMobileChatOpen ? 'hidden' : 'md:hidden'
-        } fixed bottom-0 left-0 right-0 z-40 h-16 bg-slate-950/95 backdrop-blur-xl border-t border-slate-800/90 grid grid-cols-4 items-center px-1 pb-1`}
+        } fixed bottom-0 left-0 right-0 z-40 h-16 bg-slate-950/95 backdrop-blur-xl border-t border-slate-800/90 grid grid-cols-5 items-center px-1 pb-1`}
       >
         {(
           [
             { id: 'chats', label: 'Chats', icon: MessageSquare, badge: unreadTotalCount },
+            { id: 'friends', label: 'Discover', icon: Users, badge: 0 },
             { id: 'calls', label: 'Calls', icon: Phone, badge: 0 },
             { id: 'status', label: 'Status', icon: CircleDot, badge: 0 },
             { id: 'settings', label: 'Settings', icon: Settings, badge: 0 },
@@ -5057,6 +5142,74 @@ export default function App() {
           }}
           onClose={() => setPreviewContactAvatarChat(null)}
         />
+      )}
+
+      {/* Share Me Modal (QR Code & Direct Profile Link) */}
+      {showShareModal && (
+        <ShareMeModal
+          account={account}
+          onClose={() => setShowShareModal(false)}
+        />
+      )}
+
+      {/* Direct Friend Link Confirmation Modal */}
+      {pendingInviteModalUser && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-slate-900 border border-slate-800 p-6 shadow-2xl text-center space-y-4 animate-in fade-in zoom-in-95 duration-200">
+            <div className="w-14 h-14 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center mx-auto">
+              <UserPlus className="w-7 h-7" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-base font-bold text-white">Friend Invite Link</h3>
+              <p className="text-xs text-slate-300">
+                You received a direct invite from <span className="text-emerald-400 font-mono font-bold">@{pendingInviteModalUser}</span>!
+              </p>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Connect to chat securely and share end-to-end encrypted messages with zero knowledge.
+            </p>
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setPendingInviteModalUser(null)}
+                className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold"
+              >
+                Dismiss
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const targetUser = pendingInviteModalUser;
+                  setPendingInviteModalUser(null);
+                  try {
+                    await fetch('/api/friends/request', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        fromUid: account.id,
+                        targetUsername: targetUser,
+                      }),
+                    });
+                  } catch {}
+                  // Search user to open chat
+                  try {
+                    const res = await fetch(`/api/users/search?q=${encodeURIComponent(targetUser)}`);
+                    const data = await res.json();
+                    if (data.ok && Array.isArray(data.users) && data.users.length > 0) {
+                      await handleStartOrOpenChatWithDirectoryUser(data.users[0]);
+                      setActiveTab('chats');
+                      return;
+                    }
+                  } catch {}
+                  setActiveTab('friends');
+                }}
+                className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 text-xs font-bold shadow-lg shadow-emerald-500/20"
+              >
+                Accept & Connect
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

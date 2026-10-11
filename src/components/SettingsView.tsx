@@ -33,6 +33,7 @@ import {
   Video,
   Upload,
   Camera,
+  Share2,
 } from 'lucide-react';
 import {
   InlineProfilePhotoEditor,
@@ -826,129 +827,51 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-500"
                 />
               </div>
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-medium text-slate-400">
-                    Mobile Phone Number (Primary ID)
-                  </label>
-                  {!isPhoneChanged ? (
-                    <span className="text-[10px] font-semibold text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> OTP Verified
-                    </span>
-                  ) : (
-                    <span className="text-[10px] font-semibold text-amber-400">
-                      Unverified — OTP Required
-                    </span>
-                  )}
-                </div>
-                <div className="flex gap-2">
-                  <input
-                    type="tel"
-                    value={pendingPhone}
-                    onChange={(e) => {
-                      setPendingPhone(e.target.value);
-                      setDispatchedPhoneOtp(null);
-                      setOtpErrorMsg(null);
-                    }}
-                    className="flex-1 rounded-xl bg-slate-900 border border-slate-800 px-3.5 py-2.5 text-sm font-mono text-cyan-300 focus:outline-none focus:border-emerald-500"
-                  />
-                  {isPhoneChanged && (
-                    <button
-                      type="button"
-                      onClick={() => handleRequestSettingsOtp('phone')}
-                      disabled={isSendingOtp}
-                      className="px-3 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold whitespace-nowrap"
-                    >
-                      Send SMS OTP
-                    </button>
-                  )}
-                </div>
-                {isPhoneChanged && dispatchedPhoneOtp && (
-                  <div className="mt-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/40 space-y-2 text-xs">
-                    <div className="text-[11px] text-emerald-300">
-                      Enter the 6-digit verification code from your SMS message or linked Authenticator App:
+              {/* Google Authenticator Security Status */}
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-emerald-500/30 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="p-2 bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 rounded-xl">
+                    <Shield className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <span>Google Authenticator</span>
+                      <span className="px-1.5 py-0.2 rounded-md bg-emerald-500/20 text-emerald-400 text-[10px] font-bold">
+                        ACTIVE
+                      </span>
                     </div>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        maxLength={6}
-                        value={phoneOtpCode}
-                        onChange={(e) => setPhoneOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                        placeholder="6-digit code"
-                        className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-emerald-400"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => handleVerifySettingsOtp('phone')}
-                        className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold"
-                      >
-                        Verify & Save
-                      </button>
+                    <div className="text-[11px] text-slate-400 truncate">
+                      Primary RFC 6238 TOTP verification enabled
                     </div>
                   </div>
-                )}
+                </div>
+                <div className="text-emerald-400 flex items-center gap-1 text-xs font-semibold shrink-0">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span className="hidden sm:inline">Protected</span>
+                </div>
               </div>
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-medium text-slate-400">
-                    Email Address (Secondary ID)
-                  </label>
-                  {!isEmailChanged ? (
-                    <span className="text-[10px] font-semibold text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> OTP Verified
-                    </span>
-                  ) : (
-                    <span className="text-[10px] font-semibold text-amber-400">
-                      Unverified — OTP Required
-                    </span>
-                  )}
-                </div>
-                <div className="flex gap-2">
-                  <input
-                    type="email"
-                    value={pendingEmail}
-                    onChange={(e) => {
-                      setPendingEmail(e.target.value);
-                      setDispatchedEmailOtp(null);
-                      setOtpErrorMsg(null);
-                    }}
-                    className="flex-1 rounded-xl bg-slate-900 border border-slate-800 px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-500"
-                  />
-                  {isEmailChanged && (
-                    <button
-                      type="button"
-                      onClick={() => handleRequestSettingsOtp('email')}
-                      disabled={isSendingOtp}
-                      className="px-3 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold whitespace-nowrap"
-                    >
-                      Verify Email
-                    </button>
-                  )}
-                </div>
-                {isEmailChanged && dispatchedEmailOtp && (
-                  <div className="mt-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/40 space-y-2 text-xs">
-                    <div className="text-[11px] text-emerald-300">
-                      Enter the 6-digit verification code sent to your email inbox or from your linked Authenticator App:
-                    </div>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        maxLength={6}
-                        value={emailOtpCode}
-                        onChange={(e) => setEmailOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                        placeholder="6-digit code"
-                        className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-cyan-300"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => handleVerifySettingsOtp('email')}
-                        className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold"
-                      >
-                        Verify & Save
-                      </button>
-                    </div>
+
+              {/* Share Profile Link */}
+              <div className="p-3.5 rounded-2xl bg-gradient-to-r from-emerald-950/40 via-slate-900 to-slate-950 border border-emerald-500/20 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-white">Share Your Profile</div>
+                  <div className="text-[11px] text-slate-400 truncate font-mono">
+                    @{account.username || 'user'}
                   </div>
-                )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const shareUrl = `${window.location.origin}?invite=${encodeURIComponent(account.username || 'user')}`;
+                    navigator.clipboard?.writeText(shareUrl);
+                    setProfileSyncFeedback('Profile share link copied to clipboard!');
+                    setTimeout(() => setProfileSyncFeedback(null), 3000);
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors shrink-0 shadow-sm"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span>Copy Link</span>
+                </button>
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1">

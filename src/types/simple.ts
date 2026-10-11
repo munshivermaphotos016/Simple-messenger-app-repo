@@ -6,9 +6,17 @@ import {
   VibrationPatternId,
 } from '../utils/soundEffects';
 
-export type NavigationTab = 'chats' | 'calls' | 'status' | 'settings';
+export type NavigationTab = 'chats' | 'friends' | 'calls' | 'status' | 'settings';
 
-export type ChatFilter = 'all' | 'unread' | 'favorites' | 'groups' | 'personal' | 'archived' | 'locked';
+export type ChatFilter =
+  | 'all'
+  | 'requests'
+  | 'unread'
+  | 'favorites'
+  | 'groups'
+  | 'personal'
+  | 'archived'
+  | 'locked';
 
 export type DisappearingDuration = 'off' | '24h' | '7d' | '30d' | 'custom';
 
@@ -241,7 +249,32 @@ export interface ChatConversation {
   isVerified: boolean;
   keyChangedWarning?: boolean;
   groupSettings?: GroupSettings;
+  isChatRequest?: boolean;
+  chatRequestStatus?: 'pending' | 'accepted' | 'declined';
   messages: MessageItem[];
+}
+
+export interface FriendRequest {
+  id: string;
+  fromUid: string;
+  fromUsername: string;
+  fromName: string;
+  fromAvatarUrl?: string;
+  fromAvatarColor?: string;
+  toUid: string;
+  toUsername: string;
+  status: 'pending' | 'accepted' | 'declined';
+  createdAt: number;
+}
+
+export interface UserRecommendation {
+  user: DirectoryUser;
+  mutualFriendsCount: number;
+  reason: string;
+  isFriend: boolean;
+  requestSent: boolean;
+  hasIncomingRequest: boolean;
+  incomingRequestId?: string;
 }
 
 export interface CallRecord {
@@ -309,6 +342,7 @@ export interface UserAccount {
   passwordHash?: string;
   twoStepPinHash?: string;
   totpSecret?: string;
+  totpEnabled?: boolean;
   verificationToken?: string;
   about: string;
   avatarColor: string;
