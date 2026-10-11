@@ -216,15 +216,39 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       const res = await apiFetch('/api/auth/request-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel, target }),
+        body: JSON.stringify({
+          channel,
+          identifier: target,
+          mode: 'change_identifier',
+        }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setOtpErrorMsg(data.error || `Failed to dispatch ${channel} OTP.`);
+        if (account.totpSecret) {
+          if (channel === 'phone') {
+            setDispatchedPhoneOtp('AWAITING_VERIFICATION');
+          } else {
+            setDispatchedEmailOtp('AWAITING_VERIFICATION');
+          }
+          setProfileSyncFeedback(
+            'Enter the 6-digit code from your linked Authenticator App (TOTP) below to verify this change.'
+          );
+        } else {
+          setOtpErrorMsg(
+            data.error ||
+              `Failed to dispatch ${channel} OTP. Configure live SMTP/SMS gateway or link an Authenticator App.`
+          );
+        }
       } else if (channel === 'phone') {
-        setDispatchedPhoneOtp(String(data.sandboxDispatchedOtp || ''));
+        setDispatchedPhoneOtp('AWAITING_VERIFICATION');
+        setProfileSyncFeedback(
+          data.message || `Dispatched real 6-digit SMS code to ${data.maskedTarget || target}.`
+        );
       } else {
-        setDispatchedEmailOtp(String(data.sandboxDispatchedOtp || ''));
+        setDispatchedEmailOtp('AWAITING_VERIFICATION');
+        setProfileSyncFeedback(
+          data.message || `Dispatched real 6-digit Email code to ${data.maskedTarget || target}.`
+        );
       }
     } catch {
       setOtpErrorMsg('Network error while requesting verification OTP.');
@@ -238,7 +262,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const target = channel === 'phone' ? pendingPhone.trim() : pendingEmail.trim();
     const code = channel === 'phone' ? phoneOtpCode.trim() : emailOtpCode.trim();
     if (code.length !== 6) {
-      setOtpErrorMsg('Please enter the 6-digit OTP verification code.');
+      setOtpErrorMsg('Please enter the 6-digit verification code.');
       return;
     }
     setIsSendingOtp(true);
@@ -246,11 +270,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel, target, code }),
+        body: JSON.stringify({
+          channel,
+          identifier: target,
+          code,
+          mode: 'change_identifier',
+          totpSecret: account.totpSecret,
+        }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setOtpErrorMsg(data.error || 'Invalid 6-digit OTP code.');
+        setOtpErrorMsg(data.error || 'Invalid or expired 6-digit verification code.');
         setIsSendingOtp(false);
         return;
       }
@@ -835,20 +865,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
                 {isPhoneChanged && dispatchedPhoneOtp && (
                   <div className="mt-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/40 space-y-2 text-xs">
-                    <div className="flex items-center justify-between gap-2 font-mono">
-                      <span>
-                        📲 SMS OTP:{' '}
-                        <strong className="text-emerald-300 tracking-widest">
-                          {dispatchedPhoneOtp}
-                        </strong>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setPhoneOtpCode(dispatchedPhoneOtp)}
-                        className="px-2 py-0.5 rounded bg-emerald-500 text-slate-950 font-sans font-bold text-[10px]"
-                      >
-                        Auto-Fill
-                      </button>
+                    <div className="text-[11px] text-emerald-300">
+                      Enter the 6-digit verification code from your SMS message or linked Authenticator App:
                     </div>
                     <div className="flex gap-2">
                       <input
@@ -856,7 +874,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         maxLength={6}
                         value={phoneOtpCode}
                         onChange={(e) => setPhoneOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                        placeholder="6-digit SMS OTP"
+                        placeholder="6-digit code"
                         className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-emerald-400"
                       />
                       <button
@@ -903,26 +921,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       disabled={isSendingOtp}
                       className="px-3 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold whitespace-nowrap"
                     >
-                      Send Email OTP
+                      Verify Email
                     </button>
                   )}
                 </div>
                 {isEmailChanged && dispatchedEmailOtp && (
                   <div className="mt-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/40 space-y-2 text-xs">
-                    <div className="flex items-center justify-between gap-2 font-mono">
-                      <span>
-                        ✉️ Email OTP:{' '}
-                        <strong className="text-emerald-300 tracking-widest">
-                          {dispatchedEmailOtp}
-                        </strong>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setEmailOtpCode(dispatchedEmailOtp)}
-                        className="px-2 py-0.5 rounded bg-emerald-500 text-slate-950 font-sans font-bold text-[10px]"
-                      >
-                        Auto-Fill
-                      </button>
+                    <div className="text-[11px] text-emerald-300">
+                      Enter the 6-digit verification code sent to your email inbox or from your linked Authenticator App:
                     </div>
                     <div className="flex gap-2">
                       <input
@@ -930,7 +936,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         maxLength={6}
                         value={emailOtpCode}
                         onChange={(e) => setEmailOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                        placeholder="6-digit Email OTP"
+                        placeholder="6-digit code"
                         className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-cyan-300"
                       />
                       <button
@@ -3753,20 +3759,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               {dispatchedEmailOtp && (
                 <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/40 space-y-2 text-xs">
-                  <div className="flex items-center justify-between gap-2 font-mono">
-                    <span>
-                      📧 Gmail Backup OTP:{' '}
-                      <strong className="text-cyan-300 tracking-widest">
-                        {dispatchedEmailOtp}
-                      </strong>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setEmailOtpCode(dispatchedEmailOtp)}
-                      className="px-2 py-0.5 rounded bg-cyan-500 text-slate-950 font-sans font-bold text-[10px]"
-                    >
-                      Auto-Fill OTP
-                    </button>
+                  <div className="text-[11px] text-cyan-200">
+                    Enter the 6-digit verification code sent to your Gmail inbox or from your linked Authenticator App:
                   </div>
                   <div className="flex gap-2">
                     <input
@@ -3774,7 +3768,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       maxLength={6}
                       value={emailOtpCode}
                       onChange={(e) => setEmailOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                      placeholder="6-digit Gmail OTP"
+                      placeholder="6-digit code"
                       className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-cyan-300"
                     />
                     <button

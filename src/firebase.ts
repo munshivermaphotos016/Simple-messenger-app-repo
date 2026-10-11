@@ -304,11 +304,15 @@ export async function saveCloudAccountBackup(params: {
   username: string;
   phoneHash?: string;
   emailHash?: string;
+  passwordHash?: string;
+  twoStepPinHash?: string;
+  totpSecret?: string;
+  verificationToken?: string;
   backupJson: string;
 }): Promise<void> {
   const safeUid = params.uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
   const safeBackupJson = params.backupJson.slice(0, 880000);
-  const payload = {
+  const firestorePayload = {
     uid: safeUid,
     username: (params.username || 'user').slice(0, 40),
     phoneHash: (params.phoneHash || '').slice(0, 64),
@@ -320,16 +324,22 @@ export async function saveCloudAccountBackup(params: {
   apiFetch('/api/account/backup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      ...firestorePayload,
+      passwordHash: params.passwordHash,
+      twoStepPinHash: params.twoStepPinHash,
+      totpSecret: params.totpSecret,
+      verificationToken: params.verificationToken,
+    }),
   }).catch(() => {});
 
   try {
-    await setDoc(doc(db, 'account_backups', safeUid), payload);
+    await setDoc(doc(db, 'account_backups', safeUid), firestorePayload);
     if (params.phoneHash && params.phoneHash.length >= 16) {
-      await setDoc(doc(db, 'account_backups', `ph_${params.phoneHash.slice(0, 48)}`), payload);
+      await setDoc(doc(db, 'account_backups', `ph_${params.phoneHash.slice(0, 48)}`), firestorePayload);
     }
     if (params.emailHash && params.emailHash.length >= 16) {
-      await setDoc(doc(db, 'account_backups', `em_${params.emailHash.slice(0, 48)}`), payload);
+      await setDoc(doc(db, 'account_backups', `em_${params.emailHash.slice(0, 48)}`), firestorePayload);
     }
   } catch {
     // Offline fallback handled
@@ -337,13 +347,41 @@ export async function saveCloudAccountBackup(params: {
 }
 
 /**
- * Recovers an existing account & chats backup from Firestore or Server by uid, phoneHash, or emailHash.
+ * Recovers an existing account & chats backup from Server or Firestore ONLY after verifying ownership token & passwordHash.
  */
 export async function recoverCloudAccountBackup(params: {
   uid?: string;
   phoneHash?: string;
   emailHash?: string;
+  passwordHash?: string;
+  verificationToken?: string;
 }): Promise<string | null> {
+  if (!params.verificationToken) {
+    return null;
+  }
+
+  try {
+    const res = await apiFetch('/api/account/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uid: params.uid,
+        phoneHash: params.phoneHash,
+        emailHash: params.emailHash,
+        passwordHash: params.passwordHash,
+        verificationToken: params.verificationToken,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.backupJson) return String(data.backupJson);
+    } else if (res.status === 401 || res.status === 403) {
+      return null;
+    }
+  } catch {
+    // Fall through to Firestore if server is unreachable
+  }
+
   const candidateKeys: string[] = [];
   if (params.uid) {
     candidateKeys.push(params.uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
@@ -361,26 +399,23 @@ export async function recoverCloudAccountBackup(params: {
       if (snap.exists()) {
         const data = snap.data();
         if (data && typeof data.backupJson === 'string' && data.backupJson.length > 5) {
+          try {
+            const parsed = JSON.parse(data.backupJson);
+            if (
+              parsed.passwordHash &&
+              (!params.passwordHash || parsed.passwordHash !== params.passwordHash)
+            ) {
+              return null;
+            }
+          } catch {
+            // Continue
+          }
           return data.backupJson;
         }
       }
     } catch {
-      // Continue to next key / server fallback
+      // Continue
     }
-  }
-
-  try {
-    const qParams = new URLSearchParams();
-    if (params.uid) qParams.set('uid', params.uid);
-    if (params.phoneHash) qParams.set('phoneHash', params.phoneHash);
-    if (params.emailHash) qParams.set('emailHash', params.emailHash);
-    const res = await apiFetch(`/api/account/recover?${qParams.toString()}`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data?.backupJson) return String(data.backupJson);
-    }
-  } catch {
-    // Ignore offline error
   }
 
   return null;

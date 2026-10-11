@@ -1,49 +1,75 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  ShieldCheck,
-  Lock,
-  Bell,
-  Mic,
-  Camera,
-  Users,
-  Fingerprint,
-  HardDrive,
-  ArrowRight,
-  ArrowLeft,
   Check,
-  X,
+  CheckCircle2,
+  CloudUpload,
+  Copy,
+  KeyRound,
+  Lock,
+  Mail,
+  Phone,
+  RefreshCw,
+  Shield,
+  ShieldAlert,
+  ShieldCheck,
+  Smartphone,
   Sparkles,
+  UserCheck,
+  UserPlus,
+  X,
 } from 'lucide-react';
-import { AppSettings, AudienceVisibility, UserAccount } from '../types/simple';
-import { generateDefaultUsername, normalizePhone } from '../data/initialState';
-import { recoverCloudAccountBackup } from '../firebase';
-import { InlineProfilePhotoEditor, PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
-import { apiFetch } from '../utils/androidBridge';
+import { AppSettings, ChatConversation, UserAccount } from '../types/simple';
+import { PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
+import {
+  deriveUidFromEmail,
+  deriveUidFromPhone,
+  normalizePhone,
+} from '../data/initialState';
+import { getRemoteServerOrigin } from '../utils/androidBridge';
+import {
+  auth,
+  googleProvider,
+  recoverCloudAccountBackup,
+  signInWithPopup,
+} from '../firebase';
 
 interface OnboardingModalProps {
   account: UserAccount;
   settings: AppSettings;
   localFingerprint: string;
-  onComplete: (updatedAccount: UserAccount, updatedSettings: Partial<AppSettings>, restoredChats?: any[]) => void;
+  onComplete: (
+    updatedAccount: UserAccount,
+    updatedSettings: Partial<AppSettings>,
+    restoredChats?: ChatConversation[]
+  ) => void;
   onCancel?: () => void;
 }
 
-const STEPS = [
-  'Welcome',
-  'Privacy Principles',
-  'Account Identifier',
-  'Verification',
-  'Profile Setup',
-  'Username & Discovery',
-  'Profile Photo',
-  'Contacts Permission',
-  'Notification Permission',
-  'Microphone Permission',
-  'Camera Permission',
-  'Biometric Lock',
-  'PIN / Passcode',
-  'Encrypted Backup',
+const AVATAR_COLORS = ['#10B981', '#06B6D4', '#6366F1', '#F59E0B', '#EC4899', '#8B5CF6'];
+
+const COUNTRY_CODES = [
+  { code: '+1', label: '🇺🇸/🇨🇦 +1 (US/CA)', digits: 10 },
+  { code: '+44', label: '🇬🇧 +44 (UK)', digits: 10 },
+  { code: '+91', label: '🇮🇳 +91 (India)', digits: 10 },
+  { code: '+41', label: '🇨🇭 +41 (Switzerland)', digits: 9 },
+  { code: '+49', label: '🇩🇪 +49 (Germany)', digits: 10 },
+  { code: '+33', label: '🇫🇷 +33 (France)', digits: 9 },
+  { code: '+61', label: '🇦🇺 +61 (Australia)', digits: 9 },
+  { code: '+81', label: '🇯🇵 +81 (Japan)', digits: 10 },
+  { code: '+65', label: '🇸🇬 +65 (Singapore)', digits: 8 },
+  { code: '+971', label: '🇦🇪 +971 (UAE)', digits: 9 },
+  { code: '+55', label: '🇧🇷 +55 (Brazil)', digits: 11 },
+  { code: '+234', label: '🇳🇬 +234 (Nigeria)', digits: 10 },
 ];
+
+async function sha256Hex(input: string): Promise<string> {
+  const clean = input.trim();
+  if (!clean) return '';
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(clean));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   account,
@@ -52,1491 +78,1531 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   onComplete,
   onCancel,
 }) => {
-  const [stepIdx, setStepIdx] = useState(0);
+  const isInitialSetup =
+    !account.id || !account.onboardingCompleted || (!account.phone && !account.email);
 
-  // Form states across the 14 steps
-  const [authMethod, setAuthMethod] = useState<'phone_otp' | 'gmail_otp' | 'both'>(
-    account.authMethod || 'phone_otp'
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [onboardingMode, setOnboardingMode] = useState<'register' | 'login'>('register');
+  const [verifyChannel, setVerifyChannel] = useState<
+    'totp' | 'google_oauth' | 'email_otp' | 'phone_otp'
+  >('totp');
+
+  // Step 1: Identity & Credentials
+  const [name, setName] = useState(account.name || '');
+  const [username, setUsername] = useState(account.username || '');
+  const [countryCode, setCountryCode] = useState('+91');
+  const [localPhoneNumber, setLocalPhoneNumber] = useState(() => {
+    const raw = (account.phone || '').trim();
+    if (!raw) return '';
+    for (const c of COUNTRY_CODES) {
+      if (raw.startsWith(c.code)) {
+        return raw.slice(c.code.length).trim();
+      }
+    }
+    return raw.replace(/^\+\d+\s*/, '');
+  });
+  const [email, setEmail] = useState(account.email || '');
+  const [accountPassword, setAccountPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [twoStepPin, setTwoStepPin] = useState('');
+  const [about, setAbout] = useState(
+    account.about || 'Hey there! I am using Simple Messenger.'
   );
-  const [phoneInput, setPhoneInput] = useState(account.phone);
-  const [emailInput, setEmailInput] = useState(
-    account.email && account.email.toLowerCase().endsWith('@gmail.com')
-      ? account.email
-      : account.email
-      ? `${account.email.split('@')[0]}@gmail.com`
-      : ''
-  );
-  const [phoneOtpInput, setPhoneOtpInput] = useState('');
-  const [emailOtpInput, setEmailOtpInput] = useState('');
-  const [dispatchedPhoneOtp, setDispatchedPhoneOtp] = useState<string | null>(null);
-  const [dispatchedEmailOtp, setDispatchedEmailOtp] = useState<string | null>(null);
-  const [isPhoneOtpVerified, setIsPhoneOtpVerified] = useState(false);
-  const [isEmailOtpVerified, setIsEmailOtpVerified] = useState(false);
-  const [otpErrorMsg, setOtpErrorMsg] = useState<string | null>(null);
-  const [otpStatusMsg, setOtpStatusMsg] = useState<string | null>(null);
-  const [isBusyOtp, setIsBusyOtp] = useState(false);
-  const [nameInput, setNameInput] = useState(account.name);
-  const [aboutInput, setAboutInput] = useState(account.about);
-  const [usernameInput, setUsernameInput] = useState(account.username);
-  const [allowDiscovery, setAllowDiscovery] = useState(account.allowUsernameDiscovery);
-  const [hidePhone, setHidePhone] = useState(account.hidePhoneNumber);
-  const [avatarColor, setAvatarColor] = useState(account.avatarColor);
-  const [avatarUrlInput, setAvatarUrlInput] = useState<string | undefined>(account.avatarUrl);
-  const [photoVisibilityInput, setPhotoVisibilityInput] = useState<AudienceVisibility>(
-    settings.profilePhotoVisibility || 'contacts'
+  const [avatarColor, setAvatarColor] = useState(account.avatarColor || '#10B981');
+  const [avatarUrl, setAvatarUrl] = useState<string | undefined>(
+    account.avatarUrl || PRESET_PROFILE_PHOTOS[0].url
   );
 
-  const [contactsPerm, setContactsPerm] = useState(settings.contactsPermissionGranted);
-  const [notifPerm, setNotifPerm] = useState(settings.notificationsPermissionGranted);
-  const [privateNotif, setPrivateNotif] = useState(settings.privateNotificationsMode);
-  const [micPerm, setMicPerm] = useState(settings.microphonePermissionGranted);
-  const [camPerm, setCamPerm] = useState(settings.cameraPermissionGranted);
-  const [bioEnabled, setBioEnabled] = useState(settings.biometricsEnabled);
-  const [pinCode, setPinCode] = useState(settings.appLockPin);
-  const [enableAppPin, setEnableAppPin] = useState(settings.appLockMethod === 'pin');
-  const [backupChoice, setBackupChoice] = useState<'none' | 'local_encrypted' | 'cloud_e2ee'>(
-    settings.backupMode
+  // Verification State (Zero dummy OTPs!)
+  const [otpInput, setOtpInput] = useState('');
+  const [isSendingOtp, setIsSendingOtp] = useState(false);
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  const [otpSentMessage, setOtpSentMessage] = useState<string | null>(null);
+  const [verificationToken, setVerificationToken] = useState<string>(
+    account.verificationToken || ''
   );
-  const [cloudBackupProvider, setCloudBackupProvider] = useState<'google_drive' | 'gmail'>(
-    settings.cloudBackupProvider || 'google_drive'
+  const [phoneVerified, setPhoneVerified] = useState<boolean>(false);
+  const [emailVerified, setEmailVerified] = useState<boolean>(false);
+  const [verifiedIdentifier, setVerifiedIdentifier] = useState<string>('');
+
+  // TOTP Authenticator State (RFC 6238)
+  const [totpSecret, setTotpSecret] = useState<string>(account.totpSecret || '');
+  const [totpUri, setTotpUri] = useState<string>('');
+  const [isGeneratingTotp, setIsGeneratingTotp] = useState(false);
+  const [copiedTotpSecret, setCopiedTotpSecret] = useState(false);
+
+  // Live SMTP / SMS Gateway Configuration State
+  const [showGatewayConfig, setShowGatewayConfig] = useState(false);
+  const [gatewayStatus, setGatewayStatus] = useState<{
+    smtpConfigured: boolean;
+    smtpUserMasked: string | null;
+    smsGatewayConfigured: boolean;
+  }>({
+    smtpConfigured: false,
+    smtpUserMasked: null,
+    smsGatewayConfigured: false,
+  });
+  const [smtpHost, setSmtpHost] = useState('smtp.gmail.com');
+  const [smtpPort, setSmtpPort] = useState('465');
+  const [smtpUser, setSmtpUser] = useState('');
+  const [smtpPass, setSmtpPass] = useState('');
+  const [smsWebhookUrl, setSmsWebhookUrl] = useState('');
+  const [smsWebhookApiKey, setSmsWebhookApiKey] = useState('');
+  const [isSavingGateway, setIsSavingGateway] = useState(false);
+  const [gatewayFeedback, setGatewayFeedback] = useState<string | null>(null);
+
+  // Cloud Backup & Recovery State
+  const [restoredChats, setRestoredChats] = useState<ChatConversation[] | undefined>(
+    undefined
   );
-  const [backupGmailInput, setBackupGmailInput] = useState(
-    emailInput.toLowerCase().endsWith('@gmail.com') ? emailInput : settings.cloudBackupGmail || ''
+  const [recoveredAccountData, setRecoveredAccountData] = useState<Partial<UserAccount> | null>(
+    null
   );
-  const [backupGmailOtpInput, setBackupGmailOtpInput] = useState('');
-  const [dispatchedBackupGmailOtp, setDispatchedBackupGmailOtp] = useState<string | null>(null);
-  const [isBackupGmailVerified, setIsBackupGmailVerified] = useState(false);
-  const [backupGmailError, setBackupGmailError] = useState<string | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  const isValidGmailAddress = (raw: string) => {
-    const clean = raw.trim().toLowerCase();
-    return (
-      clean.length >= 11 &&
-      (clean.endsWith('@gmail.com') || clean.endsWith('@googlemail.com')) &&
-      !clean.startsWith('@')
-    );
-  };
+  // Step 3: Privacy & Permissions
+  const [allowUsernameDiscovery, setAllowUsernameDiscovery] = useState(
+    account.allowUsernameDiscovery ?? true
+  );
+  const [hidePhoneNumber, setHidePhoneNumber] = useState(
+    account.hidePhoneNumber ?? false
+  );
+  const [appLockEnabled, setAppLockEnabled] = useState(settings.appLockEnabled);
+  const [contactsPermission, setContactsPermission] = useState(
+    settings.contactsPermissionGranted ?? true
+  );
+  const [notificationsPermission, setNotificationsPermission] = useState(
+    settings.notificationsPermissionGranted ?? true
+  );
+  const [backupMode, setBackupMode] = useState<AppSettings['backupMode']>(
+    settings.backupMode || 'cloud_e2ee'
+  );
 
-  const [existingAccountFound, setExistingAccountFound] = useState<{
-    uid: string;
-    username: string;
-    name?: string;
-    chats?: any[];
-    settings?: Partial<AppSettings>;
-  } | null>(null);
-  const [autoRestoreOnVerify, setAutoRestoreOnVerify] = useState(true);
-  const [accountMode, setAccountMode] = useState<'register' | 'login'>('register');
-  const [passwordInput, setPasswordInput] = useState('');
+  const selectedCountry =
+    COUNTRY_CODES.find((c) => c.code === countryCode) || COUNTRY_CODES[0];
+  const localDigitsOnly = localPhoneNumber.replace(/\D/g, '');
+  const fullPhoneDisplay = localDigitsOnly
+    ? `${countryCode} ${localPhoneNumber.trim()}`
+    : '';
+  const normalizedPhoneDigits = normalizePhone(fullPhoneDisplay);
+  const isPhoneValid =
+    localDigitsOnly.length >= Math.max(7, selectedCountry.digits - 2) &&
+    localDigitsOnly.length <= 14;
+  const cleanEmail = email.trim().toLowerCase();
+  const isEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail);
 
-  const sha256Hex = async (text: string): Promise<string> => {
-    const encoded = new TextEncoder().encode(text.trim());
-    const buf = await crypto.subtle.digest('SHA-256', encoded);
-    return Array.from(new Uint8Array(buf))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-  };
+  const isVerifiedForProceeding = Boolean(
+    verificationToken && (phoneVerified || emailVerified)
+  );
 
-  // Check database for existing account by phone or email
-  const checkDatabaseForExistingAccount = async () => {
-    const normPhone = authMethod !== 'gmail_otp' ? normalizePhone(phoneInput) : '';
-    const cleanEmail = authMethod !== 'phone_otp' ? emailInput.trim().toLowerCase() : '';
-    if (normPhone.length < 7 && !cleanEmail.includes('@')) return;
-
-    try {
-      const qParams = new URLSearchParams();
-      if (normPhone.length >= 7) qParams.set('phoneHash', normPhone);
-      if (cleanEmail.includes('@')) qParams.set('emailHash', cleanEmail);
-      const res = await apiFetch(`/api/account/recover?${qParams.toString()}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.backupJson) {
-          const parsed = JSON.parse(data.backupJson);
-          setExistingAccountFound({
-            uid: data.uid || parsed.account?.id || `usr_${normPhone || Date.now()}`,
-            username: data.username || parsed.account?.username || 'user',
-            name: parsed.account?.name,
-            chats: parsed.chats,
-            settings: parsed.settings,
+  // Check Gateway Status on Mount
+  useEffect(() => {
+    const apiBase = getRemoteServerOrigin();
+    fetch(`${apiBase}/api/auth/gateway-status`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.ok) {
+          setGatewayStatus({
+            smtpConfigured: Boolean(data.smtpConfigured),
+            smtpUserMasked: data.smtpUserMasked || null,
+            smsGatewayConfigured: Boolean(data.smsGatewayConfigured),
           });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleSaveGatewayConfig = async () => {
+    setErrorBanner(null);
+    setGatewayFeedback(null);
+    setIsSavingGateway(true);
+    try {
+      const apiBase = getRemoteServerOrigin();
+      const res = await fetch(`${apiBase}/api/auth/configure-gateway`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          smtpHost: smtpHost.trim(),
+          smtpPort: Number(smtpPort) || 465,
+          smtpUser: smtpUser.trim(),
+          smtpPass: smtpPass.trim(),
+          smsWebhookUrl: smsWebhookUrl.trim(),
+          smsWebhookApiKey: smsWebhookApiKey.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setErrorBanner(data.error || 'Failed to verify SMTP / SMS gateway credentials.');
+      } else {
+        setGatewayStatus({
+          smtpConfigured: Boolean(data.smtpConfigured),
+          smtpUserMasked: smtpUser.trim() || null,
+          smsGatewayConfigured: Boolean(data.smsGatewayConfigured),
+        });
+        setGatewayFeedback(
+          'Live SMTP / SMS Gateway verified and active! You can now send real OTP codes.'
+        );
+        setShowGatewayConfig(false);
+      }
+    } catch {
+      setErrorBanner('Could not reach backend server to configure gateway.');
+    } finally {
+      setIsSavingGateway(false);
+    }
+  };
+
+  // Validate Step 1 before advancing to Step 2 Verification
+  const handleProceedToVerification = async () => {
+    setErrorBanner(null);
+    setOtpSentMessage(null);
+
+    if (!isPhoneValid && !isEmailValid) {
+      setErrorBanner(
+        'Please enter a valid mobile phone number or email address to continue.'
+      );
+      return;
+    }
+
+    if (onboardingMode === 'register') {
+      if (!name.trim() || name.trim().length < 2) {
+        setErrorBanner('Please enter your full display name (at least 2 characters).');
+        return;
+      }
+      if (!accountPassword || accountPassword.length < 6) {
+        setErrorBanner(
+          'Please create a strong account password (at least 6 characters) to protect your account.'
+        );
+        return;
+      }
+      if (accountPassword !== confirmPassword) {
+        setErrorBanner('Password and Confirm Password do not match.');
+        return;
+      }
+      if (!/^\d{6}$/.test(twoStepPin)) {
+        setErrorBanner(
+          'Please set a 6-digit Two-Step Verification PIN (just like WhatsApp Two-Step Verification).'
+        );
+        return;
+      }
+    } else {
+      // Login mode requires password or 2-step PIN
+      if (!accountPassword && !/^\d{6}$/.test(twoStepPin)) {
+        setErrorBanner(
+          'Please enter your Account Password or 6-digit Two-Step Verification PIN to sign in.'
+        );
+        return;
+      }
+    }
+
+    // Check account existence on server to prevent duplicate registration or invalid login
+    setIsSendingOtp(true);
+    try {
+      const apiBase = getRemoteServerOrigin();
+      const checkRes = await fetch(`${apiBase}/api/account/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          email: isEmailValid ? cleanEmail : undefined,
+          username: username.trim().replace(/^@/, ''),
+        }),
+      });
+      const checkData = await checkRes.json();
+
+      if (onboardingMode === 'register' && checkData.exists) {
+        setErrorBanner(
+          `This ${checkData.matchedBy || 'account'} is already registered on Simple${
+            checkData.accountSummary?.username
+              ? ` (@${checkData.accountSummary.username})`
+              : ''
+          }. Please switch to "Sign In to Existing Account" and verify with your password + OTP.`
+        );
+        setIsSendingOtp(false);
+        return;
+      }
+
+      if (onboardingMode === 'login' && !checkData.exists) {
+        setErrorBanner(
+          'No registered Simple account was found with this mobile number or email. Please check your details or switch to "Create New Account".'
+        );
+        setIsSendingOtp(false);
+        return;
+      }
+
+      // If registering and TOTP is selected, initialize cryptographic RFC 6238 TOTP secret
+      if (onboardingMode === 'register' && !totpSecret) {
+        const totpRes = await fetch(`${apiBase}/api/auth/setup-totp`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountLabel: cleanEmail || fullPhoneDisplay || username || 'SimpleUser',
+          }),
+        });
+        const totpData = await totpRes.json();
+        if (totpData && totpData.ok) {
+          setTotpSecret(totpData.secret);
+          setTotpUri(totpData.otpauthUri);
+        }
+      }
+
+      setStep(2);
+    } catch {
+      setErrorBanner(
+        'Unable to verify account status with the Simple server. Please check your internet connection.'
+      );
+    } finally {
+      setIsSendingOtp(false);
+    }
+  };
+
+  // Generate or refresh TOTP Secret for Authenticator App
+  const handleGenerateTotpSecret = async () => {
+    setErrorBanner(null);
+    setIsGeneratingTotp(true);
+    try {
+      const apiBase = getRemoteServerOrigin();
+      const res = await fetch(`${apiBase}/api/auth/setup-totp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountLabel: cleanEmail || fullPhoneDisplay || username || 'SimpleUser',
+        }),
+      });
+      const data = await res.json();
+      if (data && data.ok) {
+        setTotpSecret(data.secret);
+        setTotpUri(data.otpauthUri);
+      } else {
+        setErrorBanner('Failed to generate Authenticator TOTP key.');
+      }
+    } catch {
+      setErrorBanner('Network error while generating Authenticator key.');
+    } finally {
+      setIsGeneratingTotp(false);
+    }
+  };
+
+  // Real Google OAuth Sign-In Verification (Zero dummy OTPs)
+  const handleGoogleOAuthVerification = async () => {
+    setErrorBanner(null);
+    setOtpSentMessage(null);
+    setIsVerifyingOtp(true);
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      const idToken = await result.user.getIdToken();
+      const apiBase = getRemoteServerOrigin();
+
+      const res = await fetch(`${apiBase}/api/auth/verify-google-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setErrorBanner(data.error || 'Google Account verification failed.');
+        setIsVerifyingOtp(false);
+        return;
+      }
+
+      const verifiedGmail = String(data.email || result.user.email || '')
+        .trim()
+        .toLowerCase();
+
+      // If logging in, verify account ownership and recover cloud backup
+      if (onboardingMode === 'login') {
+        const pwdHash = accountPassword ? await sha256Hex(accountPassword) : undefined;
+        const pinHash = twoStepPin ? await sha256Hex(twoStepPin) : undefined;
+
+        const recovered = await recoverCloudAccountBackup({
+          email: verifiedGmail,
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          passwordHash: pwdHash,
+          twoStepPinHash: pinHash,
+          verificationToken: data.verificationToken,
+        });
+
+        if (!recovered) {
+          setErrorBanner(
+            'Google identity verified, but your Account Password / Two-Step PIN did not match the existing account, or no account exists for this Gmail.'
+          );
+          setIsVerifyingOtp(false);
           return;
         }
-      }
 
-      // Check Firestore Cloud backup
-      const cloudJson = await recoverCloudAccountBackup({
-        phoneHash: normPhone.length >= 7 ? normPhone : undefined,
-        emailHash: cleanEmail.includes('@') ? cleanEmail : undefined,
-      });
-      if (cloudJson) {
-        const parsed = JSON.parse(cloudJson);
-        setExistingAccountFound({
-          uid: parsed.account?.id || `usr_${normPhone || Date.now()}`,
-          username: parsed.account?.username || 'user',
-          name: parsed.account?.name,
-          chats: parsed.chats,
-          settings: parsed.settings,
-        });
-      }
-    } catch {
-      // Ignore network errors during lookup
-    }
-  };
-
-  // Request real server-side 6-digit OTP codes for Mobile Phone & Gmail
-  const handleDispatchOnboardingOtps = async () => {
-    setOtpErrorMsg(null);
-    setOtpStatusMsg(null);
-    const needPhone = authMethod === 'phone_otp' || authMethod === 'both';
-    const needGmail = authMethod === 'gmail_otp' || authMethod === 'both';
-    const hasPhone = normalizePhone(phoneInput).length >= 7;
-    const hasGmail = isValidGmailAddress(emailInput);
-
-    if (needPhone && !hasPhone) {
-      setOtpErrorMsg(
-        'Please enter a valid Mobile Phone Number (at least 7 digits) to receive your SMS verification OTP.'
-      );
-      return false;
-    }
-
-    if (needGmail && !hasGmail) {
-      setOtpErrorMsg(
-        'Account creation by email requires a valid Gmail address ending in @gmail.com to receive your verification OTP.'
-      );
-      return false;
-    }
-
-    setIsBusyOtp(true);
-    try {
-      if (needPhone && !isPhoneOtpVerified) {
-        const res = await apiFetch('/api/auth/request-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel: 'phone', target: phoneInput.trim() }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) {
-          setOtpErrorMsg(data.error || 'Failed to send SMS OTP.');
-          setIsBusyOtp(false);
-          return false;
+        if (recovered.account) {
+          setRecoveredAccountData(recovered.account);
+          if (recovered.account.name) setName(recovered.account.name);
+          if (recovered.account.username) setUsername(recovered.account.username);
+          if (recovered.account.about) setAbout(recovered.account.about);
+          if (recovered.account.avatarColor) setAvatarColor(recovered.account.avatarColor);
+          if (recovered.account.avatarUrl) setAvatarUrl(recovered.account.avatarUrl);
         }
-        setDispatchedPhoneOtp(String(data.sandboxDispatchedOtp || ''));
-      }
-
-      if (needGmail && !isEmailOtpVerified) {
-        const res = await apiFetch('/api/auth/request-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel: 'email', target: emailInput.trim().toLowerCase() }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) {
-          setOtpErrorMsg(data.error || 'Failed to send Gmail OTP.');
-          setIsBusyOtp(false);
-          return false;
+        if (recovered.chats && Array.isArray(recovered.chats)) {
+          setRestoredChats(recovered.chats);
         }
-        setDispatchedEmailOtp(String(data.sandboxDispatchedOtp || ''));
-      }
-
-      setOtpStatusMsg(
-        '6-digit verification OTP dispatched! Enter the code below to verify your account.'
-      );
-      setIsBusyOtp(false);
-      return true;
-    } catch {
-      setOtpErrorMsg('Network error while requesting OTP from verification server.');
-      setIsBusyOtp(false);
-      return false;
-    }
-  };
-
-  // Verify entered 6-digit OTP(s) against server
-  const handleVerifyOnboardingOtps = async (): Promise<boolean> => {
-    setOtpErrorMsg(null);
-    const needPhone = authMethod === 'phone_otp' || authMethod === 'both';
-    const needGmail = authMethod === 'gmail_otp' || authMethod === 'both';
-
-    setIsBusyOtp(true);
-    try {
-      if (needPhone && !isPhoneOtpVerified) {
-        if (phoneOtpInput.trim().length !== 6) {
-          setOtpErrorMsg('Please enter the 6-digit SMS OTP sent to your mobile number.');
-          setIsBusyOtp(false);
-          return false;
-        }
-        const res = await apiFetch('/api/auth/request-otp-check-or-verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        }).catch(() => null);
-        void res;
-        const vRes = await apiFetch('/api/auth/verify-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            channel: 'phone',
-            target: phoneInput.trim(),
-            code: phoneOtpInput.trim(),
-          }),
-        });
-        const data = await vRes.json();
-        if (!vRes.ok || !data.ok) {
-          setOtpErrorMsg(data.error || 'Invalid Mobile SMS OTP code.');
-          setIsBusyOtp(false);
-          return false;
-        }
-        setIsPhoneOtpVerified(true);
-      }
-
-      if (needGmail && !isEmailOtpVerified) {
-        if (emailOtpInput.trim().length !== 6) {
-          setOtpErrorMsg('Please enter the 6-digit OTP sent to your Gmail address.');
-          setIsBusyOtp(false);
-          return false;
-        }
-        const vRes = await apiFetch('/api/auth/verify-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            channel: 'email',
-            target: emailInput.trim().toLowerCase(),
-            code: emailOtpInput.trim(),
-          }),
-        });
-        const data = await vRes.json();
-        if (!vRes.ok || !data.ok) {
-          setOtpErrorMsg(data.error || 'Invalid Gmail OTP code.');
-          setIsBusyOtp(false);
-          return false;
-        }
-        setIsEmailOtpVerified(true);
-        setBackupGmailInput(emailInput.trim().toLowerCase());
-        setIsBackupGmailVerified(true);
-      }
-
-      setIsBusyOtp(false);
-      return true;
-    } catch {
-      setOtpErrorMsg('Failed to verify OTP with server.');
-      setIsBusyOtp(false);
-      return false;
-    }
-  };
-
-  // Send OTP specifically for Cloud Backup Gmail in Step 13 (when user registered by Phone only)
-  const handleRequestBackupGmailOtp = async () => {
-    setBackupGmailError(null);
-    if (!isValidGmailAddress(backupGmailInput)) {
-      setBackupGmailError(
-        'Cloud Backup to Google Drive or Gmail requires a valid @gmail.com address.'
-      );
-      return;
-    }
-    setIsBusyOtp(true);
-    try {
-      const res = await apiFetch('/api/auth/request-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          channel: 'email',
-          target: backupGmailInput.trim().toLowerCase(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setBackupGmailError(data.error || 'Failed to send Gmail OTP for Cloud Backup.');
+        setRecoveryNotice(
+          `Verified ${verifiedGmail} via Google OAuth & restored your encrypted account!`
+        );
       } else {
-        setDispatchedBackupGmailOtp(String(data.sandboxDispatchedOtp || ''));
+        if (!name.trim() && data.name) {
+          setName(data.name);
+        }
       }
-    } catch {
-      setBackupGmailError('Network error requesting Gmail OTP.');
+
+      setEmail(verifiedGmail);
+      setEmailVerified(true);
+      setVerificationToken(data.verificationToken);
+      setVerifiedIdentifier(verifiedGmail);
+      setOtpSentMessage(
+        `Cryptographically verified ${verifiedGmail} via official Google OAuth 2.0.`
+      );
+    } catch (err: any) {
+      setErrorBanner(
+        err?.message ||
+          'Google Sign-In popup could not complete. On Android APK or restricted views, use Authenticator App (TOTP) or Live SMTP Email OTP.'
+      );
     } finally {
-      setIsBusyOtp(false);
+      setIsVerifyingOtp(false);
     }
   };
 
-  const handleVerifyBackupGmailOtp = async (): Promise<boolean> => {
-    setBackupGmailError(null);
-    if (isBackupGmailVerified && isValidGmailAddress(backupGmailInput)) return true;
-    if (!isValidGmailAddress(backupGmailInput)) {
-      setBackupGmailError('Please provide a valid @gmail.com address for Cloud Backup.');
-      return false;
-    }
-    if (backupGmailOtpInput.trim().length !== 6) {
-      setBackupGmailError('Please enter the 6-digit Gmail OTP to link your Cloud Backup Gmail.');
-      return false;
-    }
-    setIsBusyOtp(true);
-    try {
-      const res = await apiFetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          channel: 'email',
-          target: backupGmailInput.trim().toLowerCase(),
-          code: backupGmailOtpInput.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setBackupGmailError(data.error || 'Invalid 6-digit Gmail OTP.');
-        setIsBusyOtp(false);
-        return false;
-      }
-      setIsBackupGmailVerified(true);
-      setEmailInput(backupGmailInput.trim().toLowerCase());
-      setIsEmailOtpVerified(true);
-      setIsBusyOtp(false);
-      return true;
-    } catch {
-      setBackupGmailError('Failed to verify Gmail OTP.');
-      setIsBusyOtp(false);
-      return false;
-    }
-  };
+  // Request Real Out-of-Band Email or SMS OTP from Server (Never returns code to UI!)
+  const handleRequestRealOtp = async (channel: 'email' | 'phone') => {
+    setErrorBanner(null);
+    setOtpSentMessage(null);
 
-  const finalizeAccountSetup = async (customCloudGmail?: string) => {
-    const trimmedName = nameInput.trim();
-    if (!trimmedName) {
-      setOtpErrorMsg('Please enter your display name to create your account.');
-      setStepIdx(4);
+    const identifier = channel === 'email' ? cleanEmail : fullPhoneDisplay;
+    if (channel === 'email' && !isEmailValid) {
+      setErrorBanner('Please enter a valid email address first.');
+      return;
+    }
+    if (channel === 'phone' && !isPhoneValid) {
+      setErrorBanner('Please enter a valid mobile phone number first.');
       return;
     }
 
-    const finalPhone = authMethod !== 'gmail_otp' ? phoneInput.trim() : '';
-    const normPhone = normalizePhone(finalPhone);
-    const finalEmail =
-      customCloudGmail ||
-      (authMethod !== 'phone_otp' ? emailInput.trim().toLowerCase() : '');
-    const finalUsername =
-      usernameInput.trim().toLowerCase().replace(/^@/, '') ||
-      generateDefaultUsername(trimmedName, finalPhone, finalEmail);
+    setIsSendingOtp(true);
+    try {
+      const apiBase = getRemoteServerOrigin();
+      const pwdHash = accountPassword ? await sha256Hex(accountPassword) : undefined;
+      const pinHash = twoStepPin ? await sha256Hex(twoStepPin) : undefined;
+
+      const res = await fetch(`${apiBase}/api/auth/request-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel,
+          identifier,
+          mode: onboardingMode,
+          passwordHash: pwdHash,
+          twoStepPinHash: pinHash,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        if (data.requiresGatewaySetup) {
+          setShowGatewayConfig(true);
+        }
+        setErrorBanner(
+          data.error ||
+            `Could not dispatch real ${channel.toUpperCase()} OTP. Configure your live SMTP/SMS gateway or use Authenticator App (TOTP) / Google Sign-In.`
+        );
+        return;
+      }
+
+      setOtpSentMessage(
+        data.message ||
+          `A real 6-digit verification code has been dispatched to ${
+            data.maskedTarget || identifier
+          }. Check your external inbox/messages.`
+      );
+    } catch {
+      setErrorBanner('Network error while requesting real OTP from server.');
+    } finally {
+      setIsSendingOtp(false);
+    }
+  };
+
+  // Verify 6-digit code (TOTP Authenticator, Real Email OTP, Real SMS OTP, or Two-Step PIN on login)
+  const handleVerifyCode = async () => {
+    setErrorBanner(null);
+    const cleanCode = otpInput.replace(/\D/g, '').trim();
+    if (cleanCode.length !== 6) {
+      setErrorBanner('Please enter the 6-digit verification code.');
+      return;
+    }
+
+    const identifier =
+      verifyChannel === 'email_otp'
+        ? cleanEmail
+        : verifyChannel === 'phone_otp'
+        ? fullPhoneDisplay
+        : fullPhoneDisplay || cleanEmail;
+
+    if (!identifier) {
+      setErrorBanner('Please provide a valid phone number or email address in Step 1.');
+      return;
+    }
+
+    setIsVerifyingOtp(true);
+    try {
+      const apiBase = getRemoteServerOrigin();
+      const res = await fetch(`${apiBase}/api/auth/verify-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: verifyChannel === 'totp' ? 'totp' : verifyChannel === 'email_otp' ? 'email' : 'phone',
+          identifier,
+          code: cleanCode,
+          mode: onboardingMode,
+          totpSecret: onboardingMode === 'register' ? totpSecret : undefined,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.ok || !data.verificationToken) {
+        setErrorBanner(
+          data.error ||
+            'Invalid or expired 6-digit verification code. Please check your Authenticator app or inbox and try again.'
+        );
+        setIsVerifyingOtp(false);
+        return;
+      }
+
+      // If logging into an existing account, verify password/PIN and recover account backup
+      if (onboardingMode === 'login') {
+        const pwdHash = accountPassword ? await sha256Hex(accountPassword) : undefined;
+        const pinHash = twoStepPin ? await sha256Hex(twoStepPin) : undefined;
+
+        const recovered = await recoverCloudAccountBackup({
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          email: isEmailValid ? cleanEmail : undefined,
+          passwordHash: pwdHash,
+          twoStepPinHash: pinHash,
+          verificationToken: data.verificationToken,
+        });
+
+        if (!recovered) {
+          setErrorBanner(
+            'Verification code matched, but Account Password / Two-Step PIN did not match the registered account.'
+          );
+          setIsVerifyingOtp(false);
+          return;
+        }
+
+        if (recovered.account) {
+          setRecoveredAccountData(recovered.account);
+          if (recovered.account.name) setName(recovered.account.name);
+          if (recovered.account.username) setUsername(recovered.account.username);
+          if (recovered.account.about) setAbout(recovered.account.about);
+          if (recovered.account.avatarColor) setAvatarColor(recovered.account.avatarColor);
+          if (recovered.account.avatarUrl) setAvatarUrl(recovered.account.avatarUrl);
+          if (recovered.account.phone) {
+            setPhoneVerified(true);
+          }
+          if (recovered.account.email) {
+            setEmail(recovered.account.email);
+            setEmailVerified(true);
+          }
+        }
+        if (recovered.chats && Array.isArray(recovered.chats)) {
+          setRestoredChats(recovered.chats);
+        }
+        setRecoveryNotice(
+          `Welcome back! Verified your identity and restored your encrypted account.`
+        );
+      }
+
+      setVerificationToken(data.verificationToken);
+      setVerifiedIdentifier(identifier);
+      if (isPhoneValid) setPhoneVerified(true);
+      if (isEmailValid) setEmailVerified(true);
+      setOtpInput('');
+      setOtpSentMessage(
+        `Verified via ${
+          data.verifiedMethod === 'totp_authenticator'
+            ? 'RFC 6238 Authenticator App (TOTP)'
+            : data.verifiedMethod === 'two_step_pin'
+            ? 'Two-Step Verification PIN'
+            : 'Real Out-of-Band OTP'
+        }!`
+      );
+    } catch {
+      setErrorBanner('Verification request failed. Please check your connection.');
+    } finally {
+      setIsVerifyingOtp(false);
+    }
+  };
+
+  // Finalize Account Creation or Sign-In
+  const handleFinish = async () => {
+    if (!isVerifiedForProceeding || !verificationToken) {
+      setErrorBanner('You must complete real account verification before continuing.');
+      return;
+    }
+
+    const cleanName = (recoveredAccountData?.name || name).trim() || 'Simple User';
+    const cleanHandle =
+      (recoveredAccountData?.username || username)
+        .trim()
+        .toLowerCase()
+        .replace(/^@/, '')
+        .replace(/[^a-z0-9._]/g, '') ||
+      cleanName.toLowerCase().replace(/[^a-z0-9]/g, '') ||
+      `user.${ normalizedPhoneDigits.slice(-4) || '1001' }`;
 
     const deterministicUid =
-      account.id && account.id.trim().length > 0
-        ? account.id
-        : normPhone.length >= 7
-        ? `usr_${normPhone}`
-        : finalEmail
-        ? `usr_${finalEmail.replace(/[^a-z0-9]/g, '_')}`
-        : `usr_${Date.now().toString(36)}`;
+      recoveredAccountData?.id ||
+      (isPhoneValid && normalizedPhoneDigits.length >= 7
+        ? deriveUidFromPhone(normalizedPhoneDigits)
+        : deriveUidFromEmail(cleanEmail));
 
-    const phoneHash = normPhone.length >= 7 ? await sha256Hex(normPhone) : '';
-    const phoneTailHash =
-      normPhone.length >= 7 ? await sha256Hex(normPhone.slice(-10)) : '';
-    const emailHash = finalEmail.includes('@') ? await sha256Hex(finalEmail) : '';
-    const passwordHash = passwordInput.trim()
-      ? await sha256Hex(passwordInput.trim())
-      : '';
+    const pwdHash = accountPassword
+      ? await sha256Hex(accountPassword)
+      : recoveredAccountData?.passwordHash;
+    const pinHash = twoStepPin
+      ? await sha256Hex(twoStepPin)
+      : recoveredAccountData?.twoStepPinHash;
 
-    try {
-      await apiFetch('/api/directory/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          uid: deterministicUid,
-          name: trimmedName,
-          username: finalUsername,
-          phone: finalPhone,
-          normalizedPhone: normPhone,
-          phoneHash,
-          phoneTailHash,
-          email: finalEmail,
-          emailHash,
-          passwordHash,
-          about: aboutInput.trim() || 'Hey there! I am using Simple.',
-          avatarColor,
-          avatarUrl: avatarUrlInput,
-          identityFingerprint: localFingerprint,
-          allowUsernameDiscovery: allowDiscovery,
-          hidePhoneNumber: hidePhone,
-        }),
-      });
-    } catch {
-      // Offline fallback handled by App.tsx sync
-    }
+    const finalAccount: UserAccount = {
+      id: deterministicUid,
+      name: cleanName,
+      username: cleanHandle,
+      phone: isPhoneValid ? fullPhoneDisplay : recoveredAccountData?.phone || '',
+      normalizedPhone: isPhoneValid
+        ? normalizedPhoneDigits
+        : recoveredAccountData?.normalizedPhone || '',
+      email: isEmailValid ? cleanEmail : recoveredAccountData?.email || '',
+      authMethod:
+        verifyChannel === 'google_oauth'
+          ? 'google_oauth'
+          : verifyChannel === 'totp'
+          ? 'totp'
+          : phoneVerified && emailVerified
+          ? 'both'
+          : phoneVerified
+          ? 'phone_otp'
+          : 'gmail_otp',
+      phoneVerified: phoneVerified || Boolean(recoveredAccountData?.phoneVerified),
+      emailVerified: emailVerified || Boolean(recoveredAccountData?.emailVerified),
+      passwordHash: pwdHash,
+      twoStepPinHash: pinHash,
+      totpSecret: totpSecret || recoveredAccountData?.totpSecret,
+      verificationToken,
+      about: about.trim() || 'Available on Simple E2EE',
+      avatarColor,
+      avatarUrl,
+      allowUsernameDiscovery,
+      hidePhoneNumber,
+      onboardingCompleted: true,
+      cloudBackupGmail: isEmailValid ? cleanEmail : recoveredAccountData?.email,
+    };
 
     onComplete(
+      finalAccount,
       {
-        ...account,
-        id: deterministicUid,
-        name: trimmedName,
-        username: finalUsername,
-        phone: finalPhone,
-        normalizedPhone: normPhone,
-        email: finalEmail,
-        authMethod:
-          finalPhone && finalEmail ? 'both' : finalPhone ? 'phone_otp' : 'gmail_otp',
-        phoneVerified: Boolean(finalPhone),
-        emailVerified: Boolean(finalEmail),
-        about: aboutInput.trim() || 'Hey there! I am using Simple.',
-        avatarColor,
-        avatarUrl: avatarUrlInput,
-        allowUsernameDiscovery: allowDiscovery,
-        hidePhoneNumber: hidePhone,
-        onboardingCompleted: true,
+        appLockEnabled,
+        contactsPermissionGranted: contactsPermission,
+        notificationsPermissionGranted: notificationsPermission,
+        backupMode,
+        cloudBackupGmail: isEmailValid ? cleanEmail : undefined,
+        cloudBackupGmailVerified: emailVerified,
       },
-      {
-        profilePhotoVisibility: photoVisibilityInput,
-        contactsPermissionGranted: contactsPerm,
-        notificationsPermissionGranted: notifPerm,
-        privateNotificationsMode: privateNotif,
-        microphonePermissionGranted: micPerm,
-        cameraPermissionGranted: camPerm,
-        biometricsEnabled: bioEnabled,
-        appLockPin: pinCode || '2580',
-        chatLockPin: pinCode || '2580',
-        appLockMethod: enableAppPin ? 'pin' : bioEnabled ? 'biometric' : 'none',
-        backupMode: backupChoice,
-        cloudBackupProvider,
-        cloudBackupGmail: customCloudGmail || settings.cloudBackupGmail,
-        cloudBackupGmailVerified: Boolean(customCloudGmail),
-      }
+      restoredChats
     );
-  };
-
-  const nextStep = async () => {
-    if (stepIdx === 2) {
-      await checkDatabaseForExistingAccount();
-      const dispatched = await handleDispatchOnboardingOtps();
-      if (!dispatched) return;
-      setStepIdx(3);
-      return;
-    }
-
-    if (stepIdx === 3) {
-      const verified = await handleVerifyOnboardingOtps();
-      if (!verified) return;
-
-      if (existingAccountFound && (autoRestoreOnVerify || accountMode === 'login')) {
-        if (existingAccountFound.name) setNameInput(existingAccountFound.name);
-        if (existingAccountFound.username) setUsernameInput(existingAccountFound.username);
-        const cleanPhone = authMethod !== 'gmail_otp' ? phoneInput.trim() : '';
-        const cleanGmail =
-          authMethod !== 'phone_otp' ? emailInput.trim().toLowerCase() : '';
-        onComplete(
-          {
-            ...account,
-            id:
-              existingAccountFound.uid ||
-              account.id ||
-              `usr_${normalizePhone(cleanPhone) || Date.now()}`,
-            name: existingAccountFound.name || nameInput.trim() || 'Simple User',
-            username: existingAccountFound.username,
-            phone: cleanPhone,
-            normalizedPhone: normalizePhone(cleanPhone),
-            email: cleanGmail,
-            authMethod,
-            phoneVerified: authMethod !== 'gmail_otp',
-            emailVerified: authMethod !== 'phone_otp',
-            avatarUrl: avatarUrlInput,
-            avatarColor,
-            onboardingCompleted: true,
-          },
-          {
-            ...settings,
-            profilePhotoVisibility: photoVisibilityInput,
-            ...(existingAccountFound.settings || {}),
-          },
-          existingAccountFound.chats
-        );
-        return;
-      }
-
-      setStepIdx(4);
-      return;
-    }
-
-    if (stepIdx === 4) {
-      if (!nameInput.trim()) {
-        setOtpErrorMsg('Please enter your real display name to continue.');
-        return;
-      }
-      setOtpErrorMsg(null);
-      if (!usernameInput.trim()) {
-        setUsernameInput(
-          generateDefaultUsername(
-            nameInput,
-            authMethod !== 'gmail_otp' ? phoneInput : '',
-            authMethod !== 'phone_otp' ? emailInput : ''
-          )
-        );
-      }
-      setStepIdx(5);
-      return;
-    }
-
-    if (stepIdx < STEPS.length - 1) {
-      setStepIdx((s) => s + 1);
-    } else {
-      // Step 13 (Final Step: Encrypted Backup)
-      let verifiedCloudGmail =
-        authMethod !== 'phone_otp' && isValidGmailAddress(emailInput)
-          ? emailInput.trim().toLowerCase()
-          : '';
-
-      if (backupChoice === 'cloud_e2ee') {
-        if (!verifiedCloudGmail) {
-          const ok = await handleVerifyBackupGmailOtp();
-          if (!ok) return;
-          verifiedCloudGmail = backupGmailInput.trim().toLowerCase();
-        }
-      }
-
-      await finalizeAccountSetup(verifiedCloudGmail);
-    }
-  };
-
-  const prevStep = () => {
-    if (stepIdx > 0) setStepIdx((s) => s - 1);
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-2.5 sm:p-4 overflow-y-auto">
-      <div className="w-full max-w-lg max-h-[92dvh] flex flex-col rounded-3xl bg-slate-900 border border-slate-800 p-4 sm:p-6 text-slate-100 shadow-2xl overflow-hidden">
-        {/* Header Progress */}
-        <div className="flex items-center justify-between gap-2 pb-3.5 border-b border-slate-800 shrink-0">
-          <div>
-            <span className="text-xs font-mono text-emerald-400 tabular-nums">
-              Step {stepIdx + 1} of {STEPS.length} · {STEPS[stepIdx]}
-            </span>
-            <div className="mt-1.5 w-48 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-emerald-500 transition-transform duration-150 origin-left"
-                style={{ transform: `scaleX(${(stepIdx + 1) / STEPS.length})` }}
-              />
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#070A0E] p-2.5 sm:p-4 overflow-y-auto">
+      <div className="w-full max-w-xl rounded-3xl bg-slate-900 border border-slate-800 shadow-2xl overflow-hidden my-auto max-h-[95dvh] flex flex-col">
+        {/* Top Progress Header */}
+        <div className="p-4 sm:p-5 bg-gradient-to-r from-emerald-950/80 via-slate-900 to-slate-900 border-b border-slate-800 flex items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+              <Shield className="w-5 h-5" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-display text-base sm:text-lg font-bold text-white truncate">
+                {onboardingMode === 'register'
+                  ? 'Create Verified Simple Account'
+                  : 'Sign In to Existing Account'}
+              </h2>
+              <p className="text-[11px] text-slate-400 truncate">
+                Real cryptographic verification · Zero dummy OTPs · E2EE Database
+              </p>
             </div>
           </div>
-          {onCancel && (
-            <button
-              onClick={onCancel}
-              className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-400 hover:text-white hover:bg-slate-800"
-              aria-label="Close onboarding wizard"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          )}
+
+          <div className="flex items-center gap-2 shrink-0">
+            {[1, 2, 3].map((s) => (
+              <div
+                key={s}
+                className={`h-2 rounded-full transition-all ${
+                  step === s
+                    ? 'w-7 bg-emerald-400'
+                    : step > s
+                    ? 'w-4 bg-emerald-600'
+                    : 'w-4 bg-slate-800'
+                }`}
+              />
+            ))}
+            {!isInitialSetup && onCancel && (
+              <button
+                type="button"
+                onClick={onCancel}
+                className="ml-1 w-8 h-8 rounded-xl bg-slate-800/80 hover:bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Step Body */}
-        <div className="py-4 sm:py-6 min-h-[240px] flex-1 overflow-y-auto flex flex-col justify-start">
-          {stepIdx === 0 && (
+        {/* Scrollable Content Body */}
+        <div className="p-4 sm:p-6 space-y-5 overflow-y-auto flex-1">
+          {errorBanner && (
+            <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 flex items-start justify-between gap-2.5">
+              <div className="flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{errorBanner}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setErrorBanner(null)}
+                className="text-rose-300 hover:text-white shrink-0 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {recoveryNotice && (
+            <div className="p-3.5 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-xs text-emerald-200 flex items-center gap-2">
+              <CloudUpload className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{recoveryNotice}</span>
+            </div>
+          )}
+
+          {/* STEP 1: ACCOUNT MODE, PHONE / EMAIL & PASSWORD / 2-STEP PIN */}
+          {step === 1 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <div className="w-12 h-12 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-                  <ShieldCheck className="w-6 h-6" />
-                </div>
-                <span className="px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-bold text-emerald-300">
-                  Created by Dr. M Verma
-                </span>
-              </div>
-              <h2 className="text-2xl font-bold tracking-tight">Welcome to Simple</h2>
-              <p className="text-sm text-slate-300 leading-relaxed">
-                A modern, fast, private native Android messenger created by <strong>Dr. M Verma</strong>. Create your real account or sign in to sync your phone contacts, chat with friends on Simple, or invite anyone via WhatsApp APK share.
-              </p>
-              <div className="rounded-xl bg-slate-950 border border-slate-800 p-3.5 text-xs text-emerald-400 font-medium">
-                🔒 End-to-End Encrypted · Real-Time Messaging & Calls
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
+              {/* Toggle: Create New Account vs Sign In to Existing Account */}
+              <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-slate-950 border border-slate-800">
                 <button
                   type="button"
                   onClick={() => {
-                    setAccountMode('register');
-                    setStepIdx(2);
+                    setOnboardingMode('register');
+                    setErrorBanner(null);
                   }}
-                  className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                  className={`py-2.5 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all ${
+                    onboardingMode === 'register'
+                      ? 'bg-emerald-500 text-slate-950 shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
                 >
+                  <UserPlus className="w-4 h-4" />
                   <span>Create New Account</span>
-                  <ArrowRight className="w-4 h-4" />
                 </button>
                 <button
                   type="button"
                   onClick={() => {
-                    setAccountMode('login');
-                    setStepIdx(2);
+                    setOnboardingMode('login');
+                    setErrorBanner(null);
                   }}
-                  className="min-h-[46px] px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white text-xs font-bold flex items-center justify-center gap-2"
+                  className={`py-2.5 px-3 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all ${
+                    onboardingMode === 'login'
+                      ? 'bg-emerald-500 text-slate-950 shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
                 >
-                  <span>Sign In to Existing Account</span>
+                  <UserCheck className="w-4 h-4" />
+                  <span>Sign In (Existing)</span>
                 </button>
               </div>
-            </div>
-          )}
 
-          {stepIdx === 1 && (
-            <div className="space-y-3.5">
-              <h2 className="text-xl font-bold tracking-tight">Transparent Privacy Boundaries</h2>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Simple protects your message contents, voice notes, media, and calls using end-to-end encryption.
-              </p>
-              <div className="rounded-xl bg-slate-950 border border-slate-800 p-4 space-y-2 text-xs text-slate-400 leading-relaxed">
-                <p className="text-emerald-400 font-medium">What Simple guarantees:</p>
-                <p>• Server never stores plaintext messages, call audio, or backup keys.</p>
-                <p>• No advertising SDKs or behavioral analytics.</p>
-                <p className="text-amber-300 font-medium pt-1">What no app can guarantee:</p>
-                <p>
-                  • Your device operating system, network provider, recipient screenshots, or system notifications may still retain external metadata outside the app’s control.
-                </p>
-              </div>
-            </div>
-          )}
+              {/* Avatar & Name Section (For New Account Registration) */}
+              {onboardingMode === 'register' && (
+                <div className="space-y-3 p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800">
+                  <div className="flex items-center gap-3.5">
+                    <UserAvatar
+                      name={name || 'Simple User'}
+                      avatarColor={avatarColor}
+                      avatarUrl={avatarUrl}
+                      sizeClass="w-14 h-14"
+                      textSizeClass="text-lg"
+                    />
+                    <div className="flex-1 min-w-0 space-y-2">
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                          Full Display Name *
+                        </label>
+                        <input
+                          type="text"
+                          value={name}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setName(val);
+                            if (!username) {
+                              setUsername(
+                                val
+                                  .toLowerCase()
+                                  .replace(/[^a-z0-9]/g, '')
+                                  .slice(0, 18)
+                              );
+                            }
+                          }}
+                          placeholder="e.g., Aryan Sharma"
+                          className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                          Unique @username Handle
+                        </label>
+                        <div className="relative">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-mono text-emerald-400">
+                            @
+                          </span>
+                          <input
+                            type="text"
+                            value={username}
+                            onChange={(e) =>
+                              setUsername(
+                                e.target.value
+                                  .toLowerCase()
+                                  .replace(/[^a-z0-9._]/g, '')
+                                  .slice(0, 28)
+                              )
+                            }
+                            placeholder="aryan.sharma"
+                            className="w-full rounded-xl bg-slate-900 border border-slate-800 pl-7 pr-3 py-2 text-xs font-mono text-emerald-300 focus:outline-none focus:border-emerald-500"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
 
-          {stepIdx === 2 && (
-            <div className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="text-lg sm:text-xl font-bold tracking-tight">
-                  {accountMode === 'login' ? 'Sign In to Your Account' : 'Create Your Account'}
-                </h2>
-                <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setAccountMode('register')}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${
-                      accountMode === 'register'
-                        ? 'bg-emerald-500 text-slate-950'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    New Account
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAccountMode('login')}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${
-                      accountMode === 'login'
-                        ? 'bg-cyan-500 text-slate-950'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Sign In
-                  </button>
+                  {/* Quick Avatar Picker */}
+                  <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pt-1">
+                    {PRESET_PROFILE_PHOTOS.slice(0, 8).map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => setAvatarUrl(preset.url)}
+                        className={`p-1 rounded-xl border transition-all shrink-0 ${
+                          avatarUrl === preset.url
+                            ? 'border-emerald-400 bg-emerald-500/15 scale-105'
+                            : 'border-slate-800 bg-slate-900 opacity-75 hover:opacity-100'
+                        }`}
+                      >
+                        <img
+                          src={preset.url}
+                          alt={preset.label}
+                          className="w-8 h-8 rounded-lg object-cover"
+                        />
+                      </button>
+                    ))}
+                    {AVATAR_COLORS.map((col) => (
+                      <button
+                        key={col}
+                        type="button"
+                        onClick={() => {
+                          setAvatarColor(col);
+                          setAvatarUrl(undefined);
+                        }}
+                        className={`w-7 h-7 rounded-full shrink-0 border-2 ${
+                          !avatarUrl && avatarColor === col
+                            ? 'border-white scale-110'
+                            : 'border-transparent opacity-75'
+                        }`}
+                        style={{ backgroundColor: col }}
+                      />
+                    ))}
+                  </div>
                 </div>
-              </div>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Enter your real <strong>Mobile Phone Number</strong> or <strong>Gmail Address</strong>. Your account credentials are saved in the database so your contacts on Simple can find and message you immediately.
-              </p>
+              )}
 
-              {/* Account Creation Method Selector */}
-              <div className="grid grid-cols-3 gap-2">
-                {(
-                  [
-                    {
-                      id: 'phone_otp',
-                      title: '📱 Phone + OTP',
-                      sub: 'Mobile number',
-                    },
-                    {
-                      id: 'gmail_otp',
-                      title: '✉️ Gmail + OTP',
-                      sub: '@gmail.com',
-                    },
-                    {
-                      id: 'both',
-                      title: '🔐 Phone & Gmail',
-                      sub: 'Verify both',
-                    },
-                  ] as const
-                ).map((mode) => (
-                  <button
-                    key={mode.id}
-                    type="button"
-                    onClick={() => {
-                      setAuthMethod(mode.id);
-                      setOtpErrorMsg(null);
-                    }}
-                    className={`p-2.5 rounded-2xl border text-left transition-all ${
-                      authMethod === mode.id
-                        ? 'bg-emerald-500/20 border-emerald-500 text-white ring-1 ring-emerald-400/40'
-                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    <div className="text-xs font-bold">{mode.title}</div>
-                    <div className="text-[10px] text-slate-400 mt-0.5">{mode.sub}</div>
-                  </button>
-                ))}
-              </div>
-
-              <div className="space-y-3">
-                {(authMethod === 'phone_otp' || authMethod === 'both') && (
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">
-                      Mobile Phone Number (with Country Code)
-                    </label>
+              {/* Mobile Number & Email Identifiers */}
+              <div className="space-y-3 p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-200 mb-1">
+                    Mobile Phone Number
+                  </label>
+                  <div className="flex gap-2">
+                    <select
+                      value={countryCode}
+                      onChange={(e) => setCountryCode(e.target.value)}
+                      className="rounded-xl bg-slate-900 border border-slate-800 px-2.5 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500 shrink-0"
+                    >
+                      {COUNTRY_CODES.map((c) => (
+                        <option key={c.code} value={c.code}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </select>
                     <input
                       type="tel"
-                      value={phoneInput}
-                      onChange={(e) => {
-                        setPhoneInput(e.target.value);
-                        setIsPhoneOtpVerified(false);
-                        setDispatchedPhoneOtp(null);
-                        setOtpErrorMsg(null);
-                      }}
-                      placeholder="+91 98765 43210"
-                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm font-mono text-cyan-300 focus:outline-none focus:border-emerald-500"
+                      value={localPhoneNumber}
+                      onChange={(e) => setLocalPhoneNumber(e.target.value)}
+                      placeholder="98765 43210"
+                      className="flex-1 min-w-0 rounded-xl bg-slate-900 border border-slate-800 px-3.5 py-2.5 text-xs font-mono text-white focus:outline-none focus:border-emerald-500"
                     />
                   </div>
-                )}
+                </div>
 
-                {(authMethod === 'gmail_otp' || authMethod === 'both') && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-200 mb-1">
+                    Email / Gmail Address (for Email OTP, Google Auth & Cloud Backup)
+                  </label>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@gmail.com"
+                    className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3.5 py-2.5 text-xs font-mono text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              {/* Account Password & WhatsApp-Style 6-Digit Two-Step Verification PIN */}
+              <div className="space-y-3 p-3.5 rounded-2xl bg-slate-950/90 border border-emerald-500/30">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>
+                      {onboardingMode === 'register'
+                        ? 'Set Account Password & 6-Digit 2-Step PIN'
+                        : 'Enter Account Password & 6-Digit 2-Step PIN'}
+                    </span>
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    SHA-256 Protected
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="block text-xs font-medium text-slate-300">
-                        Gmail Address (@gmail.com)
+                    <label className="block text-[11px] text-slate-300 mb-1">
+                      Account Password *
+                    </label>
+                    <input
+                      type="password"
+                      value={accountPassword}
+                      onChange={(e) => setAccountPassword(e.target.value)}
+                      placeholder="Min 6 characters"
+                      className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+
+                  {onboardingMode === 'register' ? (
+                    <div>
+                      <label className="block text-[11px] text-slate-300 mb-1">
+                        Confirm Password *
                       </label>
-                      {emailInput && !emailInput.includes('@') && (
-                        <button
-                          type="button"
-                          onClick={() => setEmailInput(`${emailInput.trim()}@gmail.com`)}
-                          className="text-[10px] font-mono text-emerald-400 hover:underline"
-                        >
-                          Append @gmail.com
-                        </button>
-                      )}
-                    </div>
-                    <input
-                      type="email"
-                      value={emailInput}
-                      onChange={(e) => {
-                        setEmailInput(e.target.value);
-                        setIsEmailOtpVerified(false);
-                        setDispatchedEmailOtp(null);
-                        setOtpErrorMsg(null);
-                      }}
-                      placeholder="yourname@gmail.com"
-                      className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
-                    />
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Account Password (Saved Encrypted to Database)
-                  </label>
-                  <input
-                    type="password"
-                    value={passwordInput}
-                    onChange={(e) => setPasswordInput(e.target.value)}
-                    placeholder={
-                      accountMode === 'login'
-                        ? 'Enter your account password (or verify via OTP)'
-                        : 'Create a password for your account'
-                    }
-                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-              {existingAccountFound && (
-                <div className="p-3.5 rounded-2xl bg-cyan-500/15 border border-cyan-500/40 text-xs space-y-1">
-                  <div className="font-bold text-cyan-300 flex items-center gap-1.5">
-                    <Sparkles className="w-4 h-4 text-cyan-400" />
-                    <span>Existing Account Detected: @{existingAccountFound.username}</span>
-                  </div>
-                  <p className="text-slate-300 text-[11px] leading-relaxed">
-                    An existing account with previous chats and verified identity is registered for this mobile/Gmail. Complete OTP verification in the next step to recover your exact account and restore your conversation history.
-                  </p>
-                </div>
-              )}
-              {otpErrorMsg && (
-                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300">
-                  {otpErrorMsg}
-                </div>
-              )}
-            </div>
-          )}
-
-          {stepIdx === 3 && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-xl font-bold tracking-tight">Verify Account Ownership (OTP)</h2>
-                <button
-                  type="button"
-                  onClick={handleDispatchOnboardingOtps}
-                  disabled={isBusyOtp}
-                  className="px-3 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-400"
-                >
-                  Resend OTP
-                </button>
-              </div>
-              <p className="text-xs text-slate-400">
-                Enter the 6-digit verification code(s) generated by the server to verify your{' '}
-                {authMethod === 'phone_otp'
-                  ? 'mobile phone number'
-                  : authMethod === 'gmail_otp'
-                  ? 'Gmail address'
-                  : 'mobile phone number and Gmail address'}
-                .
-              </p>
-
-              {existingAccountFound && (
-                <div className="p-3.5 rounded-2xl bg-cyan-500/15 border border-cyan-500/40 space-y-2 text-xs">
-                  <div className="font-bold text-cyan-300 flex items-center justify-between">
-                    <span>Account Recovery: @{existingAccountFound.username}</span>
-                    <span className="px-2 py-0.5 rounded-full bg-cyan-500/20 text-[10px] text-cyan-300">
-                      Backup Ready
-                    </span>
-                  </div>
-                  <label className="flex items-center gap-2 cursor-pointer text-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={autoRestoreOnVerify}
-                      onChange={(e) => setAutoRestoreOnVerify(e.target.checked)}
-                      className="accent-emerald-500 w-4 h-4"
-                    />
-                    <span className="text-[11px]">
-                      Automatically restore all previous chats and account settings upon verifying OTP
-                    </span>
-                  </label>
-                </div>
-              )}
-
-              {/* Android SMS Retriever / Push OTP Auto-Fill Banner */}
-              {(dispatchedPhoneOtp || dispatchedEmailOtp) && (
-                <div className="p-3.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/40 space-y-2 text-xs">
-                  <div className="flex items-center justify-between text-emerald-300 font-semibold">
-                    <span>📲 Android Push OTP Auto-Fill Notification</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (dispatchedPhoneOtp && authMethod !== 'gmail_otp')
-                          setPhoneOtpInput(dispatchedPhoneOtp);
-                        if (dispatchedEmailOtp && authMethod !== 'phone_otp')
-                          setEmailOtpInput(dispatchedEmailOtp);
-                        setOtpErrorMsg(null);
-                      }}
-                      className="px-2.5 py-1 rounded-lg bg-emerald-500 text-slate-950 font-bold text-[11px]"
-                    >
-                      Auto-Fill OTP
-                    </button>
-                  </div>
-                  {dispatchedPhoneOtp && authMethod !== 'gmail_otp' && (
-                    <div className="font-mono text-slate-200 bg-slate-950/80 px-3 py-1.5 rounded-xl border border-slate-800">
-                      [SMS to <span className="text-cyan-300">{phoneInput}</span>]: Your Simple verification code is{' '}
-                      <strong className="text-emerald-400 text-sm tracking-widest">
-                        {dispatchedPhoneOtp}
-                      </strong>
-                    </div>
-                  )}
-                  {dispatchedEmailOtp && authMethod !== 'phone_otp' && (
-                    <div className="font-mono text-slate-200 bg-slate-950/80 px-3 py-1.5 rounded-xl border border-slate-800">
-                      [Gmail to <span className="text-cyan-300">{emailInput}</span>]: Your Simple verification code is{' '}
-                      <strong className="text-emerald-400 text-sm tracking-widest">
-                        {dispatchedEmailOtp}
-                      </strong>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {(authMethod === 'phone_otp' || authMethod === 'both') && (
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-300">
-                    6-Digit Mobile SMS OTP ({phoneInput})
-                  </label>
-                  <input
-                    type="text"
-                    maxLength={6}
-                    value={phoneOtpInput}
-                    onChange={(e) => {
-                      setPhoneOtpInput(e.target.value.replace(/[^0-9]/g, ''));
-                      setOtpErrorMsg(null);
-                    }}
-                    placeholder="••••••"
-                    className="w-full text-center font-mono text-2xl tracking-[0.4em] rounded-xl bg-slate-950 border border-slate-800 px-4 py-2.5 text-emerald-400 focus:outline-none focus:border-emerald-500 tabular-nums"
-                  />
-                </div>
-              )}
-
-              {(authMethod === 'gmail_otp' || authMethod === 'both') && (
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-300">
-                    6-Digit Gmail OTP ({emailInput})
-                  </label>
-                  <input
-                    type="text"
-                    maxLength={6}
-                    value={emailOtpInput}
-                    onChange={(e) => {
-                      setEmailOtpInput(e.target.value.replace(/[^0-9]/g, ''));
-                      setOtpErrorMsg(null);
-                    }}
-                    placeholder="••••••"
-                    className="w-full text-center font-mono text-2xl tracking-[0.4em] rounded-xl bg-slate-950 border border-slate-800 px-4 py-2.5 text-cyan-300 focus:outline-none focus:border-emerald-500 tabular-nums"
-                  />
-                </div>
-              )}
-
-              {otpStatusMsg && !otpErrorMsg && (
-                <p className="text-xs text-emerald-400">{otpStatusMsg}</p>
-              )}
-
-              {otpErrorMsg && (
-                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300">
-                  {otpErrorMsg}
-                </div>
-              )}
-            </div>
-          )}
-
-          {stepIdx === 4 && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-xl font-bold tracking-tight">Profile Info & Photo</h2>
-                  <p className="text-xs text-slate-400">
-                    Please provide your name, about bio, and an optional profile photo.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setStepIdx(6)}
-                  className="px-2.5 py-1 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-semibold text-emerald-300 whitespace-nowrap"
-                >
-                  Pro Photo Studio →
-                </button>
-              </div>
-
-              {/* Quick Profile Photo Row in Step 5 */}
-              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3.5">
-                  <label className="cursor-pointer">
-                    <UserAvatar
-                      name={nameInput || 'User'}
-                      avatarUrl={avatarUrlInput}
-                      avatarColor={avatarColor}
-                      sizeClass="w-16 h-16"
-                      textClass="text-lg"
-                      showCameraBadge
-                      title="Tap to upload a profile photo"
-                    />
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (!file) return;
-                        const reader = new FileReader();
-                        reader.onload = () => {
-                          setAvatarUrlInput(String(reader.result || ''));
-                        };
-                        reader.readAsDataURL(file);
-                        e.target.value = '';
-                      }}
-                    />
-                  </label>
-                  <div className="space-y-1">
-                    <div className="text-xs font-bold text-white">Profile Photo</div>
-                    <div className="text-[11px] text-slate-400">
-                      Tap the camera icon to upload a photo, or pick a quick avatar:
-                    </div>
-                    <div className="flex items-center gap-1.5 pt-0.5">
-                      {PRESET_PROFILE_PHOTOS.slice(0, 5).map((preset) => (
-                        <button
-                          key={preset.id}
-                          type="button"
-                          onClick={() => setAvatarUrlInput(preset.url)}
-                          className={`w-7 h-7 rounded-full overflow-hidden border-2 transition-transform ${
-                            avatarUrlInput === preset.url
-                              ? 'border-emerald-400 scale-110'
-                              : 'border-transparent opacity-80 hover:opacity-100'
-                          }`}
-                          title={`Use ${preset.label}`}
-                        >
-                          <img src={preset.url} alt={preset.label} className="w-full h-full object-cover" />
-                        </button>
-                      ))}
-                      {avatarUrlInput && (
-                        <button
-                          type="button"
-                          onClick={() => setAvatarUrlInput(undefined)}
-                          className="px-2 py-0.5 rounded-lg bg-rose-500/15 text-rose-300 text-[10px] font-semibold"
-                        >
-                          Remove
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Full Name / Display Name <span className="text-emerald-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={nameInput}
-                    onChange={(e) => {
-                      setNameInput(e.target.value);
-                      setOtpErrorMsg(null);
-                    }}
-                    placeholder="Enter your real name"
-                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">About / Bio</label>
-                  <input
-                    type="text"
-                    value={aboutInput}
-                    onChange={(e) => setAboutInput(e.target.value)}
-                    placeholder="Hey there! I am using Simple."
-                    className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-
-              {otpErrorMsg && (
-                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-300">
-                  {otpErrorMsg}
-                </div>
-              )}
-
-              <div className="pt-2">
-                <button
-                  type="button"
-                  onClick={() => finalizeAccountSetup()}
-                  className="w-full min-h-[44px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>Save Account to Database & Open Chats</span>
-                </button>
-              </div>
-            </div>
-          )}
-
-          {stepIdx === 5 && (
-            <div className="space-y-4">
-              <h2 className="text-xl font-bold tracking-tight">Username & Number Discovery</h2>
-              <p className="text-xs text-slate-400">
-                Your `@username` is created from your phone number and email so anyone on Simple can find you by `@username`, mobile number, or email.
-              </p>
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Username (@handle)</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={usernameInput}
-                    onChange={(e) => setUsernameInput(e.target.value)}
-                    className="flex-1 rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm font-mono text-emerald-300 focus:outline-none focus:border-emerald-500"
-                  />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setUsernameInput(generateDefaultUsername(nameInput, phoneInput, emailInput))
-                    }
-                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-300 flex items-center gap-1"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    From Phone/Email
-                  </button>
-                </div>
-              </div>
-              <label className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Hide my phone number display from strangers</span>
-                <input
-                  type="checkbox"
-                  checked={hidePhone}
-                  onChange={(e) => setHidePhone(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-              <label className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Allow lookup by @username, phone, or email</span>
-                <input
-                  type="checkbox"
-                  checked={allowDiscovery}
-                  onChange={(e) => setAllowDiscovery(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-              <div className="pt-2">
-                <button
-                  type="button"
-                  onClick={() => finalizeAccountSetup()}
-                  className="w-full min-h-[44px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>Complete Account & Start Chatting</span>
-                </button>
-              </div>
-            </div>
-          )}
-
-          {stepIdx === 6 && (
-            <div className="space-y-3.5">
-              <div>
-                <h2 className="text-xl font-bold tracking-tight">Profile Photo & Privacy</h2>
-                <p className="text-xs text-slate-400">
-                  Set your profile photo using your device gallery, camera, curated portraits, or emoji studio, and choose who can see your profile photo.
-                </p>
-              </div>
-              <InlineProfilePhotoEditor
-                name={nameInput || 'Alex Rivera'}
-                avatarUrl={avatarUrlInput}
-                avatarColor={avatarColor}
-                profilePhotoVisibility={photoVisibilityInput}
-                onChangeAvatarUrl={(url) => setAvatarUrlInput(url)}
-                onChangeAvatarColor={(col) => setAvatarColor(col)}
-                onChangeVisibility={(vis) => setPhotoVisibilityInput(vis)}
-                compact
-              />
-            </div>
-          )}
-
-          {stepIdx === 7 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Users className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Optional Contacts Permission</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Simple matches saved mobile phone numbers against registered Simple users so you can immediately message anyone who has the app. You can also continue without granting contacts permission and add people manually.
-              </p>
-              <div className="flex gap-3">
-                <button
-                  type="button"
-                  onClick={() => setContactsPerm(false)}
-                  className={`flex-1 min-h-[44px] rounded-xl border text-xs font-semibold transition-colors ${
-                    !contactsPerm
-                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-                      : 'bg-slate-950 border-slate-800 text-slate-400'
-                  }`}
-                >
-                  Continue Without Contacts
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setContactsPerm(true)}
-                  className={`flex-1 min-h-[44px] rounded-xl border text-xs font-semibold transition-colors ${
-                    contactsPerm
-                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-                      : 'bg-slate-950 border-slate-800 text-slate-400'
-                  }`}
-                >
-                  Allow Mobile Contact Matching
-                </button>
-              </div>
-            </div>
-          )}
-
-          {stepIdx === 8 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Bell className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Notification Permission & Privacy</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Receive real-time message and call alerts. Enable <strong>Private Notifications</strong> to show only generic <em>"New private message"</em> banners without exposing sender names or content to your lock screen.
-              </p>
-              <label className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Enable Notifications</span>
-                <input
-                  type="checkbox"
-                  checked={notifPerm}
-                  onChange={(e) => setNotifPerm(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-              <label className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Private Notifications Mode ("New private message")</span>
-                <input
-                  type="checkbox"
-                  checked={privateNotif}
-                  onChange={(e) => setPrivateNotif(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-            </div>
-          )}
-
-          {stepIdx === 9 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Mic className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Microphone Permission</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Used only when you record a voice note or make a voice or video call. Simple never listens in the background.
-              </p>
-              <label className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Allow Microphone for Calls & Voice Notes</span>
-                <input
-                  type="checkbox"
-                  checked={micPerm}
-                  onChange={(e) => setMicPerm(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-            </div>
-          )}
-
-          {stepIdx === 10 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Camera className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Camera Permission</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Used only during video calls, capturing in-chat photos, or scanning Safety Number QR codes.
-              </p>
-              <label className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Allow Camera Access When Active</span>
-                <input
-                  type="checkbox"
-                  checked={camPerm}
-                  onChange={(e) => setCamPerm(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-            </div>
-          )}
-
-          {stepIdx === 11 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Fingerprint className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Optional Biometric Lock</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Use Fingerprint or Face Unlock on your phone to quickly open Locked Chats and keep your app secure.
-              </p>
-              <label className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Enable Biometric Authentication</span>
-                <input
-                  type="checkbox"
-                  checked={bioEnabled}
-                  onChange={(e) => setBioEnabled(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-            </div>
-          )}
-
-          {stepIdx === 12 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <Lock className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">PIN / Passcode Setup</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Set a 4-digit PIN to protect your Locked Chats vault and optional full App Lock.
-              </p>
-              <input
-                type="password"
-                maxLength={8}
-                value={pinCode}
-                onChange={(e) => setPinCode(e.target.value)}
-                placeholder="4-digit PIN (e.g. 2580)"
-                className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm font-mono tracking-widest text-white focus:outline-none focus:border-emerald-500"
-              />
-              <label className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                <span className="text-xs text-slate-200">Require PIN immediately when opening Simple</span>
-                <input
-                  type="checkbox"
-                  checked={enableAppPin}
-                  onChange={(e) => setEnableAppPin(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-            </div>
-          )}
-
-          {stepIdx === 13 && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2.5 text-emerald-400">
-                <HardDrive className="w-5 h-5" />
-                <h2 className="text-xl font-bold tracking-tight text-white">Chat Backup Options</h2>
-              </div>
-              <p className="text-xs text-slate-300 leading-relaxed">
-                Choose how you want to back up your chats. For <strong>Cloud Backup (Google Drive or Gmail)</strong>, a verified <strong>@gmail.com</strong> account is required.
-              </p>
-              <div className="grid grid-cols-3 gap-2">
-                {(
-                  [
-                    { id: 'none', label: 'Off' },
-                    { id: 'local_encrypted', label: 'Save to Device' },
-                    { id: 'cloud_e2ee', label: 'Drive / Gmail Cloud' },
-                  ] as const
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => {
-                      setBackupChoice(opt.id);
-                      setBackupGmailError(null);
-                    }}
-                    className={`min-h-[44px] px-2.5 py-2 rounded-xl border text-xs font-medium transition-colors ${
-                      backupChoice === opt.id
-                        ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-                        : 'bg-slate-950 border-slate-800 text-slate-400'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-
-              {backupChoice === 'cloud_e2ee' && (
-                <div className="p-3.5 rounded-2xl bg-slate-950 border border-emerald-500/40 space-y-3 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-emerald-300">
-                      ☁️ Cloud Backup Destination (Drive or Gmail)
-                    </span>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setCloudBackupProvider('google_drive')}
-                        className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border ${
-                          cloudBackupProvider === 'google_drive'
-                            ? 'bg-emerald-500 text-slate-950 border-emerald-400'
-                            : 'bg-slate-900 text-slate-300 border-slate-800'
-                        }`}
-                      >
-                        Google Drive
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCloudBackupProvider('gmail')}
-                        className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border ${
-                          cloudBackupProvider === 'gmail'
-                            ? 'bg-emerald-500 text-slate-950 border-emerald-400'
-                            : 'bg-slate-900 text-slate-300 border-slate-800'
-                        }`}
-                      >
-                        Gmail Archive
-                      </button>
-                    </div>
-                  </div>
-
-                  {authMethod !== 'phone_otp' && isValidGmailAddress(emailInput) ? (
-                    <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 flex items-center justify-between">
-                      <span>
-                        ✓ Linked Cloud Backup Gmail: <strong>{emailInput.trim().toLowerCase()}</strong>
-                      </span>
-                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20">
-                        OTP Verified
-                      </span>
+                      <input
+                        type="password"
+                        value={confirmPassword}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
+                        placeholder="Re-enter password"
+                        className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                      />
                     </div>
                   ) : (
-                    <div className="space-y-2.5 pt-1 border-t border-slate-800">
-                      <p className="text-[11px] text-amber-200 leading-relaxed">
-                        You created your account using a phone number. To enable Cloud Backup to{' '}
-                        <strong>{cloudBackupProvider === 'google_drive' ? 'Google Drive' : 'Gmail'}</strong>, please provide and verify your <strong>@gmail.com</strong> address:
-                      </p>
-                      <div className="flex gap-2">
-                        <input
-                          type="email"
-                          value={backupGmailInput}
-                          onChange={(e) => {
-                            setBackupGmailInput(e.target.value);
-                            setIsBackupGmailVerified(false);
-                            setDispatchedBackupGmailOtp(null);
-                            setBackupGmailError(null);
-                          }}
-                          placeholder="yourname@gmail.com"
-                          className="flex-1 rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
-                        />
+                    <div>
+                      <label className="block text-[11px] text-slate-300 mb-1">
+                        6-Digit Two-Step PIN
+                      </label>
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={twoStepPin}
+                        onChange={(e) =>
+                          setTwoStepPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                        }
+                        placeholder="••••••"
+                        className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs font-mono tracking-widest text-white focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {onboardingMode === 'register' && (
+                  <div>
+                    <label className="block text-[11px] text-slate-300 mb-1">
+                      WhatsApp-Style 6-Digit Two-Step Verification PIN *
+                    </label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={twoStepPin}
+                      onChange={(e) =>
+                        setTwoStepPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      placeholder="Enter 6-digit secret PIN (e.g. 482910)"
+                      className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs font-mono tracking-widest text-white focus:outline-none focus:border-emerald-500"
+                    />
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Required whenever signing in or recovering your account on a new phone. Nobody can access your account without this PIN and password.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <button
+                type="button"
+                disabled={isSendingOtp}
+                onClick={handleProceedToVerification}
+                className="w-full min-h-[46px] rounded-2xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition-all"
+              >
+                {isSendingOtp ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Checking Account Directory…</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>
+                      {onboardingMode === 'register'
+                        ? 'Continue to Real Verification →'
+                        : 'Verify Ownership & Sign In →'}
+                    </span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
+          {/* STEP 2: REAL CRYPTOGRAPHIC VERIFICATION (NO DUMMY OTPs!) */}
+          {step === 2 && (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-white">
+                    Choose Real Verification Method
+                  </span>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
+                    Zero Dummy OTPs
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  For your security, Simple never displays or auto-fills OTP codes inside the app. Verify using Google Authenticator / Authy (RFC 6238 TOTP), Official Google Sign-In, or a real external Email/SMS gateway.
+                </p>
+
+                {/* 4 Real Verification Channel Tabs */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerifyChannel('totp');
+                      setErrorBanner(null);
+                      if (onboardingMode === 'register' && !totpSecret) {
+                        handleGenerateTotpSecret();
+                      }
+                    }}
+                    className={`p-2 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
+                      verifyChannel === 'totp'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <KeyRound className="w-4 h-4" />
+                    <span>Authenticator</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerifyChannel('google_oauth');
+                      setErrorBanner(null);
+                    }}
+                    className={`p-2 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
+                      verifyChannel === 'google_oauth'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Google Auth</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerifyChannel('email_otp');
+                      setErrorBanner(null);
+                    }}
+                    className={`p-2 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
+                      verifyChannel === 'email_otp'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Mail className="w-4 h-4" />
+                    <span>Real Email OTP</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerifyChannel('phone_otp');
+                      setErrorBanner(null);
+                    }}
+                    className={`p-2 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
+                      verifyChannel === 'phone_otp'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Smartphone className="w-4 h-4" />
+                    <span>Real SMS OTP</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* CHANNEL 1: RFC 6238 TOTP AUTHENTICATOR APP (OR 2-STEP PIN ON LOGIN) */}
+              {verifyChannel === 'totp' && (
+                <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-3.5">
+                  {onboardingMode === 'register' ? (
+                    <>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <h3 className="text-xs font-bold text-emerald-400">
+                            Step A: Link Authenticator App (RFC 6238 TOTP)
+                          </h3>
+                          <p className="text-[11px] text-slate-400 mt-0.5">
+                            Add this secret key to Google Authenticator, Authy, 1Password, or Microsoft Authenticator, then enter the live 6-digit code generated by your authenticator app.
+                          </p>
+                        </div>
                         <button
                           type="button"
-                          onClick={handleRequestBackupGmailOtp}
-                          disabled={isBusyOtp}
-                          className="px-3 py-2 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold whitespace-nowrap"
+                          onClick={handleGenerateTotpSecret}
+                          disabled={isGeneratingTotp}
+                          className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-300 shrink-0"
                         >
-                          Send Gmail OTP
+                          New Key
                         </button>
                       </div>
 
-                      {dispatchedBackupGmailOtp && (
-                        <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2">
-                          <div className="flex items-center justify-between font-mono text-[11px]">
-                            <span>
-                              ✉️ Gmail OTP:{' '}
-                              <strong className="text-emerald-300 tracking-widest">
-                                {dispatchedBackupGmailOtp}
-                              </strong>
+                      {totpSecret && (
+                        <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">
+                              Your Secret Setup Key (Base32)
                             </span>
                             <button
                               type="button"
                               onClick={() => {
-                                setBackupGmailOtpInput(dispatchedBackupGmailOtp);
-                                setBackupGmailError(null);
+                                navigator.clipboard?.writeText(totpSecret);
+                                setCopiedTotpSecret(true);
+                                setTimeout(() => setCopiedTotpSecret(false), 2000);
                               }}
-                              className="px-2 py-0.5 rounded bg-emerald-500 text-slate-950 font-sans font-bold text-[10px]"
+                              className="px-2 py-1 rounded-lg bg-emerald-500/15 text-emerald-300 text-[11px] font-semibold flex items-center gap-1"
                             >
-                              Auto-Fill
+                              {copiedTotpSecret ? (
+                                <>
+                                  <Check className="w-3 h-3" />
+                                  <span>Copied</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3" />
+                                  <span>Copy Key</span>
+                                </>
+                              )}
                             </button>
                           </div>
-                          <div className="flex gap-2">
-                            <input
-                              type="text"
-                              maxLength={6}
-                              value={backupGmailOtpInput}
-                              onChange={(e) =>
-                                setBackupGmailOtpInput(e.target.value.replace(/[^0-9]/g, ''))
-                              }
-                              placeholder="6-digit Gmail OTP"
-                              className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-cyan-300"
-                            />
-                            <button
-                              type="button"
-                              onClick={handleVerifyBackupGmailOtp}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold"
-                            >
-                              {isBackupGmailVerified ? 'Verified ✓' : 'Verify Gmail'}
-                            </button>
+                          <div className="font-mono text-xs sm:text-sm font-bold text-emerald-300 tracking-wider break-all select-all bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                            {totpSecret}
                           </div>
+                          {totpUri && (
+                            <a
+                              href={totpUri}
+                              className="w-full min-h-[38px] rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-bold flex items-center justify-center gap-1.5"
+                            >
+                              <Smartphone className="w-3.5 h-3.5" />
+                              <span>Open in Authenticator App on This Device</span>
+                            </a>
+                          )}
                         </div>
                       )}
-
-                      {isBackupGmailVerified && (
-                        <div className="text-[11px] text-emerald-400 font-semibold">
-                          ✓ Gmail verified for {cloudBackupProvider === 'google_drive' ? 'Google Drive' : 'Gmail'} Cloud Backup!
-                        </div>
-                      )}
-
-                      {backupGmailError && (
-                        <div className="p-2.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-[11px] text-rose-300">
-                          {backupGmailError}
-                        </div>
-                      )}
+                    </>
+                  ) : (
+                    <div className="space-y-1">
+                      <h3 className="text-xs font-bold text-emerald-400">
+                        Enter Authenticator App Code or 6-Digit Two-Step PIN
+                      </h3>
+                      <p className="text-[11px] text-slate-400">
+                        Open your linked Authenticator App (Google Authenticator / Authy) and enter the current 6-digit code, or enter your registered 6-digit Two-Step Verification PIN.
+                      </p>
                     </div>
                   )}
+
+                  <div className="space-y-2 pt-1">
+                    <label className="block text-xs font-semibold text-slate-200">
+                      Enter 6-Digit Code from Authenticator App
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={otpInput}
+                        onChange={(e) =>
+                          setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                        }
+                        placeholder="6-digit code"
+                        className="flex-1 rounded-xl bg-slate-900 border border-slate-700 px-4 py-2.5 text-center font-mono text-base tracking-[0.35em] text-white focus:outline-none focus:border-emerald-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleVerifyCode}
+                        disabled={isVerifyingOtp || otpInput.length !== 6}
+                        className="px-5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
+                      >
+                        {isVerifyingOtp ? 'Verifying…' : 'Verify Code'}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
+
+              {/* CHANNEL 2: REAL GOOGLE OAUTH 2.0 VERIFICATION */}
+              {verifyChannel === 'google_oauth' && (
+                <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-3">
+                  <h3 className="text-xs font-bold text-emerald-400">
+                    Official Google Account Verification (OAuth 2.0)
+                  </h3>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Sign in directly with Google to cryptographically prove ownership of your Gmail address without needing to type an OTP code.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleGoogleOAuthVerification}
+                    disabled={isVerifyingOtp}
+                    className="w-full min-h-[44px] rounded-xl bg-white hover:bg-slate-100 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 shadow-md"
+                  >
+                    <Sparkles className="w-4 h-4 text-emerald-600" />
+                    <span>
+                      {isVerifyingOtp
+                        ? 'Verifying with Google Servers…'
+                        : 'Verify with Google Sign-In'}
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              {/* CHANNEL 3 & 4: REAL SMTP EMAIL OTP OR REAL SMS GATEWAY OTP */}
+              {(verifyChannel === 'email_otp' || verifyChannel === 'phone_otp') && (
+                <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-bold text-emerald-400">
+                        {verifyChannel === 'email_otp'
+                          ? `Real SMTP Email OTP (${cleanEmail || 'No email set'})`
+                          : `Real Carrier SMS OTP (${fullPhoneDisplay || 'No phone set'})`}
+                      </h3>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Dispatches a real 6-digit code to your external{' '}
+                        {verifyChannel === 'email_otp' ? 'email inbox' : 'mobile number'}.
+                        Code is never shown inside the app.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowGatewayConfig((v) => !v)}
+                      className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-emerald-300 font-semibold shrink-0"
+                    >
+                      {showGatewayConfig ? 'Hide Gateway' : 'Configure SMTP/SMS'}
+                    </button>
+                  </div>
+
+                  {/* Gateway Status Badge */}
+                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                    <span
+                      className={`px-2.5 py-1 rounded-lg border font-medium ${
+                        (verifyChannel === 'email_otp' && gatewayStatus.smtpConfigured) ||
+                        (verifyChannel === 'phone_otp' && gatewayStatus.smsGatewayConfigured)
+                          ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                          : 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                      }`}
+                    >
+                      {verifyChannel === 'email_otp'
+                        ? gatewayStatus.smtpConfigured
+                          ? `SMTP Active (${gatewayStatus.smtpUserMasked})`
+                          : 'SMTP Relay Not Configured Yet'
+                        : gatewayStatus.smsGatewayConfigured
+                        ? 'SMS Webhook Active'
+                        : 'SMS Gateway Not Configured Yet'}
+                    </span>
+                  </div>
+
+                  {/* Collapsible Live SMTP / SMS Gateway Configuration */}
+                  {showGatewayConfig && (
+                    <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-700 space-y-3">
+                      <div className="text-xs font-bold text-white">
+                        Configure Live Outbound OTP Delivery Gateway
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Enter your SMTP server credentials (e.g., Gmail address + 16-character Google App Password) or SMS Webhook URL so Simple can dispatch real emails/SMS directly to users.
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={smtpHost}
+                          onChange={(e) => setSmtpHost(e.target.value)}
+                          placeholder="SMTP Host (smtp.gmail.com)"
+                          className="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white"
+                        />
+                        <input
+                          type="text"
+                          value={smtpPort}
+                          onChange={(e) => setSmtpPort(e.target.value)}
+                          placeholder="SMTP Port (465 or 587)"
+                          className="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white"
+                        />
+                        <input
+                          type="email"
+                          value={smtpUser}
+                          onChange={(e) => setSmtpUser(e.target.value)}
+                          placeholder="SMTP Email (you@gmail.com)"
+                          className="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white"
+                        />
+                        <input
+                          type="password"
+                          value={smtpPass}
+                          onChange={(e) => setSmtpPass(e.target.value)}
+                          placeholder="SMTP App Password"
+                          className="rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white"
+                        />
+                        <input
+                          type="url"
+                          value={smsWebhookUrl}
+                          onChange={(e) => setSmsWebhookUrl(e.target.value)}
+                          placeholder="SMS Gateway Webhook URL (optional)"
+                          className="sm:col-span-2 rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleSaveGatewayConfig}
+                        disabled={isSavingGateway}
+                        className="w-full min-h-[38px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs"
+                      >
+                        {isSavingGateway
+                          ? 'Verifying Gateway Connection…'
+                          : 'Save & Verify Live Gateway'}
+                      </button>
+                    </div>
+                  )}
+
+                  {gatewayFeedback && (
+                    <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-200">
+                      {gatewayFeedback}
+                    </div>
+                  )}
+
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <button
+                      type="button"
+                      disabled={isSendingOtp}
+                      onClick={() =>
+                        handleRequestRealOtp(
+                          verifyChannel === 'email_otp' ? 'email' : 'phone'
+                        )
+                      }
+                      className="min-h-[42px] px-4 rounded-xl bg-slate-900 hover:bg-slate-800 border border-emerald-500/40 text-emerald-300 font-bold text-xs flex items-center justify-center gap-1.5"
+                    >
+                      {isSendingOtp ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Dispatching Real OTP…</span>
+                        </>
+                      ) : (
+                        <>
+                          {verifyChannel === 'email_otp' ? (
+                            <Mail className="w-3.5 h-3.5" />
+                          ) : (
+                            <Phone className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            Send Real OTP to{' '}
+                            {verifyChannel === 'email_otp' ? 'Email' : 'Mobile'}
+                          </span>
+                        </>
+                      )}
+                    </button>
+
+                    <div className="flex flex-1 gap-2">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={otpInput}
+                        onChange={(e) =>
+                          setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                        }
+                        placeholder="Enter 6-digit OTP"
+                        className="flex-1 min-w-0 rounded-xl bg-slate-900 border border-slate-700 px-3 py-2 text-center font-mono text-sm tracking-[0.25em] text-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleVerifyCode}
+                        disabled={isVerifyingOtp || otpInput.length !== 6}
+                        className="px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
+                      >
+                        {isVerifyingOtp ? 'Checking…' : 'Verify'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {otpSentMessage && (
+                <div className="p-3 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-xs text-emerald-200 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{otpSentMessage}</span>
+                </div>
+              )}
+
+              {isVerifiedForProceeding && (
+                <div className="p-3.5 rounded-2xl bg-emerald-950/70 border border-emerald-500/50 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-white">
+                        Cryptographic Verification Complete
+                      </div>
+                      <div className="text-[11px] font-mono text-emerald-300">
+                        Verified: {verifiedIdentifier || cleanEmail || fullPhoneDisplay}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setStep(3)}
+                    className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shrink-0"
+                  >
+                    Next Step →
+                  </button>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2">
+                <button
+                  type="button"
+                  onClick={() => setStep(1)}
+                  className="min-h-[40px] px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300"
+                >
+                  ← Back to Credentials
+                </button>
+                <button
+                  type="button"
+                  disabled={!isVerifiedForProceeding}
+                  onClick={() => setStep(3)}
+                  className="min-h-[42px] px-5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs"
+                >
+                  Continue to Privacy Setup →
+                </button>
+              </div>
             </div>
           )}
-        </div>
 
-        {/* Navigation Footer */}
-        <div className="flex items-center justify-between pt-3.5 border-t border-slate-800 shrink-0">
-          <button
-            type="button"
-            onClick={prevStep}
-            disabled={stepIdx === 0}
-            className="min-h-[44px] px-4 py-2 rounded-xl bg-slate-800 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-40 flex items-center gap-1.5"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            Back
-          </button>
+          {/* STEP 3: PRIVACY, PERMISSIONS & FINALIZATION */}
+          {step === 3 && (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2.5">
+                <div className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
+                  Privacy & Contact Discovery
+                </div>
 
-          <button
-            type="button"
-            onClick={nextStep}
-            className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold flex items-center gap-1.5 transition-colors"
-          >
-            {stepIdx === STEPS.length - 1 ? (
-              <>
-                <Check className="w-4 h-4" />
-                Finish Setup
-              </>
-            ) : (
-              <>
-                Continue
-                <ArrowRight className="w-4 h-4" />
-              </>
-            )}
-          </button>
+                <label className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 cursor-pointer">
+                  <div>
+                    <div className="text-xs font-semibold text-white">
+                      Sync Contacts to Find Simple Users
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Matches saved phone numbers via SHA-256 hash so you can message friends on Simple or share the APK on WhatsApp.
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={contactsPermission}
+                    onChange={(e) => setContactsPermission(e.target.checked)}
+                    className="w-4 h-4 accent-emerald-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 cursor-pointer">
+                  <div>
+                    <div className="text-xs font-semibold text-white">
+                      Allow @username Discovery
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Let contacts find you by @{username || 'username'} without needing your phone number.
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={allowUsernameDiscovery}
+                    onChange={(e) => setAllowUsernameDiscovery(e.target.checked)}
+                    className="w-4 h-4 accent-emerald-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 cursor-pointer">
+                  <div>
+                    <div className="text-xs font-semibold text-white">
+                      Hide Phone Number in Public Directory
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Only people who already have your number saved can see it.
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={hidePhoneNumber}
+                    onChange={(e) => setHidePhoneNumber(e.target.checked)}
+                    className="w-4 h-4 accent-emerald-500"
+                  />
+                </label>
+              </div>
+
+              <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-400 space-y-1">
+                <div className="text-emerald-400 font-bold">
+                  ECDH P-256 Device Safety Fingerprint:
+                </div>
+                <div className="break-all text-slate-300">{localFingerprint}</div>
+              </div>
+
+              <div className="flex items-center justify-between gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  className="min-h-[42px] px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300"
+                >
+                  ← Back
+                </button>
+                <button
+                  type="button"
+                  onClick={handleFinish}
+                  className="flex-1 min-h-[46px] rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>
+                    {onboardingMode === 'register'
+                      ? 'Complete Account Setup & Open Chats'
+                      : 'Complete Sign-In & Open Chats'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

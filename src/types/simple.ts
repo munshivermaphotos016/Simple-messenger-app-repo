@@ -303,9 +303,13 @@ export interface UserAccount {
   phone: string;
   normalizedPhone: string;
   email?: string;
-  authMethod?: 'phone_otp' | 'gmail_otp' | 'both';
+  authMethod?: 'phone_otp' | 'gmail_otp' | 'both' | 'google_oauth' | 'totp';
   phoneVerified?: boolean;
   emailVerified?: boolean;
+  passwordHash?: string;
+  twoStepPinHash?: string;
+  totpSecret?: string;
+  verificationToken?: string;
   about: string;
   avatarColor: string;
   avatarUrl?: string;

@@ -1,0 +1,11 @@
+{
+  "usersByUid": {},
+  "uidByPhone": {},
+  "uidByUsername": {},
+  "uidByEmail": {},
+  "messagesByChatId": {},
+  "accountBackupsByUid": {},
+  "accountBackupsByPhoneHash": {},
+  "accountBackupsByEmailHash": {},
+  "updatedAt": 1791650000000
+}

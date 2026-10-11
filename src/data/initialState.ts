@@ -122,6 +122,11 @@ export function deriveUidFromPhone(phone: string): string {
   return hash ? `usr_${hash.slice(0, 16)}` : `usr_${Date.now()}`;
 }
 
+export function deriveUidFromEmail(email: string): string {
+  const hash = computeEmailHash(email);
+  return hash ? `usr_${hash.slice(0, 16)}` : `usr_${Date.now()}`;
+}
+
 export function maskPhoneForFirestore(phone: string): string {
   const norm = normalizePhone(phone);
   if (norm.length <= 2) return '+•• ••• ••••';

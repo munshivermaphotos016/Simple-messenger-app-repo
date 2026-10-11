@@ -2081,17 +2081,23 @@ export default function App() {
               emailHash: finalAccount.email
                 ? finalAccount.email.trim().toLowerCase()
                 : undefined,
+              passwordHash: finalAccount.passwordHash,
+              twoStepPinHash: finalAccount.twoStepPinHash,
+              totpSecret: finalAccount.totpSecret,
+              verificationToken: finalAccount.verificationToken,
               backupJson: fullBackupJson,
             });
 
             setShowOnboarding(false);
             setActiveTab('chats');
           }}
-          onCancel={() => {
-            if (!requiresAccountSetup) {
-              setShowOnboarding(false);
-            }
-          }}
+          onCancel={
+            requiresAccountSetup
+              ? undefined
+              : () => {
+                  setShowOnboarding(false);
+                }
+          }
         />
       </div>
     );
@@ -3368,112 +3374,52 @@ export default function App() {
               </div>
             )}
 
-            {/* Quick Dial Contacts & Incoming Call Alert Preview Bar */}
-            <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-4 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-bold text-emerald-400">
-                  Quick Dial Contacts & Ringtone Alert Preview
-                </span>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      const caller = chats[0] || {
-                        id: 'chat_elena',
-                        name: 'Dr. Elena Rostova',
-                        username: 'elena.sec',
-                        phone: '+41 44 580 12 90',
-                        avatarColor: '#10B981',
-                        isGroup: false,
-                      };
-                      setIncomingCallInvite({
-                        callId: `call_in_${Date.now()}`,
-                        chatId: caller.id,
-                        participantUid: caller.id,
-                        participantName: caller.name,
-                        participantUsername: caller.username,
-                        participantPhone: caller.phone,
-                        avatarColor: caller.avatarColor,
-                        avatarUrl: ensure3DCartoonAvatarUrl(caller.avatarUrl, caller.name),
-                        callType: 'voice' as unknown as 'audio',
-                        direction: 'incoming',
-                        isGroupCall: false,
-                        participants: [caller.name],
-                      });
-                    }}
-                    className="min-h-[34px] px-3 py-1 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 hover:bg-emerald-500/25"
-                  >
-                    <PhoneIncoming className="w-3.5 h-3.5" />
-                    Incoming Voice Ring
-                  </button>
-                  <button
-                    onClick={() => {
-                      const caller = chats[0] || {
-                        id: 'chat_elena',
-                        name: 'Dr. Elena Rostova',
-                        username: 'elena.sec',
-                        phone: '+41 44 580 12 90',
-                        avatarColor: '#10B981',
-                        isGroup: false,
-                      };
-                      setIncomingCallInvite({
-                        callId: `call_in_${Date.now()}`,
-                        chatId: caller.id,
-                        participantUid: caller.id,
-                        participantName: caller.name,
-                        participantUsername: caller.username,
-                        participantPhone: caller.phone,
-                        avatarColor: caller.avatarColor,
-                        avatarUrl: ensure3DCartoonAvatarUrl(caller.avatarUrl, caller.name),
-                        callType: 'video',
-                        direction: 'incoming',
-                        isGroupCall: false,
-                        participants: [caller.name],
-                      });
-                    }}
-                    className="min-h-[34px] px-3 py-1 rounded-xl bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 text-xs font-semibold flex items-center gap-1.5 hover:bg-cyan-500/25"
-                  >
-                    <Video className="w-3.5 h-3.5" />
-                    Incoming Video Ring
-                  </button>
+            {/* Quick Dial Contacts (Only shown when real contacts/chats exist) */}
+            {chats.length > 0 && (
+              <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-emerald-400">
+                    Quick Dial Contacts
+                  </span>
+                </div>
+
+                <div className="grid sm:grid-cols-3 gap-2">
+                  {chats.slice(0, 3).map((c) => (
+                    <div
+                      key={c.id}
+                      className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <UserAvatar
+                          name={c.name}
+                          avatarColor={c.avatarColor}
+                          avatarUrl={c.avatarUrl}
+                          sizeClass="w-8 h-8"
+                          textSizeClass="text-[11px]"
+                        />
+                        <span className="text-xs font-semibold text-white truncate">{c.name}</span>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => handleStartCall(c, 'audio')}
+                          className="w-8 h-8 rounded-lg bg-slate-800 hover:bg-emerald-500 hover:text-slate-950 text-emerald-400 flex items-center justify-center transition-colors"
+                          title={`Voice call ${c.name}`}
+                        >
+                          <Phone className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleStartCall(c, 'video')}
+                          className="w-8 h-8 rounded-lg bg-slate-800 hover:bg-cyan-500 hover:text-slate-950 text-cyan-400 flex items-center justify-center transition-colors"
+                          title={`Video call ${c.name}`}
+                        >
+                          <Video className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-
-              <div className="grid sm:grid-cols-3 gap-2">
-                {chats.slice(0, 3).map((c) => (
-                  <div
-                    key={c.id}
-                    className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <UserAvatar
-                        name={c.name}
-                        avatarColor={c.avatarColor}
-                        avatarUrl={c.avatarUrl}
-                        sizeClass="w-8 h-8"
-                        textSizeClass="text-[11px]"
-                      />
-                      <span className="text-xs font-semibold text-white truncate">{c.name}</span>
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        onClick={() => handleStartCall(c, 'audio')}
-                        className="w-8 h-8 rounded-lg bg-slate-800 hover:bg-emerald-500 hover:text-slate-950 text-emerald-400 flex items-center justify-center transition-colors"
-                        title={`Voice call ${c.name}`}
-                      >
-                        <Phone className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        onClick={() => handleStartCall(c, 'video')}
-                        className="w-8 h-8 rounded-lg bg-slate-800 hover:bg-cyan-500 hover:text-slate-950 text-cyan-400 flex items-center justify-center transition-colors"
-                        title={`Video call ${c.name}`}
-                      >
-                        <Video className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            )}
 
             {settings.lockCallHistory && !isCallLogUnlocked ? (
               <div className="p-8 rounded-2xl bg-slate-900 border border-slate-800 text-center space-y-3 max-w-sm mx-auto">
@@ -5050,41 +4996,6 @@ export default function App() {
                 : null
             )
           }
-        />
-      )}
-
-      {/* 14-Step Privacy-First Onboarding Wizard */}
-      {showOnboarding && (
-        <OnboardingModal
-          account={account}
-          settings={settings}
-          localFingerprint={localFingerprint}
-          onComplete={(updatedAccount, updatedSettings, restoredChats) => {
-            setAccount(updatedAccount);
-            setSettings((prev) => ({ ...prev, ...updatedSettings }));
-            if (restoredChats && Array.isArray(restoredChats) && restoredChats.length > 0) {
-              setChats(restoredChats);
-            }
-            syncUserAccountToDirectory(updatedAccount, localFingerprint);
-
-            // Persist full account & chats backup to cloud database for returning user recovery
-            const fullBackupJson = JSON.stringify({
-              account: updatedAccount,
-              settings: { ...settings, ...updatedSettings },
-              chats: restoredChats && restoredChats.length > 0 ? restoredChats : chats,
-              updatedAt: Date.now(),
-            });
-            saveCloudAccountBackup({
-              uid: updatedAccount.id,
-              username: updatedAccount.username,
-              phoneHash: normalizePhone(updatedAccount.phone),
-              emailHash: updatedAccount.email ? updatedAccount.email.trim().toLowerCase() : undefined,
-              backupJson: fullBackupJson,
-            });
-
-            setShowOnboarding(false);
-          }}
-          onCancel={() => setShowOnboarding(false)}
         />
       )}
 

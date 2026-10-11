@@ -13,7 +13,6 @@ export function isAndroidApkEnvironment(): boolean {
   if (proto === 'file:' || proto === 'capacitor:' || proto === 'app:') {
     return true;
   }
-  // Capacitor Android WebView default origin is https://localhost (with no port)
   if (proto === 'https:' && host === 'localhost' && !port) {
     return true;
   }
@@ -42,45 +41,61 @@ function normalizePhoneDigits(phone: string): string {
   return phone.replace(/[^0-9]/g, '');
 }
 
-function normalizeTargetForOtp(channel: 'phone' | 'email', target: string): string {
-  if (channel === 'email') {
-    return target.trim().toLowerCase();
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function generateBase32Secret(length = 20): string {
+  const bytes = new Uint8Array(length);
+  window.crypto.getRandomValues(bytes);
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += BASE32_ALPHABET[bytes[i] % 32];
   }
-  return normalizePhoneDigits(target);
+  return out;
 }
 
-interface LocalOtpRecord {
-  channel: 'phone' | 'email';
-  normalizedTarget: string;
-  displayTarget: string;
-  code: string;
-  expiresAt: number;
-  createdAt: number;
-  attempts: number;
-}
-
-function getLocalOtpStore(): Record<string, LocalOtpRecord> {
-  try {
-    const raw = localStorage.getItem('simple_apk_otp_store_v1');
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
+function base32ToBytes(base32: string): Uint8Array {
+  const cleaned = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = '';
+  for (let i = 0; i < cleaned.length; i++) {
+    const val = BASE32_ALPHABET.indexOf(cleaned[i]);
+    if (val >= 0) bits += val.toString(2).padStart(5, '0');
   }
-}
-
-function saveLocalOtpStore(store: Record<string, LocalOtpRecord>): void {
-  try {
-    localStorage.setItem('simple_apk_otp_store_v1', JSON.stringify(store));
-  } catch {
-    // Ignore storage quota errors
+  const bytes = new Uint8Array(Math.floor(bits.length / 8));
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
   }
+  return bytes;
 }
 
-function generateSecureSixDigitOtp(): string {
-  const array = new Uint32Array(1);
-  window.crypto.getRandomValues(array);
-  const num = 100000 + (array[0] % 900000);
-  return String(num);
+async function verifyTotpWebCrypto(secret: string, code: string): Promise<boolean> {
+  const cleanCode = code.trim();
+  if (!/^\d{6}$/.test(cleanCode) || !secret) return false;
+  const keyBytes = base32ToBytes(secret);
+  const cryptoKey = await window.crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const currentStep = Math.floor(Date.now() / 1000 / 30);
+  for (let w = -1; w <= 1; w++) {
+    const counter = currentStep + w;
+    const buf = new ArrayBuffer(8);
+    const view = new DataView(buf);
+    view.setUint32(0, Math.floor(counter / 0x100000000), false);
+    view.setUint32(4, counter >>> 0, false);
+    const sig = new Uint8Array(await window.crypto.subtle.sign('HMAC', cryptoKey, buf));
+    const offset = sig[sig.length - 1] & 0x0f;
+    const binary =
+      ((sig[offset] & 0x7f) << 24) |
+      ((sig[offset + 1] & 0xff) << 16) |
+      ((sig[offset + 2] & 0xff) << 8) |
+      (sig[offset + 3] & 0xff);
+    const otp = String(binary % 1000000).padStart(6, '0');
+    if (otp === cleanCode) return true;
+  }
+  return false;
 }
 
 async function handleLocalApiFallback(
@@ -104,121 +119,99 @@ async function handleLocalApiFallback(
     });
   }
 
-  if (pathName === '/api/auth/request-otp' && method === 'POST') {
-    const channel: 'phone' | 'email' = bodyObj.channel === 'email' ? 'email' : 'phone';
-    const rawTarget = String(bodyObj.target || '').trim();
-    const normTarget = normalizeTargetForOtp(channel, rawTarget);
-
-    if (channel === 'phone' && normTarget.length < 7) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: 'Please enter a valid mobile phone number (at least 7 digits) to receive an SMS OTP.',
-        },
-        400
-      );
-    }
-
-    if (channel === 'email' && (!normTarget.includes('@') || !normTarget.includes('.'))) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: 'Please enter a valid email address (e.g., name@domain.com) to receive an Email OTP.',
-        },
-        400
-      );
-    }
-
-    const challengeKey = `${channel}:${normTarget}`;
-    const store = getLocalOtpStore();
-    const otpCode = generateSecureSixDigitOtp();
-    const expiresAt = Date.now() + 5 * 60 * 1000;
-
-    store[challengeKey] = {
-      channel,
-      normalizedTarget: normTarget,
-      displayTarget: rawTarget,
-      code: otpCode,
-      expiresAt,
-      createdAt: Date.now(),
-      attempts: 0,
-    };
-    saveLocalOtpStore(store);
-
+  if (pathName === '/api/auth/gateway-status' && method === 'GET') {
     return jsonResponse({
       ok: true,
-      channel,
-      target: rawTarget,
-      normalizedTarget: normTarget,
-      expiresAt,
-      expiresInSec: 300,
-      sandboxDispatchedOtp: otpCode,
-      message:
-        channel === 'phone'
-          ? `6-digit SMS verification code sent to ${rawTarget}`
-          : `6-digit Email verification code sent to ${rawTarget}`,
+      smtpConfigured: false,
+      smtpUserMasked: null,
+      smsGatewayConfigured: false,
+      totpSupported: true,
+      googleOAuthSupported: true,
     });
   }
 
-  if (pathName === '/api/auth/verify-otp' && method === 'POST') {
-    const channel: 'phone' | 'email' = bodyObj.channel === 'email' ? 'email' : 'phone';
-    const rawTarget = String(bodyObj.target || '').trim();
-    const code = String(bodyObj.code || '').trim();
-    const normTarget = normalizeTargetForOtp(channel, rawTarget);
-    const challengeKey = `${channel}:${normTarget}`;
-
-    const store = getLocalOtpStore();
-    const record = store[challengeKey];
-    if (!record) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: `No active OTP request found for ${rawTarget}. Please tap "Send OTP" first.`,
-        },
-        400
-      );
-    }
-
-    if (Date.now() > record.expiresAt) {
-      delete store[challengeKey];
-      saveLocalOtpStore(store);
-      return jsonResponse(
-        {
-          ok: false,
-          error: 'This OTP code has expired (5-minute limit). Please request a new OTP.',
-        },
-        400
-      );
-    }
-
-    record.attempts += 1;
-    if (record.code !== code) {
-      saveLocalOtpStore(store);
-      const remaining = Math.max(0, 5 - record.attempts);
-      return jsonResponse(
-        {
-          ok: false,
-          error: `Invalid 6-digit OTP code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`,
-        },
-        400
-      );
-    }
-
-    delete store[challengeKey];
-    saveLocalOtpStore(store);
-
+  if (pathName === '/api/auth/setup-totp' && method === 'POST') {
+    const label = String(bodyObj.accountLabel || 'SimpleUser').replace(/[^a-zA-Z0-9@._+-]/g, '');
+    const secret = generateBase32Secret(20);
+    const otpauthUri = `otpauth://totp/SimpleMessenger:${encodeURIComponent(label)}?secret=${secret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
     return jsonResponse({
       ok: true,
-      channel,
-      normalizedTarget: normTarget,
-      verificationToken: `vtok_android_${Date.now()}`,
-      verifiedAt: Date.now(),
+      secret,
+      issuer: 'SimpleMessenger',
+      accountLabel: label,
+      otpauthUri,
     });
+  }
+
+  if (pathName === '/api/account/check' && method === 'POST') {
+    const phoneDigits = normalizePhoneDigits(String(bodyObj.phone || ''));
+    const cleanEmail = String(bodyObj.email || '').trim().toLowerCase();
+    const localAccRaw = localStorage.getItem('simple_account_v3');
+    if (localAccRaw) {
+      try {
+        const acc = JSON.parse(localAccRaw);
+        if (
+          acc &&
+          acc.id &&
+          ((phoneDigits && normalizePhoneDigits(acc.phone || '') === phoneDigits) ||
+            (cleanEmail && String(acc.email || '').toLowerCase() === cleanEmail))
+        ) {
+          return jsonResponse({
+            ok: true,
+            exists: true,
+            matchedBy: phoneDigits ? 'phone' : 'email',
+            accountSummary: {
+              uid: acc.id,
+              username: acc.username,
+              name: acc.name,
+              hasPassword: Boolean(acc.passwordHash),
+              hasTwoStepPin: Boolean(acc.twoStepPinHash),
+              hasTotp: Boolean(acc.totpSecret),
+            },
+          });
+        }
+      } catch {
+        // Ignore parse error
+      }
+    }
+    return jsonResponse({ ok: true, exists: false });
+  }
+
+  if (pathName === '/api/auth/request-otp' && method === 'POST') {
+    return jsonResponse(
+      {
+        ok: false,
+        requiresGatewaySetup: true,
+        error:
+          'Cloud OTP Gateway is currently unreachable or not configured. Please verify using Authenticator App (RFC 6238 TOTP) or connect to the internet.',
+      },
+      503
+    );
+  }
+
+  if (pathName === '/api/auth/verify-otp' && method === 'POST') {
+    const code = String(bodyObj.code || '').trim();
+    const clientTotpSecret = String(bodyObj.totpSecret || '').trim();
+    if (clientTotpSecret && (await verifyTotpWebCrypto(clientTotpSecret, code))) {
+      return jsonResponse({
+        ok: true,
+        verifiedMethod: 'totp_authenticator',
+        verificationToken: `vtok_totp_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        verifiedAt: Date.now(),
+      });
+    }
+    return jsonResponse(
+      {
+        ok: false,
+        error: 'Invalid 6-digit Authenticator TOTP code. Please check your Authenticator app and try again.',
+      },
+      400
+    );
   }
 
   if (pathName === '/api/directory' && method === 'GET') {
     try {
-      const saved = localStorage.getItem('simple_directory_v2');
+      const saved = localStorage.getItem('simple_directory_v3');
       const users = saved ? JSON.parse(saved) : [];
       return jsonResponse({ users });
     } catch {
@@ -234,7 +227,7 @@ async function handleLocalApiFallback(
     const q = (searchParams.get('q') || '').trim().toLowerCase().replace(/^@/, '');
     const qDigits = normalizePhoneDigits(q);
     try {
-      const saved = localStorage.getItem('simple_directory_v2');
+      const saved = localStorage.getItem('simple_directory_v3');
       const users: Array<Record<string, unknown>> = saved ? JSON.parse(saved) : [];
       const matches = users.filter((u) => {
         const uName = String(u.username || '').toLowerCase();
@@ -251,38 +244,6 @@ async function handleLocalApiFallback(
     }
   }
 
-  if (pathName === '/api/backup' && method === 'POST') {
-    const blob = {
-      id: `bkp_${Date.now()}`,
-      createdAt: Date.now(),
-      sizeBytes: String(bodyObj.ciphertextBase64 || '').length,
-      includeMedia: Boolean(bodyObj.includeMedia),
-      saltHex: String(bodyObj.saltHex || ''),
-      ivHex: String(bodyObj.ivHex || ''),
-      ciphertextBase64: String(bodyObj.ciphertextBase64 || ''),
-    };
-    try {
-      localStorage.setItem(`simple_e2ee_bkp_${bodyObj.userId}`, JSON.stringify(blob));
-    } catch {
-      // Ignore quota error
-    }
-    return jsonResponse({
-      ok: true,
-      id: blob.id,
-      createdAt: blob.createdAt,
-      sizeBytes: blob.sizeBytes,
-    });
-  }
-
-  if (pathName.startsWith('/api/backup/') && method === 'GET') {
-    const userId = pathName.replace('/api/backup/', '');
-    const raw = localStorage.getItem(`simple_e2ee_bkp_${userId}`);
-    if (!raw) {
-      return jsonResponse({ error: 'No encrypted backup found for user' }, 404);
-    }
-    return jsonResponse(JSON.parse(raw));
-  }
-
   if (pathName === '/api/account/backup' && method === 'POST') {
     try {
       const uid = String(bodyObj.uid || '');
@@ -293,6 +254,8 @@ async function handleLocalApiFallback(
         username: String(bodyObj.username || 'user'),
         phoneHash,
         emailHash,
+        passwordHash: bodyObj.passwordHash ? String(bodyObj.passwordHash) : undefined,
+        twoStepPinHash: bodyObj.twoStepPinHash ? String(bodyObj.twoStepPinHash) : undefined,
         backupJson: String(bodyObj.backupJson || ''),
         updatedAt: Date.now(),
       };
@@ -305,16 +268,33 @@ async function handleLocalApiFallback(
     }
   }
 
-  if (pathName === '/api/account/recover' && method === 'GET') {
-    const uid = searchParams.get('uid') || '';
-    const phoneHash = searchParams.get('phoneHash') || '';
-    const emailHash = searchParams.get('emailHash') || '';
+  if (pathName === '/api/account/recover' && method === 'POST') {
+    const uid = String(bodyObj.uid || '');
+    const phoneHash = String(bodyObj.phoneHash || '');
+    const emailHash = String(bodyObj.emailHash || '');
+    const passwordHash = String(bodyObj.passwordHash || '');
+    const twoStepPinHash = String(bodyObj.twoStepPinHash || '');
+    const verificationToken = String(bodyObj.verificationToken || '');
+
+    if (!passwordHash && !twoStepPinHash && !verificationToken) {
+      return jsonResponse(
+        { ok: false, error: 'Authentication required to recover account backup.' },
+        401
+      );
+    }
+
     const raw =
       (uid && localStorage.getItem(`simple_acc_bkp_${uid}`)) ||
       (phoneHash && localStorage.getItem(`simple_acc_bkp_ph_${phoneHash}`)) ||
       (emailHash && localStorage.getItem(`simple_acc_bkp_em_${emailHash}`));
     if (raw) {
       const matched = JSON.parse(raw);
+      if (matched.passwordHash && passwordHash && matched.passwordHash !== passwordHash) {
+        return jsonResponse({ ok: false, error: 'Incorrect account password.' }, 401);
+      }
+      if (matched.twoStepPinHash && twoStepPinHash && matched.twoStepPinHash !== twoStepPinHash) {
+        return jsonResponse({ ok: false, error: 'Incorrect 6-digit Two-Step PIN.' }, 401);
+      }
       return jsonResponse({
         ok: true,
         uid: matched.uid,
@@ -371,19 +351,17 @@ export async function apiFetch(
     }
   }
 
-  // When running inside a native Android APK (file:// or Capacitor localhost),
-  // try the cloud backend first with a short timeout, then fall back to the local on-device handler.
   if (isAndroidApkEnvironment()) {
     try {
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 3500);
+      const timer = window.setTimeout(() => controller.abort(), 5000);
       const cloudUrl = `${CLOUD_BACKEND_ORIGIN}${parsedUrl.pathname}${parsedUrl.search}`;
       const res = await nativeFetch(cloudUrl, {
         ...init,
         signal: controller.signal,
       });
       window.clearTimeout(timer);
-      if (res.ok || res.status === 400 || res.status === 429) {
+      if (res.status >= 200 && res.status < 600) {
         return res;
       }
     } catch {
@@ -392,10 +370,9 @@ export async function apiFetch(
     return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
   }
 
-  // When running in browser/web mode, call nativeFetch first, and fall back to local on-device handler if offline
   try {
     const res = await nativeFetch(input, init);
-    if (res.ok || res.status === 400 || res.status === 404 || res.status === 429) {
+    if (res.status >= 200 && res.status < 600) {
       return res;
     }
     return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
@@ -410,7 +387,6 @@ export function installAndroidApkNetworkBridge(): void {
   if (typeof window === 'undefined' || bridgeInstalled) return;
   bridgeInstalled = true;
 
-  // Only attempt to override window.fetch inside native Android APK file:// runtime if writable
   if (isAndroidApkEnvironment()) {
     try {
       const desc = Object.getOwnPropertyDescriptor(window, 'fetch');
@@ -422,7 +398,7 @@ export function installAndroidApkNetworkBridge(): void {
         });
       }
     } catch {
-      // Safe fallback: apiFetch is already called directly across all /api/* requests
+      // Safe fallback
     }
   }
 }
