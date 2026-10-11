@@ -3,6 +3,9 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithPhoneNumber,
+  RecaptchaVerifier,
+  ConfirmationResult,
   onAuthStateChanged,
   User,
 } from 'firebase/auth';
@@ -20,7 +23,11 @@ import {
   limit,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import { apiFetch } from './utils/androidBridge';
+import {
+  apiFetch,
+  createVerificationToken,
+  verifyTotpCodeSync,
+} from './utils/androidBridge';
 import {
   computeEmailHash,
   computePhoneHash,
@@ -376,17 +383,41 @@ export async function checkAccountInDatabase(params: {
   }
 
   for (const item of firestoreKeys) {
-    const snap = await withTimeout(getDoc(doc(db, 'account_backups', item.key)), 3000, null);
+    const snap =
+      (await withTimeout(getDocFromServer(doc(db, 'account_backups', item.key)), 2500, null)) ||
+      (await withTimeout(getDoc(doc(db, 'account_backups', item.key)), 2500, null));
     if (snap && snap.exists()) {
       const data = snap.data();
       if (data && typeof data.backupJson === 'string') {
         try {
           const parsed = JSON.parse(data.backupJson);
           const acct = parsed.account || parsed;
+          const isCompleted =
+            parsed.totpVerified === true ||
+            parsed.onboardingCompleted === true ||
+            acct?.onboardingCompleted === true;
           const storedPwdHash = parsed.passwordHash || acct?.passwordHash || '';
           const storedPinHash = parsed.twoStepPinHash || acct?.twoStepPinHash || '';
           const storedTotpSecret = parsed.totpSecret || acct?.totpSecret || '';
           const foundUsername = data.username || acct?.username || 'user';
+
+          // If this is an unverified pending registration by the SAME user with matching passwordHash, allow resuming registration
+          if (
+            params.mode === 'register' &&
+            !isCompleted &&
+            params.passwordHash &&
+            storedPwdHash === params.passwordHash
+          ) {
+            return {
+              ok: true,
+              exists: false,
+              totpSecret: storedTotpSecret || undefined,
+              matchedBy: null,
+              username: foundUsername,
+              accountSummary: null,
+            };
+          }
+
           return {
             ok: true,
             exists: true,
@@ -395,7 +426,8 @@ export async function checkAccountInDatabase(params: {
             hasPassword: Boolean(storedPwdHash),
             hasTwoStepPin: Boolean(storedPinHash),
             hasTotp: Boolean(storedTotpSecret),
-            totpSecret: storedTotpSecret || undefined,
+            // Never expose totpSecret on login checks
+            totpSecret: params.mode === 'register' ? storedTotpSecret || undefined : undefined,
             passwordHash: storedPwdHash || undefined,
             twoStepPinHash: storedPinHash || undefined,
             accountSummary: {
@@ -718,9 +750,250 @@ export async function recoverCloudAccountBackup(params: {
   return null;
 }
 
+/**
+ * Stores a pending Google Authenticator (RFC 6238 TOTP) challenge in Firebase Firestore (`account_backups`)
+ * during Step 1 -> Step 2 of new account registration so that Step 2 verifies the user's 6-digit code
+ * directly against our Firebase Firestore database.
+ */
+export async function createPendingFirestoreAuthenticatorChallenge(params: {
+  uid: string;
+  username: string;
+  name: string;
+  phone?: string;
+  email?: string;
+  passwordHash: string;
+  totpSecret: string;
+}): Promise<void> {
+  const safeUid = (params.uid || `usr_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+  const resolvedPhoneHash = ensureSha256PhoneHash(params.phone);
+  const resolvedEmailHash = ensureSha256EmailHash(params.email);
+
+  const challengeJson = JSON.stringify({
+    version: '5.0.0',
+    totpVerified: false,
+    onboardingCompleted: false,
+    passwordHash: params.passwordHash,
+    totpSecret: params.totpSecret,
+    createdAt: Date.now(),
+    account: {
+      id: safeUid,
+      name: params.name,
+      username: params.username,
+      phone: params.phone || '',
+      normalizedPhone: normalizePhone(params.phone || ''),
+      email: (params.email || '').trim().toLowerCase(),
+      passwordHash: params.passwordHash,
+      totpSecret: params.totpSecret,
+      onboardingCompleted: false,
+    },
+  });
+
+  const firestorePayload: Record<string, any> = {
+    uid: safeUid,
+    username: (params.username || 'user').slice(0, 40),
+    backupJson: challengeJson,
+    updatedAt: Date.now(),
+  };
+  if (resolvedPhoneHash) firestorePayload.phoneHash = resolvedPhoneHash.slice(0, 64);
+  if (resolvedEmailHash) firestorePayload.emailHash = resolvedEmailHash.slice(0, 64);
+
+  // Mirror locally as well
+  try {
+    const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
+    const backups = rawBackups ? JSON.parse(rawBackups) : {};
+    backups[safeUid] = firestorePayload;
+    if (resolvedPhoneHash) backups[`ph_${resolvedPhoneHash.slice(0, 48)}`] = firestorePayload;
+    if (resolvedEmailHash) backups[`em_${resolvedEmailHash.slice(0, 48)}`] = firestorePayload;
+    window.localStorage.setItem('simple_cloud_backups_mirror_v1', JSON.stringify(backups));
+  } catch {
+    // Ignore storage quota
+  }
+
+  try {
+    await withTimeout(setDoc(doc(db, 'account_backups', safeUid), firestorePayload), 3500, undefined);
+    if (resolvedPhoneHash && resolvedPhoneHash.length >= 16) {
+      await withTimeout(
+        setDoc(doc(db, 'account_backups', `ph_${resolvedPhoneHash.slice(0, 48)}`), firestorePayload),
+        3500,
+        undefined
+      );
+    }
+    if (resolvedEmailHash && resolvedEmailHash.length >= 16) {
+      await withTimeout(
+        setDoc(doc(db, 'account_backups', `em_${resolvedEmailHash.slice(0, 48)}`), firestorePayload),
+        3500,
+        undefined
+      );
+    }
+  } catch {
+    // Offline fallback handled
+  }
+}
+
+/**
+ * Verifies a 6-digit Google Authenticator (RFC 6238 TOTP) code directly against the `totpSecret`
+ * and `passwordHash` stored in our Firebase Firestore database (`account_backups`).
+ */
+export async function verifyFirestoreAuthenticatorChallenge(params: {
+  uid?: string;
+  phone?: string;
+  email?: string;
+  passwordHash: string;
+  code: string;
+  mode: 'register' | 'login';
+  expectedTotpSecret?: string;
+}): Promise<{
+  ok: boolean;
+  verificationToken?: string;
+  totpSecret?: string;
+  recoveredBundle?: RecoveredAccountBundle | null;
+  error?: string;
+}> {
+  const cleanCode = (params.code || '').trim();
+  if (!/^\d{6}$/.test(cleanCode)) {
+    return { ok: false, error: 'Please enter a valid 6-digit code from Google Authenticator.' };
+  }
+
+  const rawPhone = normalizePhone(params.phone || '');
+  const rawEmail = (params.email || '').trim().toLowerCase();
+  const shaPhoneHash = ensureSha256PhoneHash(rawPhone);
+  const shaEmailHash = ensureSha256EmailHash(rawEmail);
+
+  const candidateKeys: string[] = [];
+  if (params.uid) {
+    candidateKeys.push(params.uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
+  }
+  if (shaPhoneHash.length >= 16) {
+    candidateKeys.push(`ph_${shaPhoneHash.slice(0, 48)}`);
+    if (rawPhone.length >= 7) candidateKeys.push(deriveUidFromPhone(rawPhone));
+  }
+  if (shaEmailHash.length >= 16) {
+    candidateKeys.push(`em_${shaEmailHash.slice(0, 48)}`);
+    if (rawEmail.includes('@')) candidateKeys.push(deriveUidFromEmail(rawEmail));
+  }
+
+  let dbRecordData: Record<string, any> | null = null;
+  let matchedKey = '';
+
+  // 1. Fetch challenge/account record from Firebase Firestore server
+  for (const key of candidateKeys) {
+    const snap =
+      (await withTimeout(getDocFromServer(doc(db, 'account_backups', key)), 2800, null)) ||
+      (await withTimeout(getDoc(doc(db, 'account_backups', key)), 2800, null));
+    if (snap && snap.exists()) {
+      const data = snap.data();
+      if (data && typeof data.backupJson === 'string') {
+        dbRecordData = data;
+        matchedKey = key;
+        break;
+      }
+    }
+  }
+
+  // 2. Fallback to local mirror if offline
+  if (!dbRecordData) {
+    try {
+      const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
+      if (rawBackups) {
+        const backups = JSON.parse(rawBackups);
+        for (const key of candidateKeys) {
+          if (backups[key] && typeof backups[key].backupJson === 'string') {
+            dbRecordData = backups[key];
+            matchedKey = key;
+            break;
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  if (!dbRecordData && params.mode === 'login') {
+    return {
+      ok: false,
+      error: 'No registered account found in the Firebase database for this phone number or email.',
+    };
+  }
+
+  let storedPwdHash = '';
+  let storedTotpSecret = '';
+  let parsedBackup: any = null;
+
+  if (dbRecordData && typeof dbRecordData.backupJson === 'string') {
+    try {
+      parsedBackup = JSON.parse(dbRecordData.backupJson);
+      const acct = parsedBackup.account || parsedBackup;
+      storedPwdHash = parsedBackup.passwordHash || acct?.passwordHash || '';
+      storedTotpSecret = parsedBackup.totpSecret || acct?.totpSecret || '';
+    } catch {
+      parsedBackup = null;
+    }
+  }
+
+  // Verify passwordHash matches the Firebase database record
+  if (storedPwdHash && params.passwordHash && storedPwdHash !== params.passwordHash) {
+    return {
+      ok: false,
+      error: 'Incorrect Account Password. Your password did not match the account in the Firebase database.',
+    };
+  }
+
+  const secretToVerify = storedTotpSecret || params.expectedTotpSecret || '';
+  if (!secretToVerify) {
+    return {
+      ok: false,
+      error: 'No Google Authenticator secret is linked to this account in the Firebase database.',
+    };
+  }
+
+  // Cryptographically verify the 6-digit RFC 6238 TOTP code against the Firebase database secret
+  if (!verifyTotpCodeSync(secretToVerify, cleanCode)) {
+    return {
+      ok: false,
+      error:
+        'Invalid 6-digit Google Authenticator code. Please open your Google Authenticator app and enter the current 6-digit code for SimpleMessenger.',
+    };
+  }
+
+  // Mark totpVerified = true in Firebase Firestore
+  const vToken = createVerificationToken(rawPhone || rawEmail || matchedKey || 'verified');
+  if (dbRecordData && parsedBackup) {
+    try {
+      parsedBackup.totpVerified = true;
+      parsedBackup.lastVerifiedAt = Date.now();
+      const updatedPayload = {
+        ...dbRecordData,
+        backupJson: JSON.stringify(parsedBackup),
+        updatedAt: Date.now(),
+      };
+      if (matchedKey) {
+        await withTimeout(setDoc(doc(db, 'account_backups', matchedKey), updatedPayload), 3000, undefined);
+      }
+    } catch {
+      // Ignore offline write error
+    }
+  }
+
+  return {
+    ok: true,
+    verificationToken: vToken,
+    totpSecret: secretToVerify,
+    recoveredBundle:
+      parsedBackup && params.mode === 'login'
+        ? {
+            backupJson: JSON.stringify(parsedBackup),
+            account: parsedBackup.account || parsedBackup,
+            chats: Array.isArray(parsedBackup.chats) ? parsedBackup.chats : undefined,
+          }
+        : null,
+  };
+}
+
 export {
   doc,
   getDoc,
+  getDocFromServer,
   setDoc,
   collection,
   getDocs,
@@ -728,4 +1001,7 @@ export {
   query,
   limit,
   signInWithPopup,
+  signInWithPhoneNumber,
+  RecaptchaVerifier,
 };
+export type { ConfirmationResult };

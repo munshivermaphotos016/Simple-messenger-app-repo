@@ -510,21 +510,23 @@ async function startServer() {
   });
 
   const sendApkFile = (_req: express.Request, res: express.Response) => {
-    const versionedPath = path.join(process.cwd(), 'Simple-Android-v4.0.0.apk');
+    const versionedPath = path.join(process.cwd(), 'Simple-Android-v5.0.0.apk');
     const fallbackPath = path.join(process.cwd(), 'Simple-Android.apk');
     const apkPath = fs.existsSync(versionedPath) ? versionedPath : fallbackPath;
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v4.0.0.apk"');
+    res.setHeader('Content-Disposition', 'attachment; filename="Simple-Android-v5.0.0.apk"');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.sendFile(apkPath);
   };
 
+  app.get('/Simple-Android-v5.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v4.0.0.apk', sendApkFile);
   app.get('/Simple-Android-v3.0.0.apk', sendApkFile);
   app.get('/Simple-Android.apk', sendApkFile);
   app.get('/Simple-Messenger.apk', sendApkFile);
+  app.get('/releases/Simple-v5.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v4.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v3.0.0.apk', sendApkFile);
   app.get('/releases/Simple-v1.0.0.apk', sendApkFile);

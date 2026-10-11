@@ -33,7 +33,7 @@ jobs:
       - name: Read Version from package.json
         id: pkg
         run: |
-          VERSION=$(node -p "require('./package.json').version || '4.0.0'")
+          VERSION=$(node -p "require('./package.json').version || '5.0.0'")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building Simple-Android-v${VERSION}.apk"
 

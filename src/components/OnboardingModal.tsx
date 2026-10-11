@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Check,
   CheckCircle2,
@@ -35,18 +35,22 @@ import {
   createVerificationToken,
   generateBase32Secret,
   isAndroidApkEnvironment,
-  verifyTotpCodeSync,
 } from '../utils/androidBridge';
 import {
   auth,
   checkAccountInDatabase,
+  ConfirmationResult,
+  createPendingFirestoreAuthenticatorChallenge,
   db,
   doc,
   googleProvider,
+  RecaptchaVerifier,
   recoverCloudAccountBackup,
   saveCloudAccountBackup,
   setDoc,
+  signInWithPhoneNumber,
   signInWithPopup,
+  verifyFirestoreAuthenticatorChallenge,
 } from '../firebase';
 
 interface OnboardingModalProps {
@@ -60,8 +64,6 @@ interface OnboardingModalProps {
   ) => void;
   onCancel?: () => void;
 }
-
-const AVATAR_COLORS = ['#10B981', '#06B6D4', '#6366F1', '#F59E0B', '#EC4899', '#8B5CF6'];
 
 const COUNTRY_CODES = [
   { code: '+91', label: '🇮🇳 +91 (India)', digits: 10 },
@@ -98,9 +100,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     return 'phone';
   });
 
+  // Primary Verification Channel is Google Authenticator (RFC 6238 TOTP backed by Firebase Firestore)
   const [verifyChannel, setVerifyChannel] = useState<
-    'pin_verify' | 'totp' | 'google_oauth' | 'email_otp' | 'phone_otp'
-  >('pin_verify');
+    'totp' | 'phone_otp' | 'email_otp' | 'google_oauth'
+  >('totp');
 
   // Step 1: Identity & Credentials
   const [name, setName] = useState(account.name || '');
@@ -119,7 +122,6 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const [email, setEmail] = useState(account.email || '');
   const [accountPassword, setAccountPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [twoStepPin, setTwoStepPin] = useState('');
   const [about, setAbout] = useState(
     account.about || 'Hey there! I am using Simple Messenger.'
   );
@@ -128,24 +130,28 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     account.avatarUrl || PRESET_PROFILE_PHOTOS[0].url
   );
 
-  // Verification State (Zero dummy OTPs!)
+  // Verification State (Zero dummy OTPs, zero 2-step PIN loophole)
   const [otpInput, setOtpInput] = useState('');
   const [isSendingOtp, setIsSendingOtp] = useState(false);
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
   const [isSavingAccount, setIsSavingAccount] = useState(false);
   const [otpSentMessage, setOtpSentMessage] = useState<string | null>(null);
-  const [verificationToken, setVerificationToken] = useState<string>(
-    account.verificationToken || ''
-  );
+  const [verificationToken, setVerificationToken] = useState<string>('');
   const [phoneVerified, setPhoneVerified] = useState<boolean>(false);
   const [emailVerified, setEmailVerified] = useState<boolean>(false);
   const [verifiedIdentifier, setVerifiedIdentifier] = useState<string>('');
 
-  // TOTP Authenticator State (RFC 6238)
-  const [totpSecret, setTotpSecret] = useState<string>(account.totpSecret || '');
+  // Google Authenticator TOTP State (RFC 6238 + Firebase Firestore Database)
+  const [totpSecret, setTotpSecret] = useState<string>('');
   const [totpUri, setTotpUri] = useState<string>('');
   const [isGeneratingTotp, setIsGeneratingTotp] = useState(false);
   const [copiedTotpSecret, setCopiedTotpSecret] = useState(false);
+
+  // Real Firebase Phone Auth Confirmation Result
+  const [firebaseSmsConfirmation, setFirebaseSmsConfirmation] =
+    useState<ConfirmationResult | null>(null);
+  const recaptchaContainerRef = useRef<HTMLDivElement | null>(null);
+  const recaptchaVerifierRef = useRef<RecaptchaVerifier | null>(null);
 
   // Live SMTP / SMS Gateway Configuration State
   const [showGatewayConfig, setShowGatewayConfig] = useState(false);
@@ -201,6 +207,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const fullPhoneDisplay = localDigitsOnly
     ? `${countryCode} ${localPhoneNumber.trim()}`
     : '';
+  const e164Phone = localDigitsOnly ? `${countryCode}${localDigitsOnly}` : '';
   const normalizedPhoneDigits = normalizePhone(fullPhoneDisplay);
   const rawPhoneValid =
     localDigitsOnly.length >= Math.max(7, selectedCountry.digits - 2) &&
@@ -263,7 +270,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           smsGatewayConfigured: Boolean(data.smsGatewayConfigured),
         });
         setGatewayFeedback(
-          'Live SMTP / SMS Gateway verified and active! You can now send real OTP codes.'
+          'Live SMTP / SMS Gateway verified and active! You can now dispatch real OTP codes.'
         );
         setShowGatewayConfig(false);
       }
@@ -274,10 +281,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
   };
 
-  // Validate Step 1 before advancing to Step 2 Verification
+  // Validate Step 1 and Store/Check Challenge in Firebase Firestore Database
   const handleProceedToVerification = async () => {
     setErrorBanner(null);
     setOtpSentMessage(null);
+    setVerificationToken('');
+    setPhoneVerified(false);
+    setEmailVerified(false);
 
     if (identityMode === 'phone' && !rawPhoneValid) {
       setErrorBanner('Please enter a valid mobile phone number to continue.');
@@ -289,7 +299,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
     if (identityMode === 'both' && (!rawPhoneValid || !rawEmailValid)) {
       setErrorBanner(
-        'Please enter both a valid mobile phone number and a valid Gmail/email address (or switch to "Phone Only" / "Gmail Only" above).'
+        'Please enter both a valid mobile phone number and a valid Gmail/email address (or select "Phone Only" / "Gmail Only" above).'
       );
       return;
     }
@@ -309,44 +319,35 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         setErrorBanner('Account Password and Confirm Password do not match.');
         return;
       }
-      if (!/^\d{6}$/.test(twoStepPin)) {
-        setErrorBanner(
-          'Please set a 6-digit Two-Step Verification PIN (just like WhatsApp Two-Step Verification).'
-        );
-        return;
-      }
     } else {
-      // Login mode requires password or 2-step PIN
-      if (!accountPassword && !/^\d{6}$/.test(twoStepPin)) {
-        setErrorBanner(
-          'Please enter your Account Password or 6-digit Two-Step Verification PIN to sign in.'
-        );
+      if (!accountPassword || accountPassword.length < 6) {
+        setErrorBanner('Please enter your Account Password to sign in.');
         return;
       }
     }
 
     setIsSendingOtp(true);
     try {
-      const pwdHash = accountPassword ? sha256HexSync(accountPassword.trim()) : undefined;
-      const pinHash = /^\d{6}$/.test(twoStepPin) ? sha256HexSync(twoStepPin.trim()) : undefined;
+      const pwdHash = sha256HexSync(accountPassword.trim());
 
-      // Check account existence in Firebase Firestore, Local Mirror, and Server
+      // 1. Check account existence and credentials in Firebase Firestore Database
       const checkData = await checkAccountInDatabase({
         phone: isPhoneValid ? normalizedPhoneDigits : undefined,
         email: isEmailValid ? cleanEmail : undefined,
         username: username.trim().replace(/^@/, ''),
         mode: onboardingMode,
         passwordHash: pwdHash,
-        twoStepPinHash: pinHash,
       });
 
       if (onboardingMode === 'register' && checkData.exists) {
         setErrorBanner(
-          `This ${checkData.matchedBy || 'account'} is already registered on Simple${
+          `This ${checkData.matchedBy || 'account'} is already registered in the Simple Firebase Database${
             checkData.accountSummary?.username
               ? ` (@${checkData.accountSummary.username})`
               : ''
-          }. Please tap "Sign In (Existing)" above and sign in with your password & PIN.`
+          }. Nobody can create a new account using someone else's registered ${
+            checkData.matchedBy || 'details'
+          }. Please tap "Sign In (Existing)" above.`
         );
         setIsSendingOtp(false);
         return;
@@ -354,87 +355,246 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
       if (onboardingMode === 'login' && !checkData.exists) {
         setErrorBanner(
-          'No registered Simple account was found with this mobile number or Gmail address in the database. Please check your details or tap "Create New Account".'
+          'No registered Simple account was found with this mobile number or Gmail address in the Firebase Database. Please check your details or tap "Create New Account".'
         );
         setIsSendingOtp(false);
         return;
       }
 
       if (onboardingMode === 'login' && checkData.exists) {
-        // Verify password or PIN against the stored Firestore account record before advancing
-        if (checkData.passwordHash || checkData.twoStepPinHash) {
-          const pwdOk = Boolean(
-            pwdHash && checkData.passwordHash && pwdHash === checkData.passwordHash
+        if (checkData.passwordHash && checkData.passwordHash !== pwdHash) {
+          setErrorBanner(
+            'Incorrect Account Password for this Simple account. Please enter the exact password registered to this account.'
           );
-          const pinOk = Boolean(
-            pinHash && checkData.twoStepPinHash && pinHash === checkData.twoStepPinHash
-          );
-          if (!pwdOk && !pinOk) {
-            setErrorBanner(
-              'Incorrect Account Password or 6-Digit Two-Step Verification PIN for this account. Please enter your exact credentials.'
-            );
-            setIsSendingOtp(false);
-            return;
-          }
+          setIsSendingOtp(false);
+          return;
         }
-        if (checkData.totpSecret) {
-          setTotpSecret(checkData.totpSecret);
-        }
+        // Never expose totpSecret on the client UI during login!
+        setTotpSecret('');
+        setTotpUri('');
       }
 
-      // Generate RFC 6238 TOTP secret locally (and via API) so Authenticator App option is always ready
-      if (!totpSecret) {
+      // 2. If creating a new account, generate RFC 6238 Google Authenticator Secret and save pending challenge to Firebase Firestore Database
+      if (onboardingMode === 'register') {
+        const cleanHandle =
+          username
+            .trim()
+            .toLowerCase()
+            .replace(/^@/, '')
+            .replace(/[^a-z0-9._]/g, '') ||
+          name.trim().toLowerCase().replace(/[^a-z0-9]/g, '') ||
+          `user.${normalizedPhoneDigits.slice(-4) || '1001'}`;
+
+        const deterministicUid =
+          isPhoneValid && normalizedPhoneDigits.length >= 7
+            ? deriveUidFromPhone(normalizedPhoneDigits)
+            : deriveUidFromEmail(cleanEmail);
+
+        const activeSecret = checkData.totpSecret || totpSecret || generateBase32Secret(20);
         const label = (
           (isEmailValid ? cleanEmail : '') ||
           (isPhoneValid ? fullPhoneDisplay : '') ||
-          username ||
+          cleanHandle ||
           'SimpleUser'
         ).replace(/[^a-zA-Z0-9@._+-]/g, '');
-        const localSecret = generateBase32Secret(20);
-        const localUri = `otpauth://totp/SimpleMessenger:${encodeURIComponent(
+        const uri = `otpauth://totp/SimpleMessenger:${encodeURIComponent(
           label
-        )}?secret=${localSecret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
-        setTotpSecret(localSecret);
-        setTotpUri(localUri);
+        )}?secret=${activeSecret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
+
+        setTotpSecret(activeSecret);
+        setTotpUri(uri);
+
+        // Save pending challenge to Firebase Firestore Database (`account_backups`)
+        await createPendingFirestoreAuthenticatorChallenge({
+          uid: deterministicUid,
+          username: cleanHandle,
+          name: name.trim(),
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          email: isEmailValid ? cleanEmail : undefined,
+          passwordHash: pwdHash,
+          totpSecret: activeSecret,
+        });
       }
 
+      setVerifyChannel('totp');
       setOtpInput('');
       setStep(2);
     } catch {
-      // Never block account creation with a false network error; generate local TOTP secret and proceed
-      if (!totpSecret) {
-        const localSecret = generateBase32Secret(20);
-        setTotpSecret(localSecret);
-        setTotpUri(
-          `otpauth://totp/SimpleMessenger:SimpleUser?secret=${localSecret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`
-        );
-      }
-      setOtpInput('');
-      setStep(2);
+      setErrorBanner(
+        'Could not reach Firebase Database to verify account status. Please check your internet connection.'
+      );
     } finally {
       setIsSendingOtp(false);
     }
   };
 
-  // Generate or refresh TOTP Secret for Authenticator App
+  // Regenerate Google Authenticator Secret during Registration & Update Firebase Firestore Challenge
   const handleGenerateTotpSecret = async () => {
+    if (onboardingMode !== 'register') return;
     setErrorBanner(null);
     setIsGeneratingTotp(true);
     try {
+      const cleanHandle =
+        username
+          .trim()
+          .toLowerCase()
+          .replace(/^@/, '')
+          .replace(/[^a-z0-9._]/g, '') ||
+        name.trim().toLowerCase().replace(/[^a-z0-9]/g, '') ||
+        `user.${normalizedPhoneDigits.slice(-4) || '1001'}`;
+      const deterministicUid =
+        isPhoneValid && normalizedPhoneDigits.length >= 7
+          ? deriveUidFromPhone(normalizedPhoneDigits)
+          : deriveUidFromEmail(cleanEmail);
+      const pwdHash = sha256HexSync(accountPassword.trim());
+
+      const secret = generateBase32Secret(20);
       const label = (
         (isEmailValid ? cleanEmail : '') ||
         (isPhoneValid ? fullPhoneDisplay : '') ||
-        username ||
+        cleanHandle ||
         'SimpleUser'
       ).replace(/[^a-zA-Z0-9@._+-]/g, '');
-      const secret = generateBase32Secret(20);
       const uri = `otpauth://totp/SimpleMessenger:${encodeURIComponent(
         label
       )}?secret=${secret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
+
       setTotpSecret(secret);
       setTotpUri(uri);
+
+      await createPendingFirestoreAuthenticatorChallenge({
+        uid: deterministicUid,
+        username: cleanHandle,
+        name: name.trim(),
+        phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+        email: isEmailValid ? cleanEmail : undefined,
+        passwordHash: pwdHash,
+        totpSecret: secret,
+      });
     } finally {
       setIsGeneratingTotp(false);
+    }
+  };
+
+  // Dispatch Real Firebase Phone Auth SMS (`signInWithPhoneNumber`) or Carrier SMS Gateway OTP
+  const handleSendPhoneSmsOtp = async () => {
+    setErrorBanner(null);
+    setOtpSentMessage(null);
+
+    if (!isPhoneValid || !e164Phone) {
+      setErrorBanner('Please enter a valid mobile phone number in Step 1 first.');
+      return;
+    }
+
+    setIsSendingOtp(true);
+    try {
+      // 1. First attempt official Firebase Phone Authentication SMS (`signInWithPhoneNumber`) if supported in current environment
+      if (!isAndroidApkEnvironment() && recaptchaContainerRef.current) {
+        try {
+          if (!recaptchaVerifierRef.current) {
+            recaptchaVerifierRef.current = new RecaptchaVerifier(
+              auth,
+              recaptchaContainerRef.current,
+              { size: 'invisible' }
+            );
+          }
+          const confirmation = await signInWithPhoneNumber(
+            auth,
+            e164Phone,
+            recaptchaVerifierRef.current
+          );
+          setFirebaseSmsConfirmation(confirmation);
+          setOtpSentMessage(
+            `Firebase Authentication has dispatched a real 6-digit SMS verification code to ${fullPhoneDisplay}.`
+          );
+          setIsSendingOtp(false);
+          return;
+        } catch {
+          // Fall through to backend Carrier SMS Gateway if Firebase Phone Auth SMS is not enabled on this Firebase project
+        }
+      }
+
+      // 2. Attempt Backend Carrier SMS Gateway (`/api/auth/request-otp`)
+      const pwdHash = sha256HexSync(accountPassword.trim());
+      const res = await apiFetch('/api/auth/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier: normalizedPhoneDigits,
+          target: normalizedPhoneDigits,
+          channel: 'phone',
+          mode: onboardingMode,
+          passwordHash: pwdHash,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        setErrorBanner(
+          'External Carrier SMS billing (Firebase Blaze / Twilio / Fast2SMS) is not enabled on this project. Please use the primary "Google Authenticator (OTP)" tab on the left to verify your account with our Firebase Database immediately!'
+        );
+        return;
+      }
+
+      setOtpSentMessage(
+        data.message ||
+          `A real 6-digit SMS OTP has been dispatched to ${fullPhoneDisplay}.`
+      );
+    } catch {
+      setErrorBanner(
+        'SMS gateway unavailable. Please use the primary "Google Authenticator (OTP)" tab to verify with our Firebase Database.'
+      );
+    } finally {
+      setIsSendingOtp(false);
+    }
+  };
+
+  // Dispatch Real SMTP Email OTP
+  const handleSendEmailOtp = async () => {
+    setErrorBanner(null);
+    setOtpSentMessage(null);
+
+    if (!isEmailValid) {
+      setErrorBanner('Please enter a valid Gmail/email address in Step 1 first.');
+      return;
+    }
+
+    setIsSendingOtp(true);
+    try {
+      const pwdHash = sha256HexSync(accountPassword.trim());
+      const res = await apiFetch('/api/auth/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier: cleanEmail,
+          target: cleanEmail,
+          channel: 'email',
+          mode: onboardingMode,
+          passwordHash: pwdHash,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        if (data.requiresGatewayConfig) {
+          setShowGatewayConfig(true);
+        }
+        setErrorBanner(
+          data.error ||
+            'SMTP Email Gateway is not configured yet. Configure your Gmail App Password below, or use the primary "Google Authenticator (OTP)" tab to verify your account immediately!'
+        );
+        return;
+      }
+
+      setOtpSentMessage(
+        data.message || `A real 6-digit verification code has been sent to ${cleanEmail}.`
+      );
+    } catch {
+      setErrorBanner(
+        'Failed to contact Email OTP gateway. Please use the primary "Google Authenticator (OTP)" tab.'
+      );
+    } finally {
+      setIsSendingOtp(false);
     }
   };
 
@@ -445,9 +605,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
     if (isAndroidApkEnvironment()) {
       setErrorBanner(
-        'Inside the standalone Android APK, Android WebView blocks browser OAuth popups on file:// origins. Please select "Two-Step PIN & Password Verification" or "Authenticator App (TOTP)" above to verify your Gmail account directly!'
+        'Android WebView restricts browser OAuth popups on file:// origins. Please use the primary "Google Authenticator (OTP)" tab to verify your account with our Firebase Database!'
       );
-      setVerifyChannel('pin_verify');
+      setVerifyChannel('totp');
       return;
     }
 
@@ -467,22 +627,19 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       }
 
       const vToken = createVerificationToken(verifiedGmail || cleanEmail);
+      const pwdHash = sha256HexSync(accountPassword.trim());
 
       if (onboardingMode === 'login') {
-        const pwdHash = accountPassword ? sha256HexSync(accountPassword.trim()) : undefined;
-        const pinHash = /^\d{6}$/.test(twoStepPin) ? sha256HexSync(twoStepPin.trim()) : undefined;
-
         const recovered = await recoverCloudAccountBackup({
           email: verifiedGmail,
           phone: isPhoneValid ? normalizedPhoneDigits : undefined,
           passwordHash: pwdHash,
-          twoStepPinHash: pinHash,
           verificationToken: vToken,
         });
 
         if (!recovered) {
           setErrorBanner(
-            'Google identity verified, but your Account Password / Two-Step PIN did not match the existing account in the database.'
+            'Google identity verified, but your Account Password did not match the existing account in the Firebase Database.'
           );
           setIsVerifyingOtp(false);
           return;
@@ -500,7 +657,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           setRestoredChats(recovered.chats);
         }
         setRecoveryNotice(
-          `Verified ${verifiedGmail} via Google OAuth & restored your encrypted account from database!`
+          `Verified ${verifiedGmail} via Google OAuth & restored your encrypted account from Firebase Database!`
         );
       } else {
         if (!name.trim() && result.user.displayName) {
@@ -514,84 +671,22 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       setVerificationToken(vToken);
       setVerifiedIdentifier(verifiedGmail);
       setOtpSentMessage(`Google Account (${verifiedGmail}) cryptographically verified!`);
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      if (msg.includes('popup-closed-by-user')) {
-        setErrorBanner('Google Sign-In popup was closed before completing verification.');
-      } else {
-        setErrorBanner(
-          'Google OAuth popup is restricted in this browser/WebView container. Please use "Two-Step PIN & Password" or "Authenticator App (TOTP)" tab above to verify immediately.'
-        );
-        setVerifyChannel('pin_verify');
-      }
+    } catch {
+      setErrorBanner(
+        'Google OAuth popup was blocked or closed. Please use the primary "Google Authenticator (OTP)" tab to verify with our Firebase Database.'
+      );
+      setVerifyChannel('totp');
     } finally {
       setIsVerifyingOtp(false);
     }
   };
 
-  // Send Real Out-of-Band OTP via Live SMTP Email or Carrier SMS Gateway
-  const handleSendRealOtp = async (channel: 'email' | 'phone') => {
-    setErrorBanner(null);
-    setOtpSentMessage(null);
-
-    const identifier = channel === 'email' ? cleanEmail : normalizedPhoneDigits;
-    if (channel === 'email' && !isEmailValid) {
-      setErrorBanner('Please enter a valid Gmail/email address in Step 1 first.');
-      return;
-    }
-    if (channel === 'phone' && !isPhoneValid) {
-      setErrorBanner('Please enter a valid mobile phone number in Step 1 first.');
-      return;
-    }
-
-    setIsSendingOtp(true);
-    try {
-      const pwdHash = accountPassword ? sha256HexSync(accountPassword.trim()) : undefined;
-      const res = await apiFetch('/api/auth/request-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          identifier,
-          target: identifier,
-          channel,
-          mode: onboardingMode,
-          passwordHash: pwdHash,
-        }),
-      });
-      const data = await res.json();
-
-      if (!res.ok || !data.ok) {
-        if (data.requiresGatewayConfig) {
-          setShowGatewayConfig(true);
-        }
-        setErrorBanner(
-          data.error ||
-            `Could not dispatch ${channel.toUpperCase()} OTP. Configure your SMTP/SMS gateway below, or select "Two-Step PIN & Password" or "Authenticator App (TOTP)" above.`
-        );
-        return;
-      }
-
-      setOtpSentMessage(
-        data.message ||
-          `A real 6-digit verification code has been sent to your ${
-            channel === 'email' ? `email inbox (${cleanEmail})` : `mobile number (${fullPhoneDisplay})`
-          }.`
-      );
-    } catch {
-      setErrorBanner(
-        'Failed to contact OTP dispatch gateway. Please use "Two-Step PIN & Password" or "Authenticator App (TOTP)" above.'
-      );
-    } finally {
-      setIsSendingOtp(false);
-    }
-  };
-
-  // Verify 6-Digit Code (Two-Step PIN + Password Proof, Authenticator TOTP, or Live SMTP/SMS OTP)
+  // Verify 6-Digit OTP Code (Primary: Google Authenticator via Firebase Firestore Database; Secondary: Firebase SMS / SMTP OTP)
   const handleVerifyCode = async () => {
     setErrorBanner(null);
     const cleanCode = otpInput.trim();
     if (!/^\d{6}$/.test(cleanCode)) {
-      setErrorBanner('Please enter a valid 6-digit verification code.');
+      setErrorBanner('Please enter the 6-digit verification code.');
       return;
     }
 
@@ -607,56 +702,42 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         : 'email';
 
     const identifier = activeChannel === 'email' ? cleanEmail : normalizedPhoneDigits;
+    const deterministicUid =
+      isPhoneValid && normalizedPhoneDigits.length >= 7
+        ? deriveUidFromPhone(normalizedPhoneDigits)
+        : deriveUidFromEmail(cleanEmail);
 
     setIsVerifyingOtp(true);
     try {
-      const pwdHash = accountPassword ? sha256HexSync(accountPassword.trim()) : undefined;
-      const enteredCodeHash = sha256HexSync(cleanCode);
-      const step1PinHash = /^\d{6}$/.test(twoStepPin)
-        ? sha256HexSync(twoStepPin.trim())
-        : undefined;
+      const pwdHash = sha256HexSync(accountPassword.trim());
 
-      let verified = false;
-      let verifiedMethodLabel = '';
-      let issuedToken = '';
+      // 1. PRIMARY: Google Authenticator (RFC 6238 TOTP) verified directly against Firebase Firestore Database
+      if (verifyChannel === 'totp') {
+        const totpResult = await verifyFirestoreAuthenticatorChallenge({
+          uid: deterministicUid,
+          phone: isPhoneValid ? normalizedPhoneDigits : undefined,
+          email: isEmailValid ? cleanEmail : undefined,
+          passwordHash: pwdHash,
+          code: cleanCode,
+          mode: onboardingMode,
+          expectedTotpSecret: onboardingMode === 'register' ? totpSecret : undefined,
+        });
 
-      // 1. Check Cryptographic Two-Step PIN + Password Verification
-      if (verifyChannel === 'pin_verify') {
-        if (onboardingMode === 'register') {
-          if (step1PinHash && enteredCodeHash === step1PinHash) {
-            verified = true;
-            verifiedMethodLabel = 'Two-Step Verification PIN & SHA-256 Password Key';
-            issuedToken = createVerificationToken(identifier);
-          } else {
-            setErrorBanner(
-              'The 6-digit PIN you entered does not match the 6-digit Two-Step Verification PIN you set in Step 1. Please enter your exact 6-digit PIN.'
-            );
-            setIsVerifyingOtp(false);
-            return;
-          }
-        } else {
-          // Login mode: verify against Firestore / Database stored account record
-          const tempToken = createVerificationToken(identifier);
-          const recovered = await recoverCloudAccountBackup({
-            phone: isPhoneValid ? normalizedPhoneDigits : undefined,
-            email: isEmailValid ? cleanEmail : undefined,
-            passwordHash: pwdHash,
-            twoStepPinHash: enteredCodeHash,
-            verificationToken: tempToken,
-          });
+        if (!totpResult.ok || !totpResult.verificationToken) {
+          setErrorBanner(
+            totpResult.error ||
+              'Invalid 6-digit Google Authenticator OTP code. Please open Google Authenticator and enter the current 6-digit code for SimpleMessenger.'
+          );
+          setIsVerifyingOtp(false);
+          return;
+        }
 
-          if (!recovered) {
-            setErrorBanner(
-              'Verification failed: Your 6-digit Two-Step Verification PIN or Account Password did not match the registered account in the database.'
-            );
-            setIsVerifyingOtp(false);
-            return;
-          }
+        if (totpResult.totpSecret) {
+          setTotpSecret(totpResult.totpSecret);
+        }
 
-          verified = true;
-          verifiedMethodLabel = 'Database Cryptographic Password & Two-Step PIN Match';
-          issuedToken = tempToken;
-
+        if (onboardingMode === 'login' && totpResult.recoveredBundle) {
+          const recovered = totpResult.recoveredBundle;
           if (recovered.account) {
             setRecoveredAccountData(recovered.account);
             if (recovered.account.name) setName(recovered.account.name);
@@ -669,71 +750,80 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
             setRestoredChats(recovered.chats);
           }
           setRecoveryNotice(
-            `Verified existing account (@${
+            `Verified Google Authenticator OTP & Password against Firebase Database! Restored account @${
               recovered.account?.username || username || 'user'
-            }) from database and restored your encrypted profile & chats!`
+            }.`
           );
         }
+
+        setVerificationToken(totpResult.verificationToken);
+        setVerifiedIdentifier(identifier);
+        if (isPhoneValid) setPhoneVerified(true);
+        if (isEmailValid) setEmailVerified(true);
+        setOtpSentMessage(
+          'Google Authenticator 6-digit OTP verified with Firebase Firestore Database!'
+        );
+        setIsVerifyingOtp(false);
+        return;
       }
 
-      // 2. Check RFC 6238 Authenticator App TOTP
-      if (!verified && verifyChannel === 'totp') {
-        if (totpSecret && verifyTotpCodeSync(totpSecret, cleanCode)) {
-          verified = true;
-          verifiedMethodLabel = 'RFC 6238 Authenticator App (TOTP)';
-          issuedToken = createVerificationToken(identifier);
-        } else {
-          setErrorBanner(
-            'Invalid 6-digit Authenticator App code. Make sure you added the secret key to Google Authenticator / Authy, or switch to "Two-Step PIN & Password" tab above.'
+      // 2. SECONDARY: Firebase Phone Auth SMS ConfirmationResult (`signInWithPhoneNumber`)
+      if (verifyChannel === 'phone_otp' && firebaseSmsConfirmation) {
+        try {
+          await firebaseSmsConfirmation.confirm(cleanCode);
+          const vToken = createVerificationToken(identifier);
+          setVerificationToken(vToken);
+          setVerifiedIdentifier(identifier);
+          setPhoneVerified(true);
+          if (isEmailValid) setEmailVerified(true);
+          setOtpSentMessage(
+            `Phone number ${fullPhoneDisplay} verified via Firebase SMS Authentication!`
           );
+          setIsVerifyingOtp(false);
+          return;
+        } catch {
+          setErrorBanner('Invalid Firebase SMS verification code. Please check your SMS and try again.');
           setIsVerifyingOtp(false);
           return;
         }
       }
 
-      // 3. Check Server / Gateway OTP (`email_otp` / `phone_otp`)
-      if (!verified) {
-        const res = await apiFetch('/api/auth/verify-otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            identifier,
-            target: identifier,
-            channel: activeChannel,
-            code: cleanCode,
-            mode: onboardingMode,
-            totpSecret: totpSecret || undefined,
-            twoStepPinHash: step1PinHash || enteredCodeHash,
-            passwordHash: pwdHash,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) {
-          setErrorBanner(
-            data.error ||
-              'Invalid or expired 6-digit verification code. Please check your code and try again.'
-          );
-          setIsVerifyingOtp(false);
-          return;
-        }
-        verified = true;
-        verifiedMethodLabel = 'Live Out-of-Band OTP Verification';
-        issuedToken = data.verificationToken || createVerificationToken(identifier);
+      // 3. SECONDARY: Backend Carrier SMS / Live SMTP Email OTP (`/api/auth/verify-otp`)
+      const res = await apiFetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier,
+          target: identifier,
+          channel: activeChannel,
+          code: cleanCode,
+          mode: onboardingMode,
+          passwordHash: pwdHash,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setErrorBanner(
+          data.error ||
+            'Invalid or expired 6-digit OTP code. Please check your code or use the primary Google Authenticator (OTP) tab.'
+        );
+        setIsVerifyingOtp(false);
+        return;
       }
 
-      // If logging in via TOTP or OTP, also recover cloud backup from database
-      if (onboardingMode === 'login' && !recoveredAccountData) {
+      const issuedToken = data.verificationToken || createVerificationToken(identifier);
+
+      if (onboardingMode === 'login') {
         const recovered = await recoverCloudAccountBackup({
           phone: isPhoneValid ? normalizedPhoneDigits : undefined,
           email: isEmailValid ? cleanEmail : undefined,
           passwordHash: pwdHash,
-          twoStepPinHash: enteredCodeHash,
           verificationToken: issuedToken,
         });
 
         if (!recovered) {
           setErrorBanner(
-            'Code verified, but your Account Password or Two-Step PIN did not match the existing account in the database.'
+            'OTP verified, but your Account Password did not match the existing account in the Firebase Database.'
           );
           setIsVerifyingOtp(false);
           return;
@@ -753,7 +843,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         setRecoveryNotice(
           `Verified & restored your existing Simple account (@${
             recovered.account?.username || username || 'user'
-          }) from the database!`
+          }) from the Firebase Database!`
         );
       }
 
@@ -761,11 +851,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       setVerifiedIdentifier(identifier);
       if (isPhoneValid) setPhoneVerified(true);
       if (isEmailValid) setEmailVerified(true);
-      if (!isPhoneValid && !isEmailValid) {
-        if (activeChannel === 'phone') setPhoneVerified(true);
-        else setEmailVerified(true);
-      }
-      setOtpSentMessage(`Account cryptographically verified via ${verifiedMethodLabel}!`);
+      setOtpSentMessage('6-digit OTP verified with Firebase Database!');
     } catch {
       setErrorBanner('Verification encountered an error. Please try again.');
     } finally {
@@ -773,10 +859,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
   };
 
-  // Finalize Account Creation or Sign-In & Save Directly to Database
+  // Finalize Account Creation or Sign-In & Save Directly to Firebase Firestore Database
   const handleFinish = async () => {
     if (!isVerifiedForProceeding || !verificationToken) {
-      setErrorBanner('You must complete account verification before continuing.');
+      setErrorBanner('You must complete OTP verification before continuing.');
       return;
     }
 
@@ -805,10 +891,6 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       const pwdHash = accountPassword
         ? sha256HexSync(accountPassword.trim())
         : recoveredAccountData?.passwordHash;
-      const pinHash = /^\d{6}$/.test(twoStepPin)
-        ? sha256HexSync(twoStepPin.trim())
-        : recoveredAccountData?.twoStepPinHash ||
-          (/^\d{6}$/.test(otpInput) ? sha256HexSync(otpInput.trim()) : undefined);
 
       const finalPhone = isPhoneValid
         ? fullPhoneDisplay
@@ -828,10 +910,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         normalizedPhone: finalNormPhone,
         email: finalEmail,
         authMethod:
-          verifyChannel === 'google_oauth'
-            ? 'google_oauth'
-            : verifyChannel === 'totp'
+          verifyChannel === 'totp'
             ? 'totp'
+            : verifyChannel === 'google_oauth'
+            ? 'google_oauth'
             : isPhoneValid && isEmailValid
             ? 'both'
             : isPhoneValid
@@ -840,7 +922,6 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         phoneVerified: Boolean(isPhoneValid || recoveredAccountData?.phoneVerified),
         emailVerified: Boolean(isEmailValid || recoveredAccountData?.emailVerified),
         passwordHash: pwdHash,
-        twoStepPinHash: pinHash,
         totpSecret: totpSecret || recoveredAccountData?.totpSecret,
         verificationToken,
         about: about.trim() || 'Available on Simple E2EE',
@@ -852,13 +933,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         cloudBackupGmail: finalEmail || undefined,
       };
 
-      // 1. Immediately persist account credentials & backup to Firebase Firestore + Local + Server Database
+      // 1. Immediately persist verified account credentials & backup to Firebase Firestore Database
       const backupPayload = JSON.stringify({
-        version: '3.1.0',
+        version: '5.0.0',
+        totpVerified: true,
+        onboardingCompleted: true,
         exportedAt: Date.now(),
         account: finalAccount,
         passwordHash: pwdHash,
-        twoStepPinHash: pinHash,
         totpSecret: finalAccount.totpSecret,
         chats: restoredChats || [],
       });
@@ -871,13 +953,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         phoneHash: finalNormPhone ? computePhoneHash(finalNormPhone) : undefined,
         emailHash: finalEmail ? computeEmailHash(finalEmail) : undefined,
         passwordHash: pwdHash,
-        twoStepPinHash: pinHash,
         totpSecret: finalAccount.totpSecret,
         verificationToken,
         backupJson: backupPayload,
       });
 
-      // 2. Also register user in Firebase Firestore `directory` and `phone_index` so contacts can discover & message them
+      // 2. Register user in Firebase Firestore `directory` and `phone_index` for real contact discovery
       try {
         const phoneHash = finalNormPhone ? computePhoneHash(finalNormPhone) : '';
         const phoneTailHash = finalNormPhone ? computePhoneTailHash(finalNormPhone) : '';
@@ -937,6 +1018,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-slate-950/95 backdrop-blur-md p-2 sm:p-4 overflow-y-auto">
+      <div ref={recaptchaContainerRef} className="hidden" />
       <div className="w-full max-w-lg rounded-3xl bg-slate-900 border border-slate-800 shadow-2xl overflow-hidden my-auto max-h-[96dvh] flex flex-col">
         {/* Top Header */}
         <div className="px-4 py-3.5 bg-gradient-to-r from-emerald-950/80 via-slate-900 to-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
@@ -951,7 +1033,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   : 'Sign In to Simple Account'}
               </h2>
               <p className="text-[11px] text-slate-400 truncate">
-                Cloud Firestore Database · Phone, Gmail, or Both
+                Google Authenticator &amp; Firebase Database OTP Verification
               </p>
             </div>
           </div>
@@ -1213,26 +1295,32 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 )}
               </div>
 
-              {/* Mandatory Account Password & 6-Digit Two-Step Verification PIN */}
+              {/* Account Password (SHA-256 Protected in Firebase Database) */}
               <div className="p-3.5 rounded-2xl bg-emerald-950/20 border border-emerald-500/30 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
                     <Lock className="w-3.5 h-3.5 text-emerald-400" />
                     <span>
                       {onboardingMode === 'register'
-                        ? 'Set Account Password & 6-Digit 2-Step PIN'
-                        : 'Enter Account Password & 6-Digit 2-Step PIN'}
+                        ? 'Create Account Password'
+                        : 'Enter Your Account Password'}
                     </span>
                   </div>
                   <span className="text-[10px] font-mono text-emerald-400/80">
-                    SHA-256 Protected
+                    SHA-256 + TOTP Protected
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div
+                  className={
+                    onboardingMode === 'register'
+                      ? 'grid grid-cols-1 sm:grid-cols-2 gap-2.5'
+                      : 'space-y-2'
+                  }
+                >
                   <div>
                     <label className="block text-[11px] text-slate-300 mb-1">
-                      Account Password {onboardingMode === 'register' ? '*' : ''}
+                      Account Password *
                     </label>
                     <input
                       type="password"
@@ -1243,7 +1331,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     />
                   </div>
 
-                  {onboardingMode === 'register' ? (
+                  {onboardingMode === 'register' && (
                     <div>
                       <label className="block text-[11px] text-slate-300 mb-1">
                         Confirm Password *
@@ -1256,47 +1344,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white focus:outline-none focus:border-emerald-500"
                       />
                     </div>
-                  ) : (
-                    <div>
-                      <label className="block text-[11px] text-slate-300 mb-1">
-                        6-Digit Two-Step PIN
-                      </label>
-                      <input
-                        type="password"
-                        inputMode="numeric"
-                        maxLength={6}
-                        value={twoStepPin}
-                        onChange={(e) =>
-                          setTwoStepPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                        }
-                        placeholder="6-digit PIN"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white font-mono tracking-widest focus:outline-none focus:border-emerald-500"
-                      />
-                    </div>
                   )}
                 </div>
 
-                {onboardingMode === 'register' && (
-                  <div>
-                    <label className="block text-[11px] text-slate-300 mb-1">
-                      WhatsApp-Style 6-Digit Two-Step Verification PIN *
-                    </label>
-                    <input
-                      type="password"
-                      inputMode="numeric"
-                      maxLength={6}
-                      value={twoStepPin}
-                      onChange={(e) =>
-                        setTwoStepPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                      }
-                      placeholder="Enter 6-digit secret PIN (e.g. ••••••)"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white font-mono tracking-widest focus:outline-none focus:border-emerald-500"
-                    />
-                    <p className="text-[10px] text-slate-400 mt-1">
-                      Saved encrypted in the cloud database. Required whenever signing in or recovering your account on any phone.
-                    </p>
-                  </div>
-                )}
+                <p className="text-[10px] text-slate-400">
+                  {onboardingMode === 'register'
+                    ? 'Next step: Link Google Authenticator (RFC 6238 OTP) with our Firebase Database so nobody can ever misuse or access your account.'
+                    : 'Next step: Enter the live 6-digit OTP from your linked Google Authenticator app to verify ownership with our Firebase Database.'}
+                </p>
               </div>
 
               <button
@@ -1308,25 +1363,25 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 {isSendingOtp ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Checking Cloud Database...</span>
+                    <span>Verifying with Firebase Database...</span>
                   </>
                 ) : (
                   <>
-                    <ShieldCheck className="w-4 h-4" />
-                    <span>Continue to Account Verification →</span>
+                    <KeyRound className="w-4 h-4" />
+                    <span>Continue to Google Authenticator / OTP Verification →</span>
                   </>
                 )}
               </button>
             </div>
           )}
 
-          {/* STEP 2: CRYPTOGRAPHIC ACCOUNT VERIFICATION */}
+          {/* STEP 2: PRIMARY GOOGLE AUTHENTICATOR & FIREBASE DATABASE OTP VERIFICATION */}
           {step === 2 && (
             <div className="space-y-4">
               <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
-                    Step 2 · Verify Account Ownership
+                    Step 2 · Firebase Database OTP Verification
                   </span>
                   <button
                     type="button"
@@ -1337,36 +1392,20 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   </button>
                 </div>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Verify your identity for{' '}
+                  Verifying ownership for{' '}
                   <strong className="text-white font-mono">
                     {isPhoneValid && isEmailValid
                       ? `${fullPhoneDisplay} & ${cleanEmail}`
                       : isPhoneValid
                       ? fullPhoneDisplay
                       : cleanEmail}
-                  </strong>{' '}
-                  using one of the cryptographic verification methods below:
+                  </strong>
+                  .
                 </p>
               </div>
 
-              {/* Verification Method Selector Tabs */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setVerifyChannel('pin_verify');
-                    setErrorBanner(null);
-                  }}
-                  className={`p-2.5 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
-                    verifyChannel === 'pin_verify'
-                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <Lock className="w-4 h-4" />
-                  <span>2-Step PIN Key</span>
-                </button>
-
+              {/* Verification Method Selector Tabs (Google Authenticator Primary; no 2-step PIN loophole) */}
+              <div className="grid grid-cols-3 gap-1.5">
                 <button
                   type="button"
                   onClick={() => {
@@ -1375,31 +1414,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   }}
                   className={`p-2.5 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
                     verifyChannel === 'totp'
-                      ? 'bg-cyan-500/20 border-cyan-500 text-cyan-300'
+                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-lg shadow-emerald-500/10'
                       : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
                   }`}
                 >
                   <KeyRound className="w-4 h-4" />
-                  <span>Authenticator</span>
+                  <span>Google Authenticator</span>
                 </button>
-
-                {isEmailValid && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setVerifyChannel('email_otp');
-                      setErrorBanner(null);
-                    }}
-                    className={`p-2.5 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
-                      verifyChannel === 'email_otp'
-                        ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300'
-                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    <Mail className="w-4 h-4" />
-                    <span>Gmail SMTP OTP</span>
-                  </button>
-                )}
 
                 {isPhoneValid && (
                   <button
@@ -1415,70 +1436,49 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     }`}
                   >
                     <Phone className="w-4 h-4" />
-                    <span>Carrier SMS OTP</span>
+                    <span>Firebase SMS OTP</span>
+                  </button>
+                )}
+
+                {isEmailValid && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVerifyChannel('email_otp');
+                      setErrorBanner(null);
+                    }}
+                    className={`p-2.5 rounded-xl border text-[11px] font-bold flex flex-col items-center gap-1 transition-all ${
+                      verifyChannel === 'email_otp'
+                        ? 'bg-cyan-500/20 border-cyan-500 text-cyan-300'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Mail className="w-4 h-4" />
+                    <span>Gmail / SMTP OTP</span>
                   </button>
                 )}
               </div>
 
-              {/* CHANNEL 1: 6-DIGIT TWO-STEP VERIFICATION PIN & PASSWORD KEY */}
-              {verifyChannel === 'pin_verify' && (
-                <div className="p-4 rounded-2xl bg-slate-950/90 border border-emerald-500/30 space-y-3">
-                  <div className="space-y-1">
-                    <h3 className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                      <Lock className="w-4 h-4 text-emerald-400" />
-                      <span>
-                        {onboardingMode === 'register'
-                          ? 'Confirm Your 6-Digit Two-Step Verification PIN'
-                          : 'Verify With Your Registered 6-Digit Two-Step PIN'}
-                      </span>
-                    </h3>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                      {onboardingMode === 'register'
-                        ? 'Re-enter your secret 6-digit Two-Step Verification PIN to cryptographically lock your account in the Cloud Firestore database.'
-                        : 'Enter the secret 6-digit Two-Step Verification PIN registered to your account to verify ownership and decrypt your cloud backup.'}
-                    </p>
-                  </div>
-
-                  <div className="space-y-2 pt-1">
-                    <label className="block text-[11px] font-semibold text-slate-200">
-                      Enter Your Secret 6-Digit Two-Step Verification PIN:
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        type="password"
-                        inputMode="numeric"
-                        maxLength={6}
-                        value={otpInput}
-                        onChange={(e) =>
-                          setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
-                        }
-                        placeholder="••••••"
-                        className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.35em] text-center focus:outline-none focus:border-emerald-500"
-                      />
-                      <button
-                        type="button"
-                        disabled={isVerifyingOtp || otpInput.length !== 6}
-                        onClick={handleVerifyCode}
-                        className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
-                      >
-                        {isVerifyingOtp ? 'Verifying...' : 'Verify PIN'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* CHANNEL 2: AUTHENTICATOR APP (RFC 6238 TOTP) */}
+              {/* PRIMARY CHANNEL: GOOGLE AUTHENTICATOR (RFC 6238 TOTP + FIREBASE FIRESTORE DATABASE) */}
               {verifyChannel === 'totp' && (
-                <div className="p-4 rounded-2xl bg-slate-950/90 border border-cyan-500/30 space-y-3">
+                <div className="p-4 rounded-2xl bg-slate-950/90 border border-emerald-500/40 space-y-3.5">
                   <div className="flex items-start justify-between gap-2">
                     <div>
-                      <h3 className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
-                        <KeyRound className="w-4 h-4 text-cyan-400" />
-                        <span>Authenticator App (RFC 6238 TOTP)</span>
+                      <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold uppercase tracking-wider mb-1">
+                        Primary · Firebase Database Bound
+                      </div>
+                      <h3 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5">
+                        <KeyRound className="w-4 h-4 text-emerald-400" />
+                        <span>
+                          {onboardingMode === 'register'
+                            ? 'Link Google Authenticator & Verify 6-Digit OTP'
+                            : 'Enter 6-Digit OTP from Your Google Authenticator'}
+                        </span>
                       </h3>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        Works with Google Authenticator, Microsoft Authenticator, Authy, or 1Password.
+                      <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+                        {onboardingMode === 'register'
+                          ? 'Your unique cryptographic key has been registered in our Firebase Database. Add it to Google Authenticator below, then enter the live 6-digit OTP code generated by Google Authenticator.'
+                          : 'For security, your authenticator setup key is hidden during sign-in. Open your Google Authenticator app and enter the current 6-digit rolling OTP code for SimpleMessenger.'}
                       </p>
                     </div>
                     {onboardingMode === 'register' && (
@@ -1486,59 +1486,65 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         type="button"
                         disabled={isGeneratingTotp}
                         onClick={handleGenerateTotpSecret}
-                        className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-slate-300"
+                        className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-slate-300 shrink-0"
                       >
-                        New Key
+                        Rotate Key
                       </button>
                     )}
                   </div>
 
+                  {/* Setup Key & 1-Tap Launch Link ONLY shown during new account creation */}
                   {onboardingMode === 'register' && totpSecret && (
-                    <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
-                      <div className="text-[10px] uppercase tracking-wider text-slate-400">
-                        Your Cryptographic Base32 TOTP Setup Key
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <code className="text-xs font-mono font-bold text-cyan-300 break-all">
-                          {totpSecret}
-                        </code>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            navigator.clipboard?.writeText(totpSecret);
-                            setCopiedTotpSecret(true);
-                            setTimeout(() => setCopiedTotpSecret(false), 2000);
-                          }}
-                          className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-slate-200 flex items-center gap-1 shrink-0"
-                        >
-                          {copiedTotpSecret ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span>Copied</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>Copy Key</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                    <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 space-y-3">
                       {totpUri && (
                         <a
                           href={totpUri}
-                          className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-cyan-400 hover:underline pt-1"
+                          className="w-full py-2.5 px-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
                         >
-                          <Smartphone className="w-3.5 h-3.5" />
-                          <span>1-Tap Open in Authenticator App on This Phone</span>
+                          <Smartphone className="w-4 h-4" />
+                          <span>Step A: 1-Tap Add to Google Authenticator App</span>
                         </a>
                       )}
+
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] uppercase tracking-wider text-slate-400">
+                          Or Copy Base32 Setup Key into Google Authenticator:
+                        </div>
+                        <div className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-950 border border-slate-800">
+                          <code className="text-xs font-mono font-bold text-emerald-300 break-all">
+                            {totpSecret}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(totpSecret);
+                              setCopiedTotpSecret(true);
+                              setTimeout(() => setCopiedTotpSecret(false), 2000);
+                            }}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] font-semibold text-slate-200 flex items-center gap-1 shrink-0"
+                          >
+                            {copiedTotpSecret ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Copy Key</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   )}
 
                   <div className="space-y-2 pt-1">
                     <label className="block text-[11px] font-semibold text-slate-200">
-                      Enter 6-Digit Code from Your Authenticator App:
+                      {onboardingMode === 'register'
+                        ? 'Step B: Enter 6-Digit Rolling OTP from Google Authenticator:'
+                        : 'Enter Current 6-Digit Rolling OTP from Google Authenticator:'}
                     </label>
                     <div className="flex gap-2">
                       <input
@@ -1550,29 +1556,91 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                           setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
                         }
                         placeholder="000000"
-                        className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.35em] text-center focus:outline-none focus:border-cyan-500"
+                        className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.35em] text-center focus:outline-none focus:border-emerald-500"
                       />
                       <button
                         type="button"
                         disabled={isVerifyingOtp || otpInput.length !== 6}
                         onClick={handleVerifyCode}
-                        className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
+                        className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
                       >
-                        {isVerifyingOtp ? 'Verifying...' : 'Verify TOTP'}
+                        {isVerifyingOtp ? 'Verifying...' : 'Verify OTP'}
                       </button>
                     </div>
                   </div>
                 </div>
               )}
 
-              {/* CHANNEL 3: LIVE SMTP EMAIL OTP */}
-              {verifyChannel === 'email_otp' && (
-                <div className="p-4 rounded-2xl bg-slate-950/90 border border-indigo-500/30 space-y-3">
+              {/* SECONDARY CHANNEL: FIREBASE / CARRIER PHONE SMS OTP */}
+              {verifyChannel === 'phone_otp' && (
+                <div className="p-4 rounded-2xl bg-slate-950/90 border border-amber-500/30 space-y-3">
                   <div className="flex items-center justify-between gap-2">
                     <div>
-                      <h3 className="text-xs font-bold text-indigo-300 flex items-center gap-1.5">
-                        <Mail className="w-4 h-4 text-indigo-400" />
-                        <span>Real SMTP Email OTP ({cleanEmail || 'No email set'})</span>
+                      <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                        <Phone className="w-4 h-4 text-amber-400" />
+                        <span>Firebase / Carrier SMS OTP ({fullPhoneDisplay})</span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Dispatches a 6-digit SMS code via Firebase Phone Auth or Carrier SMS Gateway.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowGatewayConfig((v) => !v)}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-amber-300 shrink-0"
+                    >
+                      {gatewayStatus.smsGatewayConfigured
+                        ? 'SMS Active'
+                        : 'Configure SMS API'}
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={isSendingOtp || !isPhoneValid}
+                    onClick={handleSendPhoneSmsOtp}
+                    className="w-full py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-xs flex items-center justify-center gap-2"
+                  >
+                    <Phone className="w-3.5 h-3.5" />
+                    <span>
+                      {isSendingOtp
+                        ? 'Dispatching SMS OTP...'
+                        : `Send 6-Digit SMS OTP to ${fullPhoneDisplay}`}
+                    </span>
+                  </button>
+
+                  <div className="flex gap-2 pt-1">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={otpInput}
+                      onChange={(e) =>
+                        setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      placeholder="6-digit SMS OTP"
+                      className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.3em] text-center focus:outline-none focus:border-amber-500"
+                    />
+                    <button
+                      type="button"
+                      disabled={isVerifyingOtp || otpInput.length !== 6}
+                      onClick={handleVerifyCode}
+                      className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
+                    >
+                      Verify SMS
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* SECONDARY CHANNEL: LIVE SMTP EMAIL OTP / GOOGLE SIGN-IN */}
+              {verifyChannel === 'email_otp' && (
+                <div className="p-4 rounded-2xl bg-slate-950/90 border border-cyan-500/30 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
+                        <Mail className="w-4 h-4 text-cyan-400" />
+                        <span>Real Gmail / SMTP Email OTP ({cleanEmail})</span>
                       </h3>
                       <p className="text-[11px] text-slate-400 mt-0.5">
                         Dispatches a real 6-digit verification code to your email inbox via SMTP.
@@ -1581,7 +1649,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     <button
                       type="button"
                       onClick={() => setShowGatewayConfig((v) => !v)}
-                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-indigo-300 shrink-0"
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-cyan-300 shrink-0"
                     >
                       {gatewayStatus.smtpConfigured ? 'SMTP Active' : 'Configure SMTP'}
                     </button>
@@ -1590,14 +1658,14 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <button
                     type="button"
                     disabled={isSendingOtp || !isEmailValid}
-                    onClick={() => handleSendRealOtp('email')}
-                    className="w-full py-2.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 font-bold text-xs flex items-center justify-center gap-2"
+                    onClick={handleSendEmailOtp}
+                    className="w-full py-2.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 font-bold text-xs flex items-center justify-center gap-2"
                   >
                     <Mail className="w-3.5 h-3.5" />
                     <span>
                       {isSendingOtp
                         ? 'Dispatching Email via SMTP...'
-                        : `Send Real 6-Digit OTP to ${cleanEmail || 'Email'}`}
+                        : `Send Real 6-Digit OTP to ${cleanEmail}`}
                     </span>
                   </button>
 
@@ -1623,77 +1691,15 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                         setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
                       }
                       placeholder="6-digit Email OTP"
-                      className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.3em] text-center focus:outline-none focus:border-indigo-500"
+                      className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.3em] text-center focus:outline-none focus:border-cyan-500"
                     />
                     <button
                       type="button"
                       disabled={isVerifyingOtp || otpInput.length !== 6}
                       onClick={handleVerifyCode}
-                      className="px-4 py-2.5 rounded-xl bg-indigo-500 hover:bg-indigo-400 disabled:opacity-50 text-white font-bold text-xs shrink-0"
+                      className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
                     >
-                      Verify
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* CHANNEL 4: LIVE CARRIER SMS GATEWAY OTP */}
-              {verifyChannel === 'phone_otp' && (
-                <div className="p-4 rounded-2xl bg-slate-950/90 border border-amber-500/30 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                        <Phone className="w-4 h-4 text-amber-400" />
-                        <span>Carrier SMS OTP ({fullPhoneDisplay || 'No phone set'})</span>
-                      </h3>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        Dispatches a real SMS to your mobile number via Carrier SMS Gateway.
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setShowGatewayConfig((v) => !v)}
-                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-amber-300 shrink-0"
-                    >
-                      {gatewayStatus.smsGatewayConfigured
-                        ? 'SMS Active'
-                        : 'Configure SMS API'}
-                    </button>
-                  </div>
-
-                  <button
-                    type="button"
-                    disabled={isSendingOtp || !isPhoneValid}
-                    onClick={() => handleSendRealOtp('phone')}
-                    className="w-full py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-xs flex items-center justify-center gap-2"
-                  >
-                    <Phone className="w-3.5 h-3.5" />
-                    <span>
-                      {isSendingOtp
-                        ? 'Dispatching Carrier SMS...'
-                        : `Send Real SMS OTP to ${fullPhoneDisplay || 'Mobile'}`}
-                    </span>
-                  </button>
-
-                  <div className="flex gap-2 pt-1">
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      maxLength={6}
-                      value={otpInput}
-                      onChange={(e) =>
-                        setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))
-                      }
-                      placeholder="6-digit SMS OTP"
-                      className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono tracking-[0.3em] text-center focus:outline-none focus:border-amber-500"
-                    />
-                    <button
-                      type="button"
-                      disabled={isVerifyingOtp || otpInput.length !== 6}
-                      onClick={handleVerifyCode}
-                      className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs shrink-0"
-                    >
-                      Verify
+                      Verify Email
                     </button>
                   </div>
                 </div>
@@ -1807,8 +1813,8 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 <ShieldCheck className="w-4 h-4" />
                 <span>
                   {isVerifiedForProceeding
-                    ? `Verified (${verifiedIdentifier || 'OK'}) · Continue →`
-                    : 'Complete Verification Above to Continue'}
+                    ? `OTP Verified (${verifiedIdentifier || 'OK'}) · Continue →`
+                    : 'Complete Google Authenticator / OTP Verification Above'}
                 </span>
               </button>
             </div>
@@ -1820,7 +1826,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               <div className="p-3.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-3">
                 <CheckCircle2 className="w-6 h-6 text-emerald-400 shrink-0" />
                 <div className="text-xs text-emerald-100">
-                  <div className="font-bold">Account Ownership Cryptographically Verified</div>
+                  <div className="font-bold">
+                    Account Ownership Verified via Firebase Database OTP
+                  </div>
                   <div className="text-[11px] text-emerald-300/80 font-mono mt-0.5">
                     Token: {verificationToken.slice(0, 18)}…
                   </div>
@@ -1868,7 +1876,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                       Encrypted Cloud Account Backup
                     </div>
                     <div className="text-[11px] text-slate-400">
-                      Automatically back up account &amp; chats protected by your password &amp; 2-Step PIN
+                      Automatically back up account &amp; chats protected by your Password &amp; Google Authenticator OTP
                     </div>
                   </div>
                   <input
@@ -1899,7 +1907,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   {isSavingAccount ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Saving Account to Database...</span>
+                      <span>Saving Account to Firebase Database...</span>
                     </>
                   ) : (
                     <>
