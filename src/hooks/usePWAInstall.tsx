@@ -17,7 +17,7 @@ export async function shareApkOrInvite(options?: {
   const origin = isAndroidApkRuntime()
     ? getRemoteServerOrigin()
     : window.location.origin;
-  const apkUrl = `${origin}/Simple-Android-v5.0.0.apk`;
+  const apkUrl = `${origin}/Simple-Android-v6.0.0.apk`;
   const senderLabel = options?.senderName
     ? `${options.senderName}${options.senderUsername ? ` (@${options.senderUsername})` : ''}`
     : 'me';
@@ -32,7 +32,7 @@ export async function shareApkOrInvite(options?: {
       const response = await fetch(apkUrl);
       if (response.ok) {
         const blob = await response.blob();
-        const apkFile = new File([blob], 'Simple-Android-v5.0.0.apk', {
+        const apkFile = new File([blob], 'Simple-Android-v6.0.0.apk', {
           type: 'application/vnd.android.package-archive',
         });
         if (!navigator.canShare || navigator.canShare({ files: [apkFile] })) {
@@ -184,12 +184,12 @@ export const AndroidInstallButton: React.FC<{
 
       {!isAndroidApkRuntime() && !isInstalled && (
         <a
-          href={`${origin}/Simple-Android-v5.0.0.apk`}
-          download="Simple-Android-v5.0.0.apk"
+          href={`${origin}/Simple-Android-v6.0.0.apk`}
+          download="Simple-Android-v6.0.0.apk"
           className="min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-emerald-300 text-xs font-bold flex items-center gap-1.5 transition-all active:scale-95"
         >
           <Download className="w-3.5 h-3.5 shrink-0" />
-          <span>Download APK (v5.0.0)</span>
+          <span>Download APK (v6.0.0)</span>
         </a>
       )}
 

@@ -503,51 +503,46 @@ export default function App() {
 
     upsertDirectoryUser({ ...localDirEntry, isOnline: true, lastSeen: 'Online' });
 
-    // Firestore payload redacts plaintext phone numbers and uses SHA-256 phoneHash / phoneTailHash
-    const firestoreDirEntry: DirectoryUser = {
-      ...localDirEntry,
-      phone: maskPhoneForFirestore(acc.phone).slice(0, 32),
+    // Firestore payload redacts plaintext phone numbers and omits undefined fields to satisfy firestore.rules
+    const firestoreDirEntry: Record<string, any> = {
+      uid: localDirEntry.uid,
+      name: localDirEntry.name,
+      username: localDirEntry.username,
+      phone: acc.phone ? maskPhoneForFirestore(acc.phone).slice(0, 32) : 'Email Account',
       normalizedPhone: 'REDACTED_SHA256',
+      about: localDirEntry.about,
+      avatarColor: localDirEntry.avatarColor,
+      identityFingerprint: localDirEntry.identityFingerprint,
+      allowUsernameDiscovery: localDirEntry.allowUsernameDiscovery,
+      hidePhoneNumber: localDirEntry.hidePhoneNumber,
+      updatedAt: localDirEntry.updatedAt,
     };
+    if (phoneHash) firestoreDirEntry.phoneHash = phoneHash;
+    if (phoneTailHash) firestoreDirEntry.phoneTailHash = phoneTailHash;
+    if (emailHash) firestoreDirEntry.emailHash = emailHash;
 
     // Sync to Express server directory
     apiFetch('/api/directory/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(firestoreDirEntry),
+      body: JSON.stringify(localDirEntry),
     }).catch(() => {});
 
     // 1. Sync privacy-preserving profile to Firebase Firestore /directory/{uid}
-    try {
-      await setDoc(doc(db, 'directory', firestoreDirEntry.uid), firestoreDirEntry);
-    } catch (error) {
-      try {
-        handleFirestoreError(error, OperationType.WRITE, `directory/${firestoreDirEntry.uid}`);
-      } catch {
-        // Handled and logged
-      }
-    }
+    setDoc(doc(db, 'directory', firestoreDirEntry.uid), firestoreDirEntry).catch(() => {});
 
     // 2. Sync SHA-256 normalized phone hash -> UID mapping to /phone_index/{phoneHash}
-    if (phoneHash) {
-      try {
-        await setDoc(doc(db, 'phone_index', phoneHash), {
-          phoneHash,
-          phoneTailHash,
-          targetUid: firestoreDirEntry.uid,
-          username: firestoreDirEntry.username,
-          name: firestoreDirEntry.name,
-          avatarColor: firestoreDirEntry.avatarColor,
-          identityFingerprint: firestoreDirEntry.identityFingerprint,
-          updatedAt: Date.now(),
-        });
-      } catch (error) {
-        try {
-          handleFirestoreError(error, OperationType.WRITE, `phone_index/${phoneHash}`);
-        } catch {
-          // Handled and logged
-        }
-      }
+    if (phoneHash && phoneTailHash) {
+      setDoc(doc(db, 'phone_index', phoneHash), {
+        phoneHash,
+        phoneTailHash,
+        targetUid: firestoreDirEntry.uid,
+        username: firestoreDirEntry.username,
+        name: firestoreDirEntry.name,
+        avatarColor: firestoreDirEntry.avatarColor,
+        identityFingerprint: firestoreDirEntry.identityFingerprint,
+        updatedAt: Date.now(),
+      }).catch(() => {});
     }
   };
 
@@ -2583,8 +2578,8 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v5.0.0.apk`;
-                          const text = `Hey! Join me on Simple Messenger (@${account.username || 'simple'}). Download & install the official Android APK (v5.0.0) here: ${apkUrl}`;
+                          const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v6.0.0.apk`;
+                          const text = `Hey! Join me on Simple Messenger (@${account.username || 'simple'}). Download & install the official Android APK (v6.0.0) here: ${apkUrl}`;
                           window.open(
                             `https://wa.me/?text=${encodeURIComponent(text)}`,
                             '_blank',

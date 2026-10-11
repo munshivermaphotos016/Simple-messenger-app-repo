@@ -371,127 +371,136 @@ export async function checkAccountInDatabase(params: {
   const phoneHash = cleanPhone.length >= 7 ? computePhoneHash(cleanPhone) : '';
   const emailHash = cleanEmail.includes('@') ? computeEmailHash(cleanEmail) : '';
 
-  // 1. Check Firebase Firestore `account_backups` by deterministic SHA-256 keys (`ph_...`, `em_...`, `usr_...`)
   const firestoreKeys: { key: string; label: string }[] = [];
   if (phoneHash.length >= 16) {
-    firestoreKeys.push({ key: `ph_${phoneHash.slice(0, 48)}`, label: 'mobile phone number' });
-    firestoreKeys.push({ key: deriveUidFromPhone(cleanPhone), label: 'mobile phone number' });
+    firestoreKeys.push({ key: `ph_${phoneHash.slice(0, 48)}`, label: 'phone number' });
+    firestoreKeys.push({ key: deriveUidFromPhone(cleanPhone), label: 'phone number' });
   }
   if (emailHash.length >= 16) {
     firestoreKeys.push({ key: `em_${emailHash.slice(0, 48)}`, label: 'email address' });
     firestoreKeys.push({ key: deriveUidFromEmail(cleanEmail), label: 'email address' });
   }
 
-  for (const item of firestoreKeys) {
-    const snap =
-      (await withTimeout(getDocFromServer(doc(db, 'account_backups', item.key)), 2500, null)) ||
-      (await withTimeout(getDoc(doc(db, 'account_backups', item.key)), 2500, null));
-    if (snap && snap.exists()) {
-      const data = snap.data();
-      if (data && typeof data.backupJson === 'string') {
-        try {
-          const parsed = JSON.parse(data.backupJson);
-          const acct = parsed.account || parsed;
-          const isCompleted =
-            parsed.totpVerified === true ||
-            parsed.onboardingCompleted === true ||
-            acct?.onboardingCompleted === true;
-          const storedPwdHash = parsed.passwordHash || acct?.passwordHash || '';
-          const storedPinHash = parsed.twoStepPinHash || acct?.twoStepPinHash || '';
-          const storedTotpSecret = parsed.totpSecret || acct?.totpSecret || '';
-          const foundUsername = data.username || acct?.username || 'user';
+  const parseBackupRecord = (data: Record<string, any>, label: string) => {
+    if (!data || typeof data.backupJson !== 'string') return null;
+    try {
+      const parsed = JSON.parse(data.backupJson);
+      const acct = parsed.account || parsed;
+      const isCompleted =
+        parsed.totpVerified === true ||
+        parsed.onboardingCompleted === true ||
+        acct?.onboardingCompleted === true;
+      const storedPwdHash = parsed.passwordHash || acct?.passwordHash || '';
+      const storedPinHash = parsed.twoStepPinHash || acct?.twoStepPinHash || '';
+      const storedTotpSecret = parsed.totpSecret || acct?.totpSecret || '';
+      const foundUsername = data.username || acct?.username || 'user';
 
-          // If this is an unverified pending registration by the SAME user with matching passwordHash, allow resuming registration
-          if (
-            params.mode === 'register' &&
-            !isCompleted &&
-            params.passwordHash &&
-            storedPwdHash === params.passwordHash
-          ) {
-            return {
-              ok: true,
-              exists: false,
-              totpSecret: storedTotpSecret || undefined,
-              matchedBy: null,
-              username: foundUsername,
-              accountSummary: null,
-            };
-          }
+      if (
+        params.mode === 'register' &&
+        !isCompleted &&
+        params.passwordHash &&
+        storedPwdHash === params.passwordHash
+      ) {
+        return {
+          ok: true,
+          exists: false,
+          totpSecret: storedTotpSecret || undefined,
+          matchedBy: null,
+          username: foundUsername,
+          accountSummary: null,
+        };
+      }
 
-          return {
-            ok: true,
-            exists: true,
-            matchedBy: item.label,
-            username: foundUsername,
-            hasPassword: Boolean(storedPwdHash),
-            hasTwoStepPin: Boolean(storedPinHash),
-            hasTotp: Boolean(storedTotpSecret),
-            // Never expose totpSecret on login checks
-            totpSecret: params.mode === 'register' ? storedTotpSecret || undefined : undefined,
-            passwordHash: storedPwdHash || undefined,
-            twoStepPinHash: storedPinHash || undefined,
-            accountSummary: {
-              username: foundUsername,
-              name: acct?.name || null,
-            },
-          };
-        } catch {
-          return {
-            ok: true,
-            exists: true,
-            matchedBy: item.label,
-            username: data.username || 'user',
-            accountSummary: { username: data.username || 'user' },
-          };
+      if (!isCompleted && params.mode === 'register') {
+        return null;
+      }
+
+      return {
+        ok: true,
+        exists: true,
+        matchedBy: label,
+        username: foundUsername,
+        hasPassword: Boolean(storedPwdHash),
+        hasTwoStepPin: Boolean(storedPinHash),
+        hasTotp: Boolean(storedTotpSecret),
+        totpSecret: params.mode === 'register' ? storedTotpSecret || undefined : undefined,
+        passwordHash: storedPwdHash || undefined,
+        twoStepPinHash: storedPinHash || undefined,
+        accountSummary: {
+          username: foundUsername,
+          name: acct?.name || null,
+        },
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  // 1. Check local mirror immediately (0ms)
+  try {
+    const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
+    if (rawBackups) {
+      const backups = JSON.parse(rawBackups);
+      for (const item of firestoreKeys) {
+        const localRec = backups[item.key];
+        const res = localRec ? parseBackupRecord(localRec, item.label) : null;
+        if (res && res.exists) {
+          return res;
         }
       }
     }
+  } catch {
+    // Ignore
   }
 
-  // 2. Also check Firestore `directory` by deterministic UID
-  for (const item of firestoreKeys.filter((k) => k.key.startsWith('usr_'))) {
-    const dirSnap = await withTimeout(getDoc(doc(db, 'directory', item.key)), 2500, null);
-    if (dirSnap && dirSnap.exists()) {
-      const dirData = dirSnap.data();
-      if (dirData && dirData.uid) {
-        return {
-          ok: true,
-          exists: true,
-          matchedBy: item.label,
-          username: dirData.username || 'user',
-          accountSummary: {
-            username: dirData.username || 'user',
-            name: dirData.name || null,
-          },
-        };
+  // 2. Run Firestore lookups in parallel with fast 1100ms timeout
+  const snapshots = await Promise.all(
+    firestoreKeys.map(async (item) => {
+      const snap = await withTimeout(getDoc(doc(db, 'account_backups', item.key)), 1100, null);
+      return { item, snap };
+    })
+  );
+
+  for (const { item, snap } of snapshots) {
+    if (snap && snap.exists()) {
+      const parsedRes = parseBackupRecord(snap.data(), item.label);
+      if (parsedRes) {
+        return parsedRes;
       }
     }
   }
 
-  // 3. Check Express / Local API fallback via apiFetch
+  // 3. Check Express / Local API fallback with fast timeout
   try {
-    const res = await apiFetch('/api/account/check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        phone: cleanPhone || undefined,
-        email: cleanEmail || undefined,
-        username: params.username,
-        mode: params.mode || 'check',
-        passwordHash: params.passwordHash,
+    const res = await withTimeout(
+      apiFetch('/api/account/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: cleanPhone || undefined,
+          email: cleanEmail || undefined,
+          username: params.username,
+          mode: params.mode || 'check',
+          passwordHash: params.passwordHash,
+        }),
       }),
-    });
-    const data = await res.json();
-    if (data && typeof data.exists === 'boolean') {
-      return {
-        ok: true,
-        exists: data.exists,
-        matchedBy: data.matchedBy || null,
-        username: data.username || data.accountSummary?.username || null,
-        hasPassword: Boolean(data.hasPassword || data.accountSummary?.hasPassword),
-        hasTwoStepPin: Boolean(data.hasTwoStepPin || data.accountSummary?.hasTwoStepPin),
-        accountSummary: data.accountSummary || (data.username ? { username: data.username } : null),
-      };
+      1200,
+      null
+    );
+    if (res) {
+      const data = await res.json();
+      if (data && typeof data.exists === 'boolean') {
+        return {
+          ok: true,
+          exists: data.exists,
+          matchedBy: data.matchedBy || null,
+          username: data.username || data.accountSummary?.username || null,
+          hasPassword: Boolean(data.hasPassword || data.accountSummary?.hasPassword),
+          hasTwoStepPin: Boolean(data.hasTwoStepPin || data.accountSummary?.hasTwoStepPin),
+          accountSummary:
+            data.accountSummary || (data.username ? { username: data.username } : null),
+        };
+      }
     }
   } catch {
     // Safe fallback if offline
@@ -528,7 +537,6 @@ export async function saveCloudAccountBackup(params: {
   const resolvedPhoneHash = ensureSha256PhoneHash(params.phone || params.phoneHash);
   const resolvedEmailHash = ensureSha256EmailHash(params.email || params.emailHash);
 
-  // Enrich backupJson so credentials (passwordHash, twoStepPinHash, totpSecret) are preserved inside Firestore backupJson
   let enrichedBackupStr = params.backupJson;
   try {
     const parsed = JSON.parse(params.backupJson);
@@ -566,7 +574,7 @@ export async function saveCloudAccountBackup(params: {
     firestorePayload.emailHash = resolvedEmailHash.slice(0, 64);
   }
 
-  // 1. Mirror to localStorage immediately for instant offline / same-device persistence
+  // 1. Mirror to localStorage immediately (0ms) for instant persistence
   try {
     const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
     const backups = rawBackups ? JSON.parse(rawBackups) : {};
@@ -586,7 +594,7 @@ export async function saveCloudAccountBackup(params: {
     // Ignore storage quota
   }
 
-  // 2. Mirror to Express backend
+  // 2. Mirror to Express backend asynchronously
   apiFetch('/api/account/backup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -603,25 +611,32 @@ export async function saveCloudAccountBackup(params: {
     }),
   }).catch(() => {});
 
-  // 3. Persist to Google Cloud Firebase Firestore (`account_backups`)
+  // 3. Persist to Firestore in parallel with a non-blocking 750ms timeout so UI never hangs
   try {
-    await withTimeout(setDoc(doc(db, 'account_backups', safeUid), firestorePayload), 4000, undefined);
+    const writeTasks: Promise<unknown>[] = [
+      withTimeout(setDoc(doc(db, 'account_backups', safeUid), firestorePayload), 750, undefined),
+    ];
     if (resolvedPhoneHash && resolvedPhoneHash.length >= 16) {
-      await withTimeout(
-        setDoc(doc(db, 'account_backups', `ph_${resolvedPhoneHash.slice(0, 48)}`), firestorePayload),
-        4000,
-        undefined
+      writeTasks.push(
+        withTimeout(
+          setDoc(doc(db, 'account_backups', `ph_${resolvedPhoneHash.slice(0, 48)}`), firestorePayload),
+          750,
+          undefined
+        )
       );
     }
     if (resolvedEmailHash && resolvedEmailHash.length >= 16) {
-      await withTimeout(
-        setDoc(doc(db, 'account_backups', `em_${resolvedEmailHash.slice(0, 48)}`), firestorePayload),
-        4000,
-        undefined
+      writeTasks.push(
+        withTimeout(
+          setDoc(doc(db, 'account_backups', `em_${resolvedEmailHash.slice(0, 48)}`), firestorePayload),
+          750,
+          undefined
+        )
       );
     }
+    await Promise.all(writeTasks);
   } catch {
-    // Offline fallback handled
+    // Offline fallback handled automatically
   }
 }
 
@@ -631,10 +646,6 @@ export interface RecoveredAccountBundle {
   chats?: ChatConversation[];
 }
 
-/**
- * Recovers an existing account & chats backup from Firebase Firestore, Local Mirror, or Server
- * ONLY after verifying ownership token & passwordHash / twoStepPinHash.
- */
 export async function recoverCloudAccountBackup(params: {
   uid?: string;
   phone?: string;
@@ -679,7 +690,6 @@ export async function recoverCloudAccountBackup(params: {
     }
   };
 
-  // 1. Check Firebase Firestore `account_backups` first (works globally on any mobile network & APK)
   const candidateKeys: string[] = [];
   if (params.uid) {
     candidateKeys.push(params.uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
@@ -693,20 +703,7 @@ export async function recoverCloudAccountBackup(params: {
     if (rawEmail.includes('@')) candidateKeys.push(deriveUidFromEmail(rawEmail));
   }
 
-  for (const key of candidateKeys) {
-    const snap = await withTimeout(getDoc(doc(db, 'account_backups', key)), 3500, null);
-    if (snap && snap.exists()) {
-      const data = snap.data();
-      if (data && typeof data.backupJson === 'string' && data.backupJson.length > 5) {
-        const verifiedBundle = parseAndVerifyBackup(data.backupJson);
-        if (verifiedBundle) {
-          return verifiedBundle;
-        }
-      }
-    }
-  }
-
-  // 2. Check Local Mirror (`localStorage`)
+  // 1. Check Local Mirror first (0ms)
   try {
     const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
     if (rawBackups) {
@@ -723,20 +720,40 @@ export async function recoverCloudAccountBackup(params: {
     // Continue
   }
 
+  // 2. Check Firestore in parallel with fast 1100ms timeout
+  const snaps = await Promise.all(
+    candidateKeys.map((key) => withTimeout(getDoc(doc(db, 'account_backups', key)), 1100, null))
+  );
+  for (const snap of snaps) {
+    if (snap && snap.exists()) {
+      const data = snap.data();
+      if (data && typeof data.backupJson === 'string' && data.backupJson.length > 5) {
+        const verifiedBundle = parseAndVerifyBackup(data.backupJson);
+        if (verifiedBundle) {
+          return verifiedBundle;
+        }
+      }
+    }
+  }
+
   // 3. Check Express Server (`/api/account/recover`)
   try {
-    const res = await apiFetch('/api/account/recover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        uid: params.uid,
-        phoneHash: rawPhone || shaPhoneHash,
-        emailHash: rawEmail.includes('@') ? rawEmail : shaEmailHash,
-        passwordHash: params.passwordHash,
-        verificationToken: params.verificationToken,
+    const res = await withTimeout(
+      apiFetch('/api/account/recover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: params.uid,
+          phoneHash: rawPhone || shaPhoneHash,
+          emailHash: rawEmail.includes('@') ? rawEmail : shaEmailHash,
+          passwordHash: params.passwordHash,
+          verificationToken: params.verificationToken,
+        }),
       }),
-    });
-    if (res.ok) {
+      1200,
+      null
+    );
+    if (res && res.ok) {
       const data = await res.json();
       if (data?.backupJson) {
         const verifiedBundle = parseAndVerifyBackup(String(data.backupJson));
@@ -750,11 +767,6 @@ export async function recoverCloudAccountBackup(params: {
   return null;
 }
 
-/**
- * Stores a pending Google Authenticator (RFC 6238 TOTP) challenge in Firebase Firestore (`account_backups`)
- * during Step 1 -> Step 2 of new account registration so that Step 2 verifies the user's 6-digit code
- * directly against our Firebase Firestore database.
- */
 export async function createPendingFirestoreAuthenticatorChallenge(params: {
   uid: string;
   username: string;
@@ -769,7 +781,7 @@ export async function createPendingFirestoreAuthenticatorChallenge(params: {
   const resolvedEmailHash = ensureSha256EmailHash(params.email);
 
   const challengeJson = JSON.stringify({
-    version: '5.0.0',
+    version: '6.0.0',
     totpVerified: false,
     onboardingCompleted: false,
     passwordHash: params.passwordHash,
@@ -797,43 +809,54 @@ export async function createPendingFirestoreAuthenticatorChallenge(params: {
   if (resolvedPhoneHash) firestorePayload.phoneHash = resolvedPhoneHash.slice(0, 64);
   if (resolvedEmailHash) firestorePayload.emailHash = resolvedEmailHash.slice(0, 64);
 
-  // Mirror locally as well
+  // Mirror locally immediately (0ms)
   try {
     const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
     const backups = rawBackups ? JSON.parse(rawBackups) : {};
-    backups[safeUid] = firestorePayload;
-    if (resolvedPhoneHash) backups[`ph_${resolvedPhoneHash.slice(0, 48)}`] = firestorePayload;
-    if (resolvedEmailHash) backups[`em_${resolvedEmailHash.slice(0, 48)}`] = firestorePayload;
+    const localEntry = {
+      ...firestorePayload,
+      normalizedPhone: normalizePhone(params.phone || ''),
+      email: (params.email || '').trim().toLowerCase(),
+      passwordHash: params.passwordHash,
+      totpSecret: params.totpSecret,
+    };
+    backups[safeUid] = localEntry;
+    if (resolvedPhoneHash) backups[`ph_${resolvedPhoneHash.slice(0, 48)}`] = localEntry;
+    if (resolvedEmailHash) backups[`em_${resolvedEmailHash.slice(0, 48)}`] = localEntry;
     window.localStorage.setItem('simple_cloud_backups_mirror_v1', JSON.stringify(backups));
   } catch {
     // Ignore storage quota
   }
 
+  // Persist to Firestore in parallel with fast 700ms timeout
   try {
-    await withTimeout(setDoc(doc(db, 'account_backups', safeUid), firestorePayload), 3500, undefined);
+    const tasks: Promise<unknown>[] = [
+      withTimeout(setDoc(doc(db, 'account_backups', safeUid), firestorePayload), 700, undefined),
+    ];
     if (resolvedPhoneHash && resolvedPhoneHash.length >= 16) {
-      await withTimeout(
-        setDoc(doc(db, 'account_backups', `ph_${resolvedPhoneHash.slice(0, 48)}`), firestorePayload),
-        3500,
-        undefined
+      tasks.push(
+        withTimeout(
+          setDoc(doc(db, 'account_backups', `ph_${resolvedPhoneHash.slice(0, 48)}`), firestorePayload),
+          700,
+          undefined
+        )
       );
     }
     if (resolvedEmailHash && resolvedEmailHash.length >= 16) {
-      await withTimeout(
-        setDoc(doc(db, 'account_backups', `em_${resolvedEmailHash.slice(0, 48)}`), firestorePayload),
-        3500,
-        undefined
+      tasks.push(
+        withTimeout(
+          setDoc(doc(db, 'account_backups', `em_${resolvedEmailHash.slice(0, 48)}`), firestorePayload),
+          700,
+          undefined
+        )
       );
     }
+    await Promise.all(tasks);
   } catch {
     // Offline fallback handled
   }
 }
 
-/**
- * Verifies a 6-digit Google Authenticator (RFC 6238 TOTP) code directly against the `totpSecret`
- * and `passwordHash` stored in our Firebase Firestore database (`account_backups`).
- */
 export async function verifyFirestoreAuthenticatorChallenge(params: {
   uid?: string;
   phone?: string;
@@ -851,7 +874,7 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
 }> {
   const cleanCode = (params.code || '').trim();
   if (!/^\d{6}$/.test(cleanCode)) {
-    return { ok: false, error: 'Please enter a valid 6-digit code from Google Authenticator.' };
+    return { ok: false, error: 'Please enter the 6-digit code from your Authenticator app.' };
   }
 
   const rawPhone = normalizePhone(params.phone || '');
@@ -875,44 +898,47 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   let dbRecordData: Record<string, any> | null = null;
   let matchedKey = '';
 
-  // 1. Fetch challenge/account record from Firebase Firestore server
-  for (const key of candidateKeys) {
-    const snap =
-      (await withTimeout(getDocFromServer(doc(db, 'account_backups', key)), 2800, null)) ||
-      (await withTimeout(getDoc(doc(db, 'account_backups', key)), 2800, null));
-    if (snap && snap.exists()) {
-      const data = snap.data();
-      if (data && typeof data.backupJson === 'string') {
-        dbRecordData = data;
-        matchedKey = key;
-        break;
-      }
-    }
-  }
-
-  // 2. Fallback to local mirror if offline
-  if (!dbRecordData) {
-    try {
-      const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
-      if (rawBackups) {
-        const backups = JSON.parse(rawBackups);
-        for (const key of candidateKeys) {
-          if (backups[key] && typeof backups[key].backupJson === 'string') {
-            dbRecordData = backups[key];
-            matchedKey = key;
-            break;
-          }
+  // 1. Check local mirror first (0ms)
+  try {
+    const rawBackups = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
+    if (rawBackups) {
+      const backups = JSON.parse(rawBackups);
+      for (const key of candidateKeys) {
+        if (backups[key] && typeof backups[key].backupJson === 'string') {
+          dbRecordData = backups[key];
+          matchedKey = key;
+          break;
         }
       }
-    } catch {
-      // Ignore
+    }
+  } catch {
+    // Ignore
+  }
+
+  // 2. If not in local mirror, fetch from Firestore in parallel with fast 1100ms timeout
+  if (!dbRecordData) {
+    const snaps = await Promise.all(
+      candidateKeys.map(async (key) => ({
+        key,
+        snap: await withTimeout(getDoc(doc(db, 'account_backups', key)), 1100, null),
+      }))
+    );
+    for (const { key, snap } of snaps) {
+      if (snap && snap.exists()) {
+        const data = snap.data();
+        if (data && typeof data.backupJson === 'string') {
+          dbRecordData = data;
+          matchedKey = key;
+          break;
+        }
+      }
     }
   }
 
   if (!dbRecordData && params.mode === 'login') {
     return {
       ok: false,
-      error: 'No registered account found in the Firebase database for this phone number or email.',
+      error: 'No account found for this phone number or email. Please check your details.',
     };
   }
 
@@ -931,11 +957,10 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
     }
   }
 
-  // Verify passwordHash matches the Firebase database record
   if (storedPwdHash && params.passwordHash && storedPwdHash !== params.passwordHash) {
     return {
       ok: false,
-      error: 'Incorrect Account Password. Your password did not match the account in the Firebase database.',
+      error: 'Incorrect password for this account.',
     };
   }
 
@@ -943,20 +968,17 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   if (!secretToVerify) {
     return {
       ok: false,
-      error: 'No Google Authenticator secret is linked to this account in the Firebase database.',
+      error: 'No Authenticator key is linked to this account. Please verify by Mobile or Email OTP.',
     };
   }
 
-  // Cryptographically verify the 6-digit RFC 6238 TOTP code against the Firebase database secret
   if (!verifyTotpCodeSync(secretToVerify, cleanCode)) {
     return {
       ok: false,
-      error:
-        'Invalid 6-digit Google Authenticator code. Please open your Google Authenticator app and enter the current 6-digit code for SimpleMessenger.',
+      error: 'Invalid 6-digit code. Please open your Authenticator app and enter the current code.',
     };
   }
 
-  // Mark totpVerified = true in Firebase Firestore
   const vToken = createVerificationToken(rawPhone || rawEmail || matchedKey || 'verified');
   if (dbRecordData && parsedBackup) {
     try {
@@ -968,10 +990,12 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
         updatedAt: Date.now(),
       };
       if (matchedKey) {
-        await withTimeout(setDoc(doc(db, 'account_backups', matchedKey), updatedPayload), 3000, undefined);
+        withTimeout(setDoc(doc(db, 'account_backups', matchedKey), updatedPayload), 700, undefined).catch(
+          () => {}
+        );
       }
     } catch {
-      // Ignore offline write error
+      // Ignore
     }
   }
 

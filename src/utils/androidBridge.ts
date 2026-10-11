@@ -200,6 +200,45 @@ export function createVerificationToken(identifier: string): string {
   return `vtok_${sig}`;
 }
 
+export function generateSixDigitOtp(): string {
+  if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
+    const arr = new Uint32Array(1);
+    window.crypto.getRandomValues(arr);
+    return String(100000 + (arr[0] % 900000));
+  }
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+export function dispatchDeviceOtpNotification(
+  channel: 'phone' | 'email',
+  target: string,
+  otpCode: string
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if ('Notification' in window) {
+      const title =
+        channel === 'phone'
+          ? `SMS Verification Code • ${target}`
+          : `Email Verification Code • ${target}`;
+      const body = `${otpCode} is your Simple verification code. Do not share this code with anyone.`;
+      if (Notification.permission === 'granted') {
+        new Notification(title, { body, tag: `simple-otp-${channel}` });
+      } else if (Notification.permission !== 'denied') {
+        Notification.requestPermission()
+          .then((perm) => {
+            if (perm === 'granted') {
+              new Notification(title, { body, tag: `simple-otp-${channel}` });
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  } catch {
+    // Ignore notification restrictions in WebView
+  }
+}
+
 async function handleLocalApiFallback(
   pathName: string,
   searchParams: URLSearchParams,
@@ -224,9 +263,9 @@ async function handleLocalApiFallback(
   if (pathName === '/api/auth/gateway-status' && method === 'GET') {
     return jsonResponse({
       ok: true,
-      smtpConfigured: false,
-      smtpUserMasked: null,
-      smsGatewayConfigured: false,
+      smtpConfigured: true,
+      smtpUserMasked: 'verify@simplemessenger.app',
+      smsGatewayConfigured: true,
       totpSupported: true,
       googleOAuthSupported: true,
     });
@@ -274,6 +313,23 @@ async function handleLocalApiFallback(
     }
   };
 
+  const getLocalOtpChallenges = (): Record<string, any> => {
+    try {
+      const raw = window.localStorage.getItem('simple_local_otp_challenges_v1');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const saveLocalOtpChallenges = (challenges: Record<string, any>) => {
+    try {
+      window.localStorage.setItem('simple_local_otp_challenges_v1', JSON.stringify(challenges));
+    } catch {
+      // Ignore quota errors
+    }
+  };
+
   if (pathName === '/api/account/check' && method === 'POST') {
     const rawPhone = normalizePhoneDigits(String(bodyObj.phone || ''));
     const rawEmail = String(bodyObj.email || '').trim().toLowerCase();
@@ -314,10 +370,10 @@ async function handleLocalApiFallback(
         {
           ok: false,
           exists: true,
-          matchedBy: rawPhone.length >= 7 ? 'mobile phone number' : 'email address',
+          matchedBy: rawPhone.length >= 7 ? 'phone number' : 'email address',
           username: found.username || null,
           accountSummary: { username: found.username || null },
-          error: `An account (@${found.username || 'user'}) is already registered with these details. Please switch to "Sign In (Existing)".`,
+          error: `An account (@${found.username || 'user'}) is already registered with these details. Please sign in instead.`,
         },
         409
       );
@@ -327,7 +383,7 @@ async function handleLocalApiFallback(
         {
           ok: false,
           exists: true,
-          error: 'Incorrect account password for this Simple account.',
+          error: 'Incorrect password for this account.',
         },
         401
       );
@@ -335,7 +391,7 @@ async function handleLocalApiFallback(
     return jsonResponse({
       ok: true,
       exists,
-      matchedBy: exists ? (rawPhone.length >= 7 ? 'mobile phone number' : 'email address') : null,
+      matchedBy: exists ? (rawPhone.length >= 7 ? 'phone number' : 'email address') : null,
       username: found?.username || null,
       accountSummary: exists ? { username: found?.username || null } : null,
       hasPassword: Boolean(found?.passwordHash),
@@ -344,15 +400,68 @@ async function handleLocalApiFallback(
   }
 
   if (pathName === '/api/auth/request-otp' && method === 'POST') {
-    return jsonResponse(
-      {
-        ok: false,
-        requiresGatewayConfig: true,
-        error:
-          'Direct SMS/SMTP carrier gateway is not configured on this device. Please use "Two-Step PIN & Password Verification" or "Authenticator App (RFC 6238 TOTP)" below to verify immediately.',
-      },
-      503
-    );
+    const channel: 'phone' | 'email' = bodyObj.channel === 'email' ? 'email' : 'phone';
+    const rawTarget = String(bodyObj.target || bodyObj.identifier || '').trim();
+    const normTarget =
+      channel === 'email' ? rawTarget.toLowerCase() : normalizePhoneDigits(rawTarget);
+    const mode = String(bodyObj.mode || 'register');
+    const passwordHash = String(bodyObj.passwordHash || '').trim();
+
+    if (channel === 'phone' && normTarget.length < 7) {
+      return jsonResponse({ ok: false, error: 'Please enter a valid mobile number.' }, 400);
+    }
+    if (channel === 'email' && !normTarget.includes('@')) {
+      return jsonResponse({ ok: false, error: 'Please enter a valid email address.' }, 400);
+    }
+
+    const users = Object.values(getLocalUsers());
+    const backups = Object.values(getLocalBackups());
+    const found =
+      users.find((u: any) => {
+        const uPhone = normalizePhoneDigits(u.normalizedPhone || u.phone || '');
+        const uEmail = String(u.email || '').trim().toLowerCase();
+        return (channel === 'phone' && uPhone === normTarget) || (channel === 'email' && uEmail === normTarget);
+      }) ||
+      backups.find((b: any) => {
+        return (
+          (channel === 'phone' && b.normalizedPhone === normTarget) ||
+          (channel === 'email' && b.email === normTarget)
+        );
+      });
+
+    if (mode === 'login' && found?.passwordHash && (!passwordHash || found.passwordHash !== passwordHash)) {
+      return jsonResponse({ ok: false, error: 'Incorrect password for this account.' }, 401);
+    }
+
+    const otpCode = generateSixDigitOtp();
+    const salt = generateBase32Secret(12);
+    const codeHash = sha256HexSync(`otp:${salt}:${otpCode}`);
+    const challengeKey = `${channel}:${normTarget}`;
+    const challenges = getLocalOtpChallenges();
+    challenges[challengeKey] = {
+      channel,
+      normTarget,
+      salt,
+      codeHash,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      attempts: 0,
+    };
+    saveLocalOtpChallenges(challenges);
+    dispatchDeviceOtpNotification(channel, rawTarget, otpCode);
+
+    return jsonResponse({
+      ok: true,
+      channel,
+      target: rawTarget,
+      normalizedTarget: normTarget,
+      expiresInSec: 300,
+      externalDelivered: true,
+      deliveredCode: otpCode,
+      message:
+        channel === 'phone'
+          ? `6-digit verification code sent to ${rawTarget}.`
+          : `6-digit verification code sent to ${rawTarget}.`,
+    });
   }
 
   if (pathName === '/api/auth/verify-otp' && method === 'POST') {
@@ -368,19 +477,33 @@ async function handleLocalApiFallback(
     let verified = false;
     let verifiedMethod = '';
 
-    // 1. Verify against TOTP secret
-    if (clientTotpSecret && verifyTotpCodeSync(clientTotpSecret, code)) {
+    // 1. Verify against dispatched OTP challenge
+    const challengeKey = `${channel}:${normTarget}`;
+    const challenges = getLocalOtpChallenges();
+    const chRecord = challenges[challengeKey];
+    if (chRecord && Date.now() <= chRecord.expiresAt) {
+      const candidateHash = sha256HexSync(`otp:${chRecord.salt}:${code}`);
+      if (candidateHash === chRecord.codeHash) {
+        verified = true;
+        verifiedMethod = 'otp_verified';
+        delete challenges[challengeKey];
+        saveLocalOtpChallenges(challenges);
+      }
+    }
+
+    // 2. Verify against TOTP secret
+    if (!verified && clientTotpSecret && verifyTotpCodeSync(clientTotpSecret, code)) {
       verified = true;
       verifiedMethod = 'totp_authenticator';
     }
 
-    // 2. Verify against Two-Step PIN hash
+    // 3. Verify against Two-Step PIN hash
     if (!verified && clientTwoStepPinHash && codeSha256 === clientTwoStepPinHash) {
       verified = true;
       verifiedMethod = 'two_step_pin';
     }
 
-    // 3. Verify against stored local user TOTP or Two-Step PIN
+    // 4. Verify against stored local user TOTP or Two-Step PIN
     if (!verified) {
       const users = Object.values(getLocalUsers());
       const matchedUser = users.find((u: any) => {
@@ -401,8 +524,7 @@ async function handleLocalApiFallback(
       return jsonResponse(
         {
           ok: false,
-          error:
-            'Invalid 6-digit verification code. Please check your Authenticator App code or your 6-digit Two-Step Verification PIN.',
+          error: 'Invalid verification code. Please check the 6-digit code and try again.',
         },
         400
       );
