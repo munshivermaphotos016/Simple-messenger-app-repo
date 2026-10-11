@@ -2583,8 +2583,8 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v3.0.0.apk`;
-                          const text = `Hey! Join me on Simple Messenger (@${account.username || 'simple'}). Download & install the official Android APK (v3.0.0) here: ${apkUrl}`;
+                          const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v4.0.0.apk`;
+                          const text = `Hey! Join me on Simple Messenger (@${account.username || 'simple'}). Download & install the official Android APK (v4.0.0) here: ${apkUrl}`;
                           window.open(
                             `https://wa.me/?text=${encodeURIComponent(text)}`,
                             '_blank',

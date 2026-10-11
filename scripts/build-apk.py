@@ -1777,39 +1777,14 @@ def main():
 
     # Bundle all chat theme wallpapers from src/assets/images/chat_bg_* into assets/wallpapers/
     src_images_dir = os.path.join(root_dir, "src", "assets", "images")
-    has_convert = shutil.which("convert") is not None
     for img_file in sorted(glob.glob(os.path.join(src_images_dir, "chat_bg_*"))):
         ext = os.path.splitext(img_file)[1].lower()
-        img_name = os.path.basename(img_file)
-        if img_name == "chat_bg_theme_3_1791569123658.jpg":
-            continue
         if ext in (".jpg", ".jpeg", ".png", ".webp"):
-            img_bytes = None
-            if has_convert and ext in (".jpg", ".jpeg"):
-                try:
-                    proc = subprocess.run(
-                        [
-                            "convert",
-                            img_file,
-                            "-resize",
-                            "1080x1920>",
-                            "-strip",
-                            "-quality",
-                            "76",
-                            "jpeg:-",
-                        ],
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    if proc.stdout:
-                        img_bytes = proc.stdout
-                except Exception:
-                    img_bytes = None
-            if img_bytes is None:
-                with open(img_file, "rb") as imf:
-                    img_bytes = imf.read()
-            payload_entries.append((f"assets/wallpapers/{img_name}", img_bytes, False))
+            img_name = os.path.basename(img_file)
+            with open(img_file, "rb") as imf:
+                payload_entries.append(
+                    (f"assets/wallpapers/{img_name}", imf.read(), False)
+                )
 
     # Also bundle public icons at root of assets/
     for pub_name in ("apple-touch-icon.png", "icon.svg"):

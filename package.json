@@ -2,7 +2,7 @@
   "name": "simple-encrypted-messenger-android",
   "author": "Dr. M Verma",
   "private": true,
-  "version": "3.0.0",
+  "version": "4.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

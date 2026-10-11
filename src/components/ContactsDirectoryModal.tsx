@@ -321,7 +321,7 @@ export const ContactsDirectoryModal: React.FC<ContactsDirectoryModalProps> = ({
 
   const openWhatsAppApkInvite = (targetPhone?: string, targetName?: string) => {
     const cleanDigits = normalizePhone(targetPhone || '');
-    const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v3.0.0.apk`;
+    const apkUrl = `${getRemoteServerOrigin()}/Simple-Android-v4.0.0.apk`;
     const inviteText = `Hey${targetName ? ` ${targetName}` : ''}! I'm using Simple Messenger for private end-to-end encrypted chats & calls. Download and install the Simple Android APK here to message me (@${currentAccount.username}): ${apkUrl}`;
     const waUrl =
       cleanDigits.length >= 7

@@ -2,6 +2,8 @@
 // Ensures all /api/* and /ws calls work seamlessly when installed as a standalone Android APK
 // (file:///android_asset/index.html or Capacitor https://localhost) as well as on any web host.
 
+import { sha256HexSync } from '../data/initialState';
+
 export const CLOUD_BACKEND_ORIGIN =
   'https://ais-pre-6fmo26yzskc3abizbl2egg-735834549250.asia-east1.run.app';
 
@@ -38,14 +40,20 @@ export function getRealtimeWebSocketUrl(): string {
 }
 
 function normalizePhoneDigits(phone: string): string {
-  return phone.replace(/[^0-9]/g, '');
+  return (phone || '').replace(/[^0-9]/g, '');
 }
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
-function generateBase32Secret(length = 20): string {
+export function generateBase32Secret(length = 20): string {
   const bytes = new Uint8Array(length);
-  window.crypto.getRandomValues(bytes);
+  if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
   let out = '';
   for (let i = 0; i < length; i++) {
     out += BASE32_ALPHABET[bytes[i] % 32];
@@ -54,7 +62,7 @@ function generateBase32Secret(length = 20): string {
 }
 
 function base32ToBytes(base32: string): Uint8Array {
-  const cleaned = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  const cleaned = (base32 || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
   let bits = '';
   for (let i = 0; i < cleaned.length; i++) {
     const val = BASE32_ALPHABET.indexOf(cleaned[i]);
@@ -67,17 +75,105 @@ function base32ToBytes(base32: string): Uint8Array {
   return bytes;
 }
 
-async function verifyTotpWebCrypto(secret: string, code: string): Promise<boolean> {
-  const cleanCode = code.trim();
+/**
+ * Pure-JS FIPS 180-4 SHA-1 + RFC 2104 HMAC-SHA1 so RFC 6238 TOTP works 100% natively
+ * even inside Android WebView `file:///android_asset/index.html` where `crypto.subtle` is restricted.
+ */
+function sha1Bytes(msg: Uint8Array): Uint8Array {
+  const rol = (n: number, s: number) => ((n << s) | (n >>> (32 - s))) >>> 0;
+  const ml = msg.length * 8;
+  const totalLen = Math.ceil((msg.length + 9) / 64) * 64;
+  const padded = new Uint8Array(totalLen);
+  padded.set(msg);
+  padded[msg.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(totalLen - 4, ml >>> 0, false);
+
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+
+  const w = new Uint32Array(80);
+  for (let offset = 0; offset < totalLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 80; i++) {
+      w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+    let a = h0,
+      b = h1,
+      c = h2,
+      d = h3,
+      e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f = 0,
+        k = 0;
+      if (i < 20) {
+        f = ((b & c) | (~b & d)) >>> 0;
+        k = 0x5a827999;
+      } else if (i < 40) {
+        f = (b ^ c ^ d) >>> 0;
+        k = 0x6ed9eba1;
+      } else if (i < 60) {
+        f = ((b & c) | (b & d) | (c & d)) >>> 0;
+        k = 0x8f1bbcdc;
+      } else {
+        f = (b ^ c ^ d) >>> 0;
+        k = 0xca62c1d6;
+      }
+      const temp = (rol(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d;
+      d = c;
+      c = rol(b, 30);
+      b = a;
+      a = temp;
+    }
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+
+  const out = new Uint8Array(20);
+  const outView = new DataView(out.buffer);
+  outView.setUint32(0, h0, false);
+  outView.setUint32(4, h1, false);
+  outView.setUint32(8, h2, false);
+  outView.setUint32(12, h3, false);
+  outView.setUint32(16, h4, false);
+  return out;
+}
+
+function hmacSha1Bytes(keyBytes: Uint8Array, messageBytes: Uint8Array): Uint8Array {
+  const blockSize = 64;
+  let key = keyBytes;
+  if (key.length > blockSize) {
+    key = sha1Bytes(key);
+  }
+  const paddedKey = new Uint8Array(blockSize);
+  paddedKey.set(key);
+
+  const ipad = new Uint8Array(blockSize + messageBytes.length);
+  const opad = new Uint8Array(blockSize + 20);
+  for (let i = 0; i < blockSize; i++) {
+    ipad[i] = paddedKey[i] ^ 0x36;
+    opad[i] = paddedKey[i] ^ 0x5c;
+  }
+  ipad.set(messageBytes, blockSize);
+  const innerHash = sha1Bytes(ipad);
+  opad.set(innerHash, blockSize);
+  return sha1Bytes(opad);
+}
+
+export function verifyTotpCodeSync(secret: string, code: string): boolean {
+  const cleanCode = (code || '').trim();
   if (!/^\d{6}$/.test(cleanCode) || !secret) return false;
   const keyBytes = base32ToBytes(secret);
-  const cryptoKey = await window.crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'HMAC', hash: 'SHA-1' },
-    false,
-    ['sign']
-  );
+  if (keyBytes.length === 0) return false;
   const currentStep = Math.floor(Date.now() / 1000 / 30);
   for (let w = -1; w <= 1; w++) {
     const counter = currentStep + w;
@@ -85,7 +181,7 @@ async function verifyTotpWebCrypto(secret: string, code: string): Promise<boolea
     const view = new DataView(buf);
     view.setUint32(0, Math.floor(counter / 0x100000000), false);
     view.setUint32(4, counter >>> 0, false);
-    const sig = new Uint8Array(await window.crypto.subtle.sign('HMAC', cryptoKey, buf));
+    const sig = hmacSha1Bytes(keyBytes, new Uint8Array(buf));
     const offset = sig[sig.length - 1] & 0x0f;
     const binary =
       ((sig[offset] & 0x7f) << 24) |
@@ -96,6 +192,12 @@ async function verifyTotpWebCrypto(secret: string, code: string): Promise<boolea
     if (otp === cleanCode) return true;
   }
   return false;
+}
+
+export function createVerificationToken(identifier: string): string {
+  const rand = generateBase32Secret(16).toLowerCase();
+  const sig = sha256HexSync(`simple-vtok:${identifier}:${Date.now()}:${rand}`).slice(0, 32);
+  return `vtok_${sig}`;
 }
 
 async function handleLocalApiFallback(
@@ -131,208 +233,280 @@ async function handleLocalApiFallback(
   }
 
   if (pathName === '/api/auth/setup-totp' && method === 'POST') {
-    const label = String(bodyObj.accountLabel || 'SimpleUser').replace(/[^a-zA-Z0-9@._+-]/g, '');
+    const label = String(
+      bodyObj.accountLabel || bodyObj.label || bodyObj.identifier || 'SimpleUser'
+    ).replace(/[^a-zA-Z0-9@._+-]/g, '');
     const secret = generateBase32Secret(20);
     const otpauthUri = `otpauth://totp/SimpleMessenger:${encodeURIComponent(label)}?secret=${secret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
     return jsonResponse({
       ok: true,
       secret,
+      totpSecret: secret,
       issuer: 'SimpleMessenger',
       accountLabel: label,
       otpauthUri,
     });
   }
 
-  if (pathName === '/api/account/check' && method === 'POST') {
-    const phoneDigits = normalizePhoneDigits(String(bodyObj.phone || ''));
-    const cleanEmail = String(bodyObj.email || '').trim().toLowerCase();
-    const localAccRaw = localStorage.getItem('simple_account_v3');
-    if (localAccRaw) {
-      try {
-        const acc = JSON.parse(localAccRaw);
-        if (
-          acc &&
-          acc.id &&
-          ((phoneDigits && normalizePhoneDigits(acc.phone || '') === phoneDigits) ||
-            (cleanEmail && String(acc.email || '').toLowerCase() === cleanEmail))
-        ) {
-          return jsonResponse({
-            ok: true,
-            exists: true,
-            matchedBy: phoneDigits ? 'phone' : 'email',
-            accountSummary: {
-              uid: acc.id,
-              username: acc.username,
-              name: acc.name,
-              hasPassword: Boolean(acc.passwordHash),
-              hasTwoStepPin: Boolean(acc.twoStepPinHash),
-              hasTotp: Boolean(acc.totpSecret),
-            },
-          });
-        }
-      } catch {
-        // Ignore parse error
-      }
+  const getLocalUsers = (): Record<string, any> => {
+    try {
+      const raw = window.localStorage.getItem('simple_local_registered_users_v1');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
     }
-    return jsonResponse({ ok: true, exists: false });
+  };
+
+  const saveLocalUsers = (users: Record<string, any>) => {
+    try {
+      window.localStorage.setItem('simple_local_registered_users_v1', JSON.stringify(users));
+    } catch {
+      // Ignore quota errors
+    }
+  };
+
+  const getLocalBackups = (): Record<string, any> => {
+    try {
+      const raw = window.localStorage.getItem('simple_cloud_backups_mirror_v1');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  if (pathName === '/api/account/check' && method === 'POST') {
+    const rawPhone = normalizePhoneDigits(String(bodyObj.phone || ''));
+    const rawEmail = String(bodyObj.email || '').trim().toLowerCase();
+    const rawUsername = String(bodyObj.username || '').trim().toLowerCase().replace(/^@/, '');
+    const mode = String(bodyObj.mode || 'check');
+    const passwordHash = String(bodyObj.passwordHash || '').trim();
+    const users = Object.values(getLocalUsers());
+    const backups = Object.values(getLocalBackups());
+
+    const matchedUser = users.find((u: any) => {
+      const uPhone = normalizePhoneDigits(u.normalizedPhone || u.phone || '');
+      const uEmail = String(u.email || '').trim().toLowerCase();
+      const uHandle = String(u.username || '').trim().toLowerCase();
+      if (rawPhone.length >= 7 && uPhone.length >= 7) {
+        if (uPhone === rawPhone || (rawPhone.length >= 10 && uPhone.slice(-10) === rawPhone.slice(-10))) {
+          return true;
+        }
+      }
+      if (rawEmail && uEmail && uEmail === rawEmail) {
+        return true;
+      }
+      if (mode === 'register' && rawUsername && uHandle && uHandle === rawUsername) {
+        return true;
+      }
+      return false;
+    });
+
+    const matchedBackup = backups.find((b: any) => {
+      if (rawPhone.length >= 7 && b.normalizedPhone === rawPhone) return true;
+      if (rawEmail && b.email === rawEmail) return true;
+      return false;
+    });
+
+    const found = matchedUser || matchedBackup;
+    const exists = Boolean(found);
+    if (mode === 'register' && exists) {
+      return jsonResponse(
+        {
+          ok: false,
+          exists: true,
+          matchedBy: rawPhone.length >= 7 ? 'mobile phone number' : 'email address',
+          username: found.username || null,
+          accountSummary: { username: found.username || null },
+          error: `An account (@${found.username || 'user'}) is already registered with these details. Please switch to "Sign In (Existing)".`,
+        },
+        409
+      );
+    }
+    if (mode === 'login' && exists && passwordHash && found.passwordHash && found.passwordHash !== passwordHash) {
+      return jsonResponse(
+        {
+          ok: false,
+          exists: true,
+          error: 'Incorrect account password for this Simple account.',
+        },
+        401
+      );
+    }
+    return jsonResponse({
+      ok: true,
+      exists,
+      matchedBy: exists ? (rawPhone.length >= 7 ? 'mobile phone number' : 'email address') : null,
+      username: found?.username || null,
+      accountSummary: exists ? { username: found?.username || null } : null,
+      hasPassword: Boolean(found?.passwordHash),
+      hasTwoStepPin: Boolean(found?.twoStepPinHash),
+    });
   }
 
   if (pathName === '/api/auth/request-otp' && method === 'POST') {
     return jsonResponse(
       {
         ok: false,
-        requiresGatewaySetup: true,
+        requiresGatewayConfig: true,
         error:
-          'Cloud OTP Gateway is currently unreachable or not configured. Please verify using Authenticator App (RFC 6238 TOTP) or connect to the internet.',
+          'Direct SMS/SMTP carrier gateway is not configured on this device. Please use "Two-Step PIN & Password Verification" or "Authenticator App (RFC 6238 TOTP)" below to verify immediately.',
       },
       503
     );
   }
 
   if (pathName === '/api/auth/verify-otp' && method === 'POST') {
+    const channel = bodyObj.channel === 'email' ? 'email' : 'phone';
+    const rawTarget = String(bodyObj.target || bodyObj.identifier || '').trim();
+    const normTarget =
+      channel === 'email' ? rawTarget.toLowerCase() : normalizePhoneDigits(rawTarget);
     const code = String(bodyObj.code || '').trim();
     const clientTotpSecret = String(bodyObj.totpSecret || '').trim();
-    if (clientTotpSecret && (await verifyTotpWebCrypto(clientTotpSecret, code))) {
-      return jsonResponse({
-        ok: true,
-        verifiedMethod: 'totp_authenticator',
-        verificationToken: `vtok_totp_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-        verifiedAt: Date.now(),
+    const clientTwoStepPinHash = String(bodyObj.twoStepPinHash || '').trim();
+    const codeSha256 = sha256HexSync(code);
+
+    let verified = false;
+    let verifiedMethod = '';
+
+    // 1. Verify against TOTP secret
+    if (clientTotpSecret && verifyTotpCodeSync(clientTotpSecret, code)) {
+      verified = true;
+      verifiedMethod = 'totp_authenticator';
+    }
+
+    // 2. Verify against Two-Step PIN hash
+    if (!verified && clientTwoStepPinHash && codeSha256 === clientTwoStepPinHash) {
+      verified = true;
+      verifiedMethod = 'two_step_pin';
+    }
+
+    // 3. Verify against stored local user TOTP or Two-Step PIN
+    if (!verified) {
+      const users = Object.values(getLocalUsers());
+      const matchedUser = users.find((u: any) => {
+        const uPhone = normalizePhoneDigits(u.normalizedPhone || u.phone || '');
+        const uEmail = String(u.email || '').trim().toLowerCase();
+        return (normTarget && uPhone === normTarget) || (normTarget && uEmail === normTarget);
       });
+      if (matchedUser?.totpSecret && verifyTotpCodeSync(matchedUser.totpSecret, code)) {
+        verified = true;
+        verifiedMethod = 'totp_authenticator';
+      } else if (matchedUser?.twoStepPinHash && codeSha256 === matchedUser.twoStepPinHash) {
+        verified = true;
+        verifiedMethod = 'two_step_pin';
+      }
     }
-    return jsonResponse(
-      {
-        ok: false,
-        error: 'Invalid 6-digit Authenticator TOTP code. Please check your Authenticator app and try again.',
-      },
-      400
-    );
+
+    if (!verified) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            'Invalid 6-digit verification code. Please check your Authenticator App code or your 6-digit Two-Step Verification PIN.',
+        },
+        400
+      );
+    }
+
+    const verificationToken = createVerificationToken(normTarget);
+    return jsonResponse({
+      ok: true,
+      verified: true,
+      channel,
+      normalizedTarget: normTarget,
+      verifiedMethod,
+      verificationToken,
+      verifiedAt: Date.now(),
+    });
   }
 
-  if (pathName === '/api/directory' && method === 'GET') {
-    try {
-      const saved = localStorage.getItem('simple_directory_v3');
-      const users = saved ? JSON.parse(saved) : [];
-      return jsonResponse({ users });
-    } catch {
-      return jsonResponse({ users: [] });
-    }
-  }
-
-  if (pathName === '/api/directory/register' && method === 'POST') {
-    return jsonResponse({ ok: true, user: bodyObj });
-  }
-
-  if (pathName === '/api/directory/lookup' && method === 'GET') {
-    const q = (searchParams.get('q') || '').trim().toLowerCase().replace(/^@/, '');
-    const qDigits = normalizePhoneDigits(q);
-    try {
-      const saved = localStorage.getItem('simple_directory_v3');
-      const users: Array<Record<string, unknown>> = saved ? JSON.parse(saved) : [];
-      const matches = users.filter((u) => {
-        const uName = String(u.username || '').toLowerCase();
-        const uEmail = String(u.email || '').toLowerCase();
-        const uPhone = String(u.normalizedPhone || '');
-        const dName = String(u.name || '').toLowerCase();
-        if (uName.includes(q) || (uEmail && uEmail.includes(q)) || dName.includes(q)) return true;
-        if (qDigits.length >= 4 && uPhone.includes(qDigits)) return true;
-        return false;
-      });
-      return jsonResponse({ matches });
-    } catch {
-      return jsonResponse({ matches: [] });
-    }
+  if (pathName === '/api/users/register' && method === 'POST') {
+    const users = getLocalUsers();
+    const uid = String(bodyObj.uid || `usr_${Date.now()}`);
+    users[uid] = {
+      ...users[uid],
+      ...bodyObj,
+      uid,
+      isOnline: true,
+      lastSeen: Date.now(),
+    };
+    saveLocalUsers(users);
+    return jsonResponse({ ok: true, profile: users[uid], directoryCount: Object.keys(users).length });
   }
 
   if (pathName === '/api/account/backup' && method === 'POST') {
     try {
+      const backups = getLocalBackups();
       const uid = String(bodyObj.uid || '');
-      const phoneHash = bodyObj.phoneHash ? String(bodyObj.phoneHash) : '';
-      const emailHash = bodyObj.emailHash ? String(bodyObj.emailHash) : '';
-      const record = {
-        uid,
-        username: String(bodyObj.username || 'user'),
-        phoneHash,
-        emailHash,
-        passwordHash: bodyObj.passwordHash ? String(bodyObj.passwordHash) : undefined,
-        twoStepPinHash: bodyObj.twoStepPinHash ? String(bodyObj.twoStepPinHash) : undefined,
-        backupJson: String(bodyObj.backupJson || ''),
-        updatedAt: Date.now(),
-      };
-      if (uid) localStorage.setItem(`simple_acc_bkp_${uid}`, JSON.stringify(record));
-      if (phoneHash) localStorage.setItem(`simple_acc_bkp_ph_${phoneHash}`, JSON.stringify(record));
-      if (emailHash) localStorage.setItem(`simple_acc_bkp_em_${emailHash}`, JSON.stringify(record));
-      return jsonResponse({ ok: true, updatedAt: record.updatedAt });
+      if (uid) {
+        backups[uid] = {
+          ...bodyObj,
+          updatedAt: Date.now(),
+        };
+        window.localStorage.setItem('simple_cloud_backups_mirror_v1', JSON.stringify(backups));
+      }
     } catch {
-      return jsonResponse({ ok: true, updatedAt: Date.now() });
+      // Ignore storage quota
     }
+    return jsonResponse({ ok: true, updatedAt: Date.now() });
   }
 
   if (pathName === '/api/account/recover' && method === 'POST') {
-    const uid = String(bodyObj.uid || '');
-    const phoneHash = String(bodyObj.phoneHash || '');
-    const emailHash = String(bodyObj.emailHash || '');
-    const passwordHash = String(bodyObj.passwordHash || '');
-    const twoStepPinHash = String(bodyObj.twoStepPinHash || '');
-    const verificationToken = String(bodyObj.verificationToken || '');
-
-    if (!passwordHash && !twoStepPinHash && !verificationToken) {
-      return jsonResponse(
-        { ok: false, error: 'Authentication required to recover account backup.' },
-        401
-      );
+    const verificationToken = String(bodyObj.verificationToken || '').trim();
+    const passwordHash = String(bodyObj.passwordHash || '').trim();
+    if (!verificationToken) {
+      return jsonResponse({ ok: false, error: 'Verification token required.' }, 401);
     }
-
-    const raw =
-      (uid && localStorage.getItem(`simple_acc_bkp_${uid}`)) ||
-      (phoneHash && localStorage.getItem(`simple_acc_bkp_ph_${phoneHash}`)) ||
-      (emailHash && localStorage.getItem(`simple_acc_bkp_em_${emailHash}`));
-    if (raw) {
-      const matched = JSON.parse(raw);
-      if (matched.passwordHash && passwordHash && matched.passwordHash !== passwordHash) {
-        return jsonResponse({ ok: false, error: 'Incorrect account password.' }, 401);
-      }
-      if (matched.twoStepPinHash && twoStepPinHash && matched.twoStepPinHash !== twoStepPinHash) {
-        return jsonResponse({ ok: false, error: 'Incorrect 6-digit Two-Step PIN.' }, 401);
-      }
-      return jsonResponse({
-        ok: true,
-        uid: matched.uid,
-        username: matched.username,
-        backupJson: matched.backupJson,
-        updatedAt: matched.updatedAt,
-      });
+    const backups = getLocalBackups();
+    const uid = String(bodyObj.uid || '').trim();
+    const record = uid ? backups[uid] : Object.values(backups)[0];
+    if (!record) {
+      return jsonResponse({ found: false }, 404);
     }
-    return jsonResponse({ ok: false, error: 'No local account backup found.' }, 404);
+    if (record.passwordHash && (!passwordHash || record.passwordHash !== passwordHash)) {
+      return jsonResponse({ ok: false, error: 'Incorrect account password.' }, 401);
+    }
+    return jsonResponse({
+      found: true,
+      uid: record.uid,
+      username: record.username,
+      backupJson: record.backupJson,
+      updatedAt: record.updatedAt,
+    });
   }
 
-  return jsonResponse({ ok: true });
-}
+  if (pathName === '/api/directory' && method === 'GET') {
+    const users = Object.values(getLocalUsers());
+    return jsonResponse({ users });
+  }
 
-const nativeFetch: typeof fetch =
-  typeof window !== 'undefined' && typeof window.fetch === 'function'
-    ? window.fetch.bind(window)
-    : fetch;
+  if (pathName === '/api/contacts/sync' && method === 'POST') {
+    return jsonResponse({ matched: [], unmatchedPhones: [] });
+  }
+
+  if (pathName === '/api/messages/pull' && method === 'GET') {
+    return jsonResponse({ messages: [] });
+  }
+
+  return jsonResponse({ ok: true, fallback: true });
+}
 
 export async function apiFetch(
   input: RequestInfo | URL,
   init?: RequestInit
 ): Promise<Response> {
-  const urlStr =
+  const rawUrl =
     typeof input === 'string'
       ? input
       : input instanceof URL
       ? input.toString()
       : input.url;
 
-  const isApiCall = urlStr.startsWith('/api/') || urlStr.includes('/api/');
-  if (!isApiCall) {
-    return nativeFetch(input, init);
-  }
+  const nativeFetch = window.__simpleNativeFetch || window.fetch.bind(window);
 
   let parsedUrl: URL;
   try {
-    parsedUrl = new URL(urlStr, 'https://simple.local');
+    parsedUrl = new URL(rawUrl, 'https://localhost');
   } catch {
     return nativeFetch(input, init);
   }
@@ -351,28 +525,33 @@ export async function apiFetch(
     }
   }
 
+  const isJsonResponse = (res: Response): boolean => {
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    return ct.includes('application/json');
+  };
+
   if (isAndroidApkEnvironment()) {
     try {
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 5000);
+      const timer = window.setTimeout(() => controller.abort(), 2800);
       const cloudUrl = `${CLOUD_BACKEND_ORIGIN}${parsedUrl.pathname}${parsedUrl.search}`;
       const res = await nativeFetch(cloudUrl, {
         ...init,
         signal: controller.signal,
       });
       window.clearTimeout(timer);
-      if (res.status >= 200 && res.status < 600) {
+      if (res.status >= 200 && res.status < 500 && !res.redirected && isJsonResponse(res)) {
         return res;
       }
     } catch {
-      // Cloud backend unreachable or offline; fall back to local on-device handler below
+      // Cloud backend unreachable, sleeping, or behind proxy; fall back to local handler
     }
     return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
   }
 
   try {
     const res = await nativeFetch(input, init);
-    if (res.status >= 200 && res.status < 600) {
+    if (res.status >= 200 && res.status < 500 && !res.redirected && isJsonResponse(res)) {
       return res;
     }
     return handleLocalApiFallback(parsedUrl.pathname, parsedUrl.searchParams, method, bodyObj);
@@ -381,11 +560,21 @@ export async function apiFetch(
   }
 }
 
+declare global {
+  interface Window {
+    __simpleNativeFetch?: typeof window.fetch;
+  }
+}
+
 let bridgeInstalled = false;
 
 export function installAndroidApkNetworkBridge(): void {
   if (typeof window === 'undefined' || bridgeInstalled) return;
   bridgeInstalled = true;
+
+  if (!window.__simpleNativeFetch) {
+    window.__simpleNativeFetch = window.fetch.bind(window);
+  }
 
   if (isAndroidApkEnvironment()) {
     try {
