@@ -1,6 +1,7 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps } from 'firebase/app';
 import {
   getAuth,
+  Auth,
   GoogleAuthProvider,
   signInWithPopup,
   signInWithPhoneNumber,
@@ -53,6 +54,33 @@ export const db = initializeFirestore(
 );
 
 export const auth = getAuth(app);
+
+export function getActiveFirebaseAuth(customConfig?: {
+  apiKey?: string;
+  authDomain?: string;
+  projectId?: string;
+  appId?: string;
+}): Auth {
+  const apiKey = customConfig?.apiKey?.trim();
+  const projectId = customConfig?.projectId?.trim();
+  if (!apiKey || !projectId || apiKey === firebaseConfig.apiKey) {
+    return auth;
+  }
+  const appName = `custom_phone_auth_${projectId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  const existingApp = getApps().find((a) => a.name === appName);
+  const customApp =
+    existingApp ||
+    initializeApp(
+      {
+        apiKey,
+        authDomain: customConfig?.authDomain?.trim() || `${projectId}.firebaseapp.com`,
+        projectId,
+        appId: customConfig?.appId?.trim() || firebaseConfig.appId,
+      },
+      appName
+    );
+  return getAuth(customApp);
+}
 
 export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
@@ -951,7 +979,6 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
 
   let storedPwdHash = '';
   let storedTotpSecret = '';
-  let storedPinHash = '';
   let parsedBackup: any = null;
 
   if (dbRecordData && typeof dbRecordData.backupJson === 'string') {
@@ -960,7 +987,6 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
       const acct = parsedBackup.account || parsedBackup;
       storedPwdHash = parsedBackup.passwordHash || acct?.passwordHash || '';
       storedTotpSecret = parsedBackup.totpSecret || acct?.totpSecret || '';
-      storedPinHash = parsedBackup.twoStepPinHash || acct?.twoStepPinHash || '';
     } catch {
       parsedBackup = null;
     }
@@ -974,16 +1000,12 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
   }
 
   const secretToVerify = storedTotpSecret || params.expectedTotpSecret || '';
-  const pinHashToVerify = storedPinHash || (params.mode === 'register' ? params.expectedTwoStepPinHash || '' : '');
-  const codePinHash = sha256HexSync(cleanCode);
-
-  const matchesPin = Boolean(pinHashToVerify && codePinHash === pinHashToVerify);
   const matchesTotp = Boolean(secretToVerify && verifyTotpCodeSync(secretToVerify, cleanCode));
 
-  if (!matchesPin && !matchesTotp) {
+  if (!matchesTotp) {
     return {
       ok: false,
-      error: 'Invalid 6-digit verification code. Please check your code and try again.',
+      error: 'Invalid 6-digit Google Authenticator code. Please open your Authenticator app and enter the current 6-digit code.',
     };
   }
 
@@ -1011,7 +1033,6 @@ export async function verifyFirestoreAuthenticatorChallenge(params: {
     ok: true,
     verificationToken: vToken,
     totpSecret: secretToVerify || undefined,
-    twoStepPinHash: pinHashToVerify || undefined,
     recoveredBundle:
       parsedBackup && params.mode === 'login'
         ? {

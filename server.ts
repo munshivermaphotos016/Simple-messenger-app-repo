@@ -16,11 +16,13 @@ interface OtpGatewayConfig {
   smtpPass?: string;
   smtpFrom?: string;
   resendApiKey?: string;
+  twoFactorApiKey?: string;
   fast2smsApiKey?: string;
   twilioAccountSid?: string;
   twilioAuthToken?: string;
   twilioPhoneNumber?: string;
   textbeltApiKey?: string;
+  firebaseApiKey?: string;
 }
 
 interface OtpChallengeRecord {
@@ -35,7 +37,7 @@ interface OtpChallengeRecord {
   createdAt: number;
   attempts: number;
   maxAttempts: number;
-  externalDeliveryStatus: 'delivered_smtp' | 'delivered_sms' | 'authenticator_or_pin';
+  externalDeliveryStatus: 'delivered_smtp' | 'delivered_sms' | 'authenticator_only';
 }
 
 interface VerifiedOwnershipToken {
@@ -304,6 +306,16 @@ function findBackupRecordByTarget(
 }
 
 function getEffectiveGatewayConfig(): OtpGatewayConfig {
+  let defaultFirebaseKey = process.env.FIREBASE_API_KEY || '';
+  if (!defaultFirebaseKey) {
+    try {
+      const rawCfg = fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf-8');
+      const parsedCfg = JSON.parse(rawCfg);
+      defaultFirebaseKey = parsedCfg.apiKey || '';
+    } catch {
+      defaultFirebaseKey = '';
+    }
+  }
   return {
     smtpHost: gatewayConfig.smtpHost || process.env.SMTP_HOST || 'smtp.gmail.com',
     smtpPort: Number(gatewayConfig.smtpPort || process.env.SMTP_PORT || 465),
@@ -318,11 +330,13 @@ function getEffectiveGatewayConfig(): OtpGatewayConfig {
       process.env.GMAIL_USER ||
       '',
     resendApiKey: gatewayConfig.resendApiKey || process.env.RESEND_API_KEY || '',
+    twoFactorApiKey: gatewayConfig.twoFactorApiKey || process.env.TWOFACTOR_API_KEY || '',
     fast2smsApiKey: gatewayConfig.fast2smsApiKey || process.env.FAST2SMS_API_KEY || '',
     twilioAccountSid: gatewayConfig.twilioAccountSid || process.env.TWILIO_ACCOUNT_SID || '',
     twilioAuthToken: gatewayConfig.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN || '',
     twilioPhoneNumber: gatewayConfig.twilioPhoneNumber || process.env.TWILIO_PHONE_NUMBER || '',
     textbeltApiKey: gatewayConfig.textbeltApiKey || process.env.TEXTBELT_API_KEY || '',
+    firebaseApiKey: gatewayConfig.firebaseApiKey || defaultFirebaseKey,
   };
 }
 
@@ -414,11 +428,52 @@ async function dispatchRealSmsOtp(
   otpCode: string
 ): Promise<{ delivered: boolean; provider?: string; error?: string }> {
   const cfg = getEffectiveGatewayConfig();
+  const indianTenDigit = normPhone.length >= 10 ? normPhone.slice(-10) : normPhone;
+  const e164 = rawPhone.trim().startsWith('+')
+    ? rawPhone.trim().replace(/\s+/g, '')
+    : `+${normPhone}`;
 
-  // 1. Fast2SMS (India +91 / 10-digit numbers)
+  // 1. 2Factor.in Instant OTP SMS Gateway (India +91 / International)
+  if (cfg.twoFactorApiKey) {
+    try {
+      const url = `https://2factor.in/API/V1/${encodeURIComponent(
+        cfg.twoFactorApiKey
+      )}/SMS/${encodeURIComponent(indianTenDigit)}/${encodeURIComponent(otpCode)}`;
+      const resp = await fetch(url, { method: 'GET' });
+      const data = (await resp.json()) as Record<string, unknown>;
+      if (resp.ok && String(data.Status || '').toLowerCase() === 'success') {
+        return { delivered: true, provider: '2Factor.in SMS OTP' };
+      }
+    } catch {
+      // Fall through to next provider
+    }
+  }
+
+  // 2. Fast2SMS (India +91 / 10-digit numbers — tries OTP route first, then Quick SMS route)
   if (cfg.fast2smsApiKey) {
     try {
-      const indianTenDigit = normPhone.length >= 10 ? normPhone.slice(-10) : normPhone;
+      const otpResp = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+        method: 'POST',
+        headers: {
+          authorization: cfg.fast2smsApiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          route: 'otp',
+          variables_values: otpCode,
+          flash: 0,
+          numbers: indianTenDigit,
+        }),
+      });
+      const otpData = (await otpResp.json()) as Record<string, unknown>;
+      if (otpResp.ok && otpData.return === true) {
+        return { delivered: true, provider: 'Fast2SMS OTP Gateway' };
+      }
+    } catch {
+      // Try Quick SMS route next
+    }
+
+    try {
       const resp = await fetch('https://www.fast2sms.com/dev/bulkV2', {
         method: 'POST',
         headers: {
@@ -442,10 +497,9 @@ async function dispatchRealSmsOtp(
     }
   }
 
-  // 2. Twilio Programmable SMS
+  // 3. Twilio Programmable SMS
   if (cfg.twilioAccountSid && cfg.twilioAuthToken && cfg.twilioPhoneNumber) {
     try {
-      const e164 = rawPhone.trim().startsWith('+') ? rawPhone.trim() : `+${normPhone}`;
       const url = `https://api.twilio.com/2010-04-01/Accounts/${cfg.twilioAccountSid}/Messages.json`;
       const bodyParams = new URLSearchParams({
         To: e164,
@@ -471,9 +525,8 @@ async function dispatchRealSmsOtp(
     }
   }
 
-  // 3. Textbelt SMS Gateway (uses configured key or free-tier 'textbelt' key)
+  // 4. Textbelt SMS Gateway (uses configured key or free-tier 'textbelt' key)
   try {
-    const e164 = rawPhone.trim().startsWith('+') ? rawPhone.trim() : `+${normPhone}`;
     const resp = await fetch('https://textbelt.com/text', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -604,15 +657,20 @@ async function startServer() {
     const eff = getEffectiveGatewayConfig();
     res.json({
       ok: true,
-      smtpConfigured: Boolean(eff.smtpUser && eff.smtpPass),
+      smtpConfigured: Boolean((eff.smtpUser && eff.smtpPass) || eff.resendApiKey),
       smtpHost: eff.smtpHost || 'smtp.gmail.com',
       smtpUserMasked: eff.smtpUser
         ? `${eff.smtpUser.slice(0, 3)}***@${eff.smtpUser.split('@')[1] || 'gmail.com'}`
         : null,
       smsConfigured: Boolean(
-        eff.fast2smsApiKey || (eff.twilioAccountSid && eff.twilioAuthToken) || eff.textbeltApiKey
+        eff.twoFactorApiKey ||
+          eff.fast2smsApiKey ||
+          (eff.twilioAccountSid && eff.twilioAuthToken) ||
+          eff.textbeltApiKey
       ),
-      smsProvider: eff.fast2smsApiKey
+      smsProvider: eff.twoFactorApiKey
+        ? '2Factor.in'
+        : eff.fast2smsApiKey
         ? 'Fast2SMS'
         : eff.twilioAccountSid
         ? 'Twilio'
@@ -629,11 +687,13 @@ async function startServer() {
       smtpUser,
       smtpPass,
       resendApiKey,
+      twoFactorApiKey,
       fast2smsApiKey,
       twilioAccountSid,
       twilioAuthToken,
       twilioPhoneNumber,
       textbeltApiKey,
+      firebaseApiKey,
     } = req.body || {};
 
     gatewayConfig = {
@@ -643,6 +703,7 @@ async function startServer() {
       ...(smtpUser !== undefined ? { smtpUser: String(smtpUser).trim() } : {}),
       ...(smtpPass !== undefined ? { smtpPass: String(smtpPass).trim() } : {}),
       ...(resendApiKey !== undefined ? { resendApiKey: String(resendApiKey).trim() } : {}),
+      ...(twoFactorApiKey !== undefined ? { twoFactorApiKey: String(twoFactorApiKey).trim() } : {}),
       ...(fast2smsApiKey !== undefined ? { fast2smsApiKey: String(fast2smsApiKey).trim() } : {}),
       ...(twilioAccountSid !== undefined
         ? { twilioAccountSid: String(twilioAccountSid).trim() }
@@ -654,6 +715,7 @@ async function startServer() {
         ? { twilioPhoneNumber: String(twilioPhoneNumber).trim() }
         : {}),
       ...(textbeltApiKey !== undefined ? { textbeltApiKey: String(textbeltApiKey).trim() } : {}),
+      ...(firebaseApiKey !== undefined ? { firebaseApiKey: String(firebaseApiKey).trim() } : {}),
     };
     savePersistentDatabase();
 
@@ -662,10 +724,16 @@ async function startServer() {
       ok: true,
       smtpConfigured: Boolean((eff.smtpUser && eff.smtpPass) || eff.resendApiKey),
       smsGatewayConfigured: Boolean(
-        eff.fast2smsApiKey || (eff.twilioAccountSid && eff.twilioAuthToken) || eff.textbeltApiKey
+        eff.twoFactorApiKey ||
+          eff.fast2smsApiKey ||
+          (eff.twilioAccountSid && eff.twilioAuthToken) ||
+          eff.textbeltApiKey
       ),
       smsConfigured: Boolean(
-        eff.fast2smsApiKey || (eff.twilioAccountSid && eff.twilioAuthToken) || eff.textbeltApiKey
+        eff.twoFactorApiKey ||
+          eff.fast2smsApiKey ||
+          (eff.twilioAccountSid && eff.twilioAuthToken) ||
+          eff.textbeltApiKey
       ),
     });
   };
@@ -883,6 +951,102 @@ async function startServer() {
   app.post('/api/auth/verify-google', handleVerifyGoogleAuth);
   app.post('/api/auth/verify-google-token', handleVerifyGoogleAuth);
 
+  // Verify Firebase Phone Auth ID Token directly with Google Identity Toolkit
+  app.post('/api/auth/verify-firebase-phone', async (req, res) => {
+    const idToken = String(req.body.idToken || '').trim();
+    const expectedPhone = normalizePhoneDigits(String(req.body.phone || req.body.target || ''));
+    const customApiKey = String(req.body.firebaseApiKey || '').trim();
+
+    if (!idToken) {
+      res.status(400).json({ ok: false, error: 'Missing Firebase Phone Auth ID token.' });
+      return;
+    }
+
+    const eff = getEffectiveGatewayConfig();
+    const apiKeyToUse = customApiKey || eff.firebaseApiKey || '';
+
+    if (!apiKeyToUse) {
+      res.status(500).json({ ok: false, error: 'Firebase API key is not configured on server.' });
+      return;
+    }
+
+    try {
+      const lookupRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+          apiKeyToUse
+        )}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+
+      if (!lookupRes.ok) {
+        res.status(401).json({
+          ok: false,
+          error: 'Firebase Phone Auth token verification failed with Google Identity Toolkit.',
+        });
+        return;
+      }
+
+      const lookupData = (await lookupRes.json()) as {
+        users?: Array<{
+          localId?: string;
+          phoneNumber?: string;
+        }>;
+      };
+      const verifiedUser = Array.isArray(lookupData.users) ? lookupData.users[0] : undefined;
+      const verifiedPhoneRaw = String(verifiedUser?.phoneNumber || '').trim();
+      const verifiedPhoneNorm = normalizePhoneDigits(verifiedPhoneRaw);
+
+      if (!verifiedPhoneNorm || verifiedPhoneNorm.length < 7) {
+        res.status(401).json({
+          ok: false,
+          error: 'Firebase token does not contain a verified mobile phone number.',
+        });
+        return;
+      }
+
+      if (
+        expectedPhone.length >= 7 &&
+        verifiedPhoneNorm !== expectedPhone &&
+        verifiedPhoneNorm.slice(-10) !== expectedPhone.slice(-10)
+      ) {
+        res.status(403).json({
+          ok: false,
+          error: `Firebase verified phone number (${verifiedPhoneRaw}) does not match the entered number.`,
+        });
+        return;
+      }
+
+      const verificationToken = `vtok_${crypto.randomBytes(24).toString('hex')}`;
+      const tokenRecord: VerifiedOwnershipToken = {
+        token: verificationToken,
+        channel: 'phone',
+        normalizedTarget: expectedPhone || verifiedPhoneNorm,
+        verifiedAt: Date.now(),
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      };
+      verifiedOwnershipTokens.set(verificationToken, tokenRecord);
+
+      res.json({
+        ok: true,
+        channel: 'phone',
+        phone: verifiedPhoneRaw,
+        normalizedTarget: tokenRecord.normalizedTarget,
+        verificationToken,
+        verifiedMethod: 'firebase_phone_otp',
+        verifiedAt: tokenRecord.verifiedAt,
+      });
+    } catch {
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to contact Google Identity Toolkit to verify Firebase Phone OTP token.',
+      });
+    }
+  });
+
   // ============================================================================
   // REAL ACCOUNT OWNERSHIP OTP VERIFICATION SYSTEM (Zero Dummy In-App OTPs)
   // ============================================================================
@@ -975,7 +1139,7 @@ async function startServer() {
       existingChallenge?.totpSecret ||
       generateBase32Secret(20);
 
-    let deliveryStatus: OtpChallengeRecord['externalDeliveryStatus'] = 'authenticator_or_pin';
+    let deliveryStatus: OtpChallengeRecord['externalDeliveryStatus'] = 'authenticator_only';
     let deliveryProvider: string | null = null;
     let externalDelivered = false;
 
@@ -1029,7 +1193,6 @@ async function startServer() {
       expiresInSec: 300,
       externalDelivered,
       deliveryProvider,
-      hasTwoStepPin: Boolean(existingUser?.twoStepPinHash || existingBackup?.twoStepPinHash),
       hasTotp: Boolean(existingUser?.totpSecret || existingBackup?.totpSecret),
       totpEnrollment:
         !isAlreadyRegistered && mode !== 'login'
@@ -1046,8 +1209,8 @@ async function startServer() {
             channel === 'email' ? 'email' : 'text message (SMS)'
           }.`
         : channel === 'email'
-        ? `Verify ${rawTarget} using your email code, Google Sign-In, 6-Digit Security PIN, or Authenticator.`
-        : `Verify ${rawTarget} using your SMS code, 6-Digit Security PIN, or Authenticator.`,
+        ? `Verify ${rawTarget} using your email OTP code, Google Sign-In, or Google Authenticator.`
+        : `Verify ${rawTarget} using your SMS OTP code or Google Authenticator.`,
     });
   });
 
@@ -1058,9 +1221,7 @@ async function startServer() {
     const mode: 'register' | 'login' | 'update' =
       req.body.mode === 'login' ? 'login' : 'register';
     const code = String(req.body.code || '').trim();
-    const passwordHash = String(req.body.passwordHash || '').trim();
     const clientTotpSecret = String(req.body.totpSecret || '').trim();
-    const clientTwoStepPinHash = String(req.body.twoStepPinHash || '').trim();
     const normTarget = normalizeTargetForOtp(channel, rawTarget);
     const challengeKey = `${channel}:${normTarget}`;
 
@@ -1086,25 +1247,12 @@ async function startServer() {
       ? verifyTotpCode(activeTotpSecret, code)
       : false;
 
-    // 2. Check against 6-Digit Security PIN (stored on account for login, or chosen by user during new registration)
-    const storedPasswordHash =
-      existingUser?.passwordHash || existingBackup?.passwordHash || '';
-    const storedPinHash =
-      existingUser?.twoStepPinHash ||
-      existingBackup?.twoStepPinHash ||
-      (mode === 'register' ? clientTwoStepPinHash : '');
-    const candidatePinHash = computeSha256Hex(code);
-    const matchesTwoStepPin =
-      Boolean(storedPinHash) &&
-      candidatePinHash === storedPinHash &&
-      (!storedPasswordHash || !passwordHash || passwordHash === storedPasswordHash);
-
-    // 3. Check against server-dispatched SMTP/SMS 6-digit OTP hash
+    // 2. Check against server-dispatched SMTP/SMS 6-digit OTP hash
     let matchesDispatchedOtp = false;
     if (record) {
       if (Date.now() > record.expiresAt) {
         otpChallenges.delete(challengeKey);
-        if (!matchesAuthenticatorTotp && !matchesTwoStepPin) {
+        if (!matchesAuthenticatorTotp) {
           res.status(400).json({
             ok: false,
             error: 'Verification session expired (5-minute limit). Please request a new code.',
@@ -1126,7 +1274,7 @@ async function startServer() {
       }
     }
 
-    if (!matchesDispatchedOtp && !matchesAuthenticatorTotp && !matchesTwoStepPin) {
+    if (!matchesDispatchedOtp && !matchesAuthenticatorTotp) {
       const remaining = record ? Math.max(0, record.maxAttempts - record.attempts) : 4;
       res.status(400).json({
         ok: false,
@@ -1157,11 +1305,7 @@ async function startServer() {
       channel,
       normalizedTarget: normTarget,
       verificationToken,
-      verifiedMethod: matchesAuthenticatorTotp
-        ? 'totp_authenticator'
-        : matchesTwoStepPin
-        ? 'two_step_pin'
-        : 'real_otp',
+      verifiedMethod: matchesAuthenticatorTotp ? 'totp_authenticator' : 'real_otp',
       totpSecret: verifiedTotpSecret,
       verifiedAt: tokenRecord.verifiedAt,
     });

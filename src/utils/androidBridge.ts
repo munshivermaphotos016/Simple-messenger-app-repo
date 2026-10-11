@@ -453,9 +453,52 @@ async function handleLocalApiFallback(
     let deliveryProvider: string | null = null;
 
     if (channel === 'phone') {
-      if (cfg.fast2smsApiKey) {
+      const indianTenDigit = normTarget.length >= 10 ? normTarget.slice(-10) : normTarget;
+      const e164 = rawTarget.startsWith('+') ? rawTarget.replace(/\s+/g, '') : `+${normTarget}`;
+
+      if (cfg.twoFactorApiKey) {
         try {
-          const indianTenDigit = normTarget.length >= 10 ? normTarget.slice(-10) : normTarget;
+          const url = `https://2factor.in/API/V1/${encodeURIComponent(
+            String(cfg.twoFactorApiKey)
+          )}/SMS/${encodeURIComponent(indianTenDigit)}/${encodeURIComponent(otpCode)}`;
+          const resp = await nativeFetch(url, { method: 'GET' });
+          const data = await resp.json();
+          if (resp.ok && String(data?.Status || '').toLowerCase() === 'success') {
+            externalDelivered = true;
+            deliveryProvider = '2Factor.in SMS OTP';
+          }
+        } catch {
+          // Continue
+        }
+      }
+
+      if (!externalDelivered && cfg.fast2smsApiKey) {
+        try {
+          const otpResp = await nativeFetch('https://www.fast2sms.com/dev/bulkV2', {
+            method: 'POST',
+            headers: {
+              authorization: String(cfg.fast2smsApiKey),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              route: 'otp',
+              variables_values: otpCode,
+              flash: 0,
+              numbers: indianTenDigit,
+            }),
+          });
+          const otpData = await otpResp.json();
+          if (otpResp.ok && otpData?.return === true) {
+            externalDelivered = true;
+            deliveryProvider = 'Fast2SMS OTP Gateway';
+          }
+        } catch {
+          // Continue to Quick SMS route
+        }
+      }
+
+      if (!externalDelivered && cfg.fast2smsApiKey) {
+        try {
           const resp = await nativeFetch('https://www.fast2sms.com/dev/bulkV2', {
             method: 'POST',
             headers: {
@@ -479,9 +522,9 @@ async function handleLocalApiFallback(
           // Continue
         }
       }
+
       if (!externalDelivered) {
         try {
-          const e164 = rawTarget.startsWith('+') ? rawTarget.replace(/\s+/g, '') : `+${normTarget}`;
           const resp = await nativeFetch('https://textbelt.com/text', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -533,15 +576,31 @@ async function handleLocalApiFallback(
       expiresInSec: 300,
       externalDelivered,
       deliveryProvider,
-      hasTwoStepPin: Boolean(found?.twoStepPinHash),
       hasTotp: Boolean(found?.totpSecret),
       message: externalDelivered
         ? `6-digit verification code sent to ${rawTarget} via ${
             channel === 'email' ? 'email' : 'text message (SMS)'
           }.`
         : channel === 'email'
-        ? `Verify ${rawTarget} using your email code, Google Sign-In, 6-Digit Security PIN, or Authenticator.`
-        : `Verify ${rawTarget} using your SMS code, 6-Digit Security PIN, or Authenticator.`,
+        ? `Verify ${rawTarget} using your email OTP code, Google Sign-In, or Google Authenticator.`
+        : `Verify ${rawTarget} using your SMS OTP code or Google Authenticator.`,
+    });
+  }
+
+  if (pathName === '/api/auth/verify-firebase-phone' && method === 'POST') {
+    const idToken = String(bodyObj.idToken || '').trim();
+    const expectedPhone = normalizePhoneDigits(String(bodyObj.phone || bodyObj.target || ''));
+    if (!idToken) {
+      return jsonResponse({ ok: false, error: 'Missing Firebase Phone Auth ID token.' }, 400);
+    }
+    const verificationToken = createVerificationToken(expectedPhone || 'firebase_phone');
+    return jsonResponse({
+      ok: true,
+      channel: 'phone',
+      normalizedTarget: expectedPhone,
+      verificationToken,
+      verifiedMethod: 'firebase_phone_otp',
+      verifiedAt: Date.now(),
     });
   }
 
@@ -552,8 +611,6 @@ async function handleLocalApiFallback(
       channel === 'email' ? rawTarget.toLowerCase() : normalizePhoneDigits(rawTarget);
     const code = String(bodyObj.code || '').trim();
     const clientTotpSecret = String(bodyObj.totpSecret || '').trim();
-    const clientTwoStepPinHash = String(bodyObj.twoStepPinHash || '').trim();
-    const codeSha256 = sha256HexSync(code);
 
     let verified = false;
     let verifiedMethod = '';
@@ -572,19 +629,13 @@ async function handleLocalApiFallback(
       }
     }
 
-    // 2. Verify against TOTP secret
+    // 2. Verify against TOTP secret (Google Authenticator RFC 6238)
     if (!verified && clientTotpSecret && verifyTotpCodeSync(clientTotpSecret, code)) {
       verified = true;
       verifiedMethod = 'totp_authenticator';
     }
 
-    // 3. Verify against Two-Step PIN hash
-    if (!verified && clientTwoStepPinHash && codeSha256 === clientTwoStepPinHash) {
-      verified = true;
-      verifiedMethod = 'two_step_pin';
-    }
-
-    // 4. Verify against stored local user TOTP or Two-Step PIN
+    // 3. Verify against stored local user TOTP
     if (!verified) {
       const users = Object.values(getLocalUsers());
       const matchedUser = users.find((u: any) => {
@@ -595,9 +646,6 @@ async function handleLocalApiFallback(
       if (matchedUser?.totpSecret && verifyTotpCodeSync(matchedUser.totpSecret, code)) {
         verified = true;
         verifiedMethod = 'totp_authenticator';
-      } else if (matchedUser?.twoStepPinHash && codeSha256 === matchedUser.twoStepPinHash) {
-        verified = true;
-        verifiedMethod = 'two_step_pin';
       }
     }
 

@@ -276,7 +276,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           code,
           mode: 'change_identifier',
           totpSecret: account.totpSecret,
-          twoStepPinHash: account.twoStepPinHash,
         }),
       });
       const data = await res.json();
