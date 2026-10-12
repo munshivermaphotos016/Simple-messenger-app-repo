@@ -67,6 +67,7 @@ import {
   INITIAL_SETTINGS,
   INITIAL_STATUS_POSTS,
   INITIAL_USER_ACCOUNT,
+  isLegacyDummyRecord,
   maskPhoneForFirestore,
   normalizePhone,
 } from './data/initialState';
@@ -168,7 +169,9 @@ export default function App() {
     if (saved) {
       try {
         const parsed: ChatConversation[] = JSON.parse(saved);
-        return Array.isArray(parsed) ? parsed : INITIAL_CHATS;
+        return Array.isArray(parsed)
+          ? parsed.filter((c) => !isLegacyDummyRecord(c))
+          : INITIAL_CHATS;
       } catch {
         return INITIAL_CHATS;
       }
@@ -181,7 +184,9 @@ export default function App() {
     if (saved) {
       try {
         const parsed: DirectoryUser[] = JSON.parse(saved);
-        return Array.isArray(parsed) ? parsed : INITIAL_DIRECTORY_USERS;
+        return Array.isArray(parsed)
+          ? parsed.filter((u) => !isLegacyDummyRecord(u))
+          : INITIAL_DIRECTORY_USERS;
       } catch {
         return INITIAL_DIRECTORY_USERS;
       }
@@ -191,7 +196,17 @@ export default function App() {
 
   const [savedContacts, setSavedContacts] = useState<SavedContact[]>(() => {
     const saved = localStorage.getItem('simple_contacts_v3');
-    return saved ? JSON.parse(saved) : INITIAL_SAVED_CONTACTS;
+    if (saved) {
+      try {
+        const parsed: SavedContact[] = JSON.parse(saved);
+        return Array.isArray(parsed)
+          ? parsed.filter((c) => !isLegacyDummyRecord(c))
+          : INITIAL_SAVED_CONTACTS;
+      } catch {
+        return INITIAL_SAVED_CONTACTS;
+      }
+    }
+    return INITIAL_SAVED_CONTACTS;
   });
 
   const [calls, setCalls] = useState<CallRecord[]>(() => {
@@ -199,7 +214,9 @@ export default function App() {
     if (saved) {
       try {
         const parsed: CallRecord[] = JSON.parse(saved);
-        return Array.isArray(parsed) ? parsed : INITIAL_CALL_HISTORY;
+        return Array.isArray(parsed)
+          ? parsed.filter((c) => !isLegacyDummyRecord(c))
+          : INITIAL_CALL_HISTORY;
       } catch {
         return INITIAL_CALL_HISTORY;
       }
@@ -212,7 +229,9 @@ export default function App() {
     if (saved) {
       try {
         const parsed: StatusPost[] = JSON.parse(saved);
-        return Array.isArray(parsed) ? parsed : INITIAL_STATUS_POSTS;
+        return Array.isArray(parsed)
+          ? parsed.filter((s) => !isLegacyDummyRecord({ name: s.authorName }))
+          : INITIAL_STATUS_POSTS;
       } catch {
         return INITIAL_STATUS_POSTS;
       }
@@ -407,6 +426,7 @@ export default function App() {
 
   // Helper to merge a user into local directory state and link any matching saved contacts by SHA-256 phoneHash
   const upsertDirectoryUser = (user: DirectoryUser) => {
+    if (!user || isLegacyDummyRecord(user)) return;
     const computedHash =
       user.phoneHash ||
       (user.normalizedPhone && user.normalizedPhone !== 'REDACTED_SHA256'

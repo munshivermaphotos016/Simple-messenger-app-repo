@@ -176,6 +176,114 @@ export const INITIAL_DIRECTORY_USERS: DirectoryUser[] = [];
 
 export const INITIAL_SAVED_CONTACTS: SavedContact[] = [];
 
+const LEGACY_DUMMY_USERNAMES = new Set([
+  'alice_wonder',
+  'bob_builder',
+  'alice_badc',
+  'bob_badc',
+  'alice_c705',
+  'bob_c705',
+  'elena.rostova',
+  'elena.crypto',
+  'marcus.vance',
+  'marcus.sec',
+  'sora.takahashi',
+  'sora.compose',
+  'priya.sharma',
+  'priya.k',
+  'arjun.mehta',
+  'maya.lin',
+  'vikram.patel',
+  'ananya.iyer',
+  'rohan.desai',
+  'kiran.rao',
+  'alex.mercer',
+  'dr.verma.demo',
+  'simple.bot',
+]);
+
+const LEGACY_DUMMY_NAMES = new Set([
+  'alice wonder',
+  'bob builder',
+  'alice badc',
+  'bob badc',
+  'alice c705',
+  'bob c705',
+  'elena rostova',
+  'marcus vance',
+  'sora takahashi',
+  'dr. priya sharma',
+  'priya sharma',
+  'arjun mehta',
+  'maya lin',
+  'vikram patel',
+  'ananya iyer',
+  'rohan desai',
+  'kiran rao',
+  'alex mercer',
+  'core security team',
+  'android kotlin dev group',
+]);
+
+const LEGACY_DUMMY_IDS = new Set([
+  'usr_4ded0839b7362a78',
+  'usr_0c02d70383c253c0',
+  'usr_a46618dc4d7f00f7',
+  'usr_6446096a89282dee',
+  'usr_c090e3c27c0a4942',
+  'usr_fb6d7994486221e0',
+  'usr_elena',
+  'usr_marcus',
+  'usr_sora',
+  'usr_priya',
+  'usr_arjun',
+  'usr_maya',
+  'usr_vikram',
+  'usr_ananya',
+  'usr_rohan',
+  'usr_kiran',
+  'usr_alex',
+  'usr_me',
+  'chat_1',
+  'chat_2',
+  'chat_3',
+  'chat_4',
+  'chat_5',
+  'chat_group_1',
+  'dir_1',
+  'dir_2',
+  'dir_3',
+  'dir_4',
+  'dir_5',
+  'dir_6',
+  'dir_7',
+  'dir_8',
+]);
+
+export function isLegacyDummyRecord(item: {
+  id?: string;
+  uid?: string;
+  peerUid?: string;
+  username?: string;
+  name?: string;
+  contactName?: string;
+}): boolean {
+  if (!item) return false;
+  const id = (item.uid || item.id || item.peerUid || '').trim();
+  if (id && (LEGACY_DUMMY_IDS.has(id) || id.startsWith('usr_demo') || id.startsWith('usr_seed') || id.startsWith('dir_'))) {
+    return true;
+  }
+  const uname = (item.username || '').trim().toLowerCase().replace(/^@/, '');
+  if (uname && (LEGACY_DUMMY_USERNAMES.has(uname) || /^alice_[a-f0-9]{4}$/.test(uname) || /^bob_[a-f0-9]{4}$/.test(uname))) {
+    return true;
+  }
+  const nm = (item.name || item.contactName || '').trim().toLowerCase();
+  if (nm && (LEGACY_DUMMY_NAMES.has(nm) || /^alice [a-f0-9]{4}$/.test(nm) || /^bob [a-f0-9]{4}$/.test(nm))) {
+    return true;
+  }
+  return false;
+}
+
 export const INITIAL_SETTINGS: AppSettings = {
   lastSeenVisibility: 'contacts',
   onlineStatusVisibility: 'same_as_last_seen',

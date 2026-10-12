@@ -8,7 +8,9 @@ import {
   EyeOff,
   KeyRound,
   Lock,
+  Mail,
   QrCode,
+  RefreshCw,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -21,6 +23,15 @@ import { AppSettings, ChatConversation, UserAccount } from '../types/simple';
 import { PRESET_PROFILE_PHOTOS, UserAvatar } from './ProfilePhotoModal';
 import { apiFetch, generateBase32Secret } from '../utils/androidBridge';
 import { sha256HexSync } from '../data/initialState';
+import { auth, googleProvider, signInWithPopup } from '../firebase';
+
+interface DetectedGoogleAccount {
+  email: string;
+  name: string;
+  picture?: string;
+  source: 'firebase_device' | 'android_account_manager' | 'saved_device' | 'oauth_verified';
+  oauthVerified?: boolean;
+}
 
 interface OnboardingModalProps {
   account: UserAccount;
@@ -42,7 +53,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   onCancel,
 }) => {
   const [step, setStep] = useState<1 | 2>(1);
-  const [mode, setMode] = useState<'register' | 'login'>('register');
+  const [mode, setMode] = useState<'register' | 'login' | 'google'>('register');
 
   // Fields
   const [name, setName] = useState(account.name || '');
@@ -55,6 +66,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const [avatarUrl, setAvatarUrl] = useState<string | undefined>(
     account.avatarUrl || PRESET_PROFILE_PHOTOS[0].url
   );
+
+  // Device Google Account auto-detection state
+  const [detectedGoogleAccounts, setDetectedGoogleAccounts] = useState<DetectedGoogleAccount[]>([]);
+  const [selectedGoogleAccount, setSelectedGoogleAccount] = useState<DetectedGoogleAccount | null>(null);
+  const [manualGoogleEmail, setManualGoogleEmail] = useState('');
+  const [isScanningGoogle, setIsScanningGoogle] = useState(false);
 
   // Username validation state
   const [usernameAvailable, setUsernameAvailable] = useState<boolean | null>(null);
@@ -74,6 +91,153 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   // Status & errors
   const [isLoading, setIsLoading] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+
+  // Auto-detect Google accounts on the device (Android AccountManager bridge, Firebase Auth session, saved device accounts)
+  const scanDeviceGoogleAccounts = () => {
+    setIsScanningGoogle(true);
+    const list: DetectedGoogleAccount[] = [];
+    const seen = new Set<string>();
+
+    const addAccount = (acc: DetectedGoogleAccount) => {
+      const clean = (acc.email || '').trim().toLowerCase();
+      if (!clean || !clean.includes('@') || seen.has(clean)) return;
+      seen.add(clean);
+      list.push({ ...acc, email: clean });
+    };
+
+    try {
+      // 1. Check active Firebase Auth user on device
+      if (auth.currentUser && auth.currentUser.email) {
+        addAccount({
+          email: auth.currentUser.email,
+          name: auth.currentUser.displayName || auth.currentUser.email.split('@')[0],
+          picture: auth.currentUser.photoURL || undefined,
+          source: 'firebase_device',
+          oauthVerified: true,
+        });
+      }
+
+      // 2. Check Native Android WebView bridge if running inside Android APK
+      const winAny = window as any;
+      if (winAny.SimpleAndroidBridge && typeof winAny.SimpleAndroidBridge.getDeviceGoogleAccounts === 'function') {
+        const rawAndroidAccounts = winAny.SimpleAndroidBridge.getDeviceGoogleAccounts();
+        const parsedAndroid = typeof rawAndroidAccounts === 'string' ? JSON.parse(rawAndroidAccounts) : rawAndroidAccounts;
+        if (Array.isArray(parsedAndroid)) {
+          parsedAndroid.forEach((item: any) => {
+            const emailStr = typeof item === 'string' ? item : item?.email;
+            if (emailStr) {
+              addAccount({
+                email: emailStr,
+                name: item?.name || emailStr.split('@')[0],
+                picture: item?.picture,
+                source: 'android_account_manager',
+              });
+            }
+          });
+        }
+      }
+
+      // 3. Check previously detected / linked Google accounts on this device
+      const rawSaved = localStorage.getItem('simple_device_google_accounts_v1');
+      if (rawSaved) {
+        const parsedSaved = JSON.parse(rawSaved);
+        if (Array.isArray(parsedSaved)) {
+          parsedSaved.forEach((item: any) => {
+            if (item && item.email) {
+              addAccount({
+                email: item.email,
+                name: item.name || item.email.split('@')[0],
+                picture: item.picture,
+                source: 'saved_device',
+                oauthVerified: Boolean(item.oauthVerified),
+              });
+            }
+          });
+        }
+      }
+
+      // 4. Check current account email if it's a Google email
+      if (account.email && account.email.includes('@')) {
+        addAccount({
+          email: account.email,
+          name: account.name || account.email.split('@')[0],
+          picture: account.avatarUrl,
+          source: 'saved_device',
+        });
+      }
+    } catch {
+      // Ignore storage errors
+    }
+
+    setDetectedGoogleAccounts(list);
+    if (list.length > 0 && !selectedGoogleAccount) {
+      setSelectedGoogleAccount(list[0]);
+      if (!name) setName(list[0].name);
+      if (!username) {
+        setUsername(
+          list[0].email
+            .split('@')[0]
+            .toLowerCase()
+            .replace(/[^a-z0-9._-]/g, '')
+        );
+      }
+    }
+    setTimeout(() => setIsScanningGoogle(false), 250);
+  };
+
+  useEffect(() => {
+    scanDeviceGoogleAccounts();
+  }, []);
+
+  const persistDeviceGoogleAccount = (acc: DetectedGoogleAccount) => {
+    try {
+      const raw = localStorage.getItem('simple_device_google_accounts_v1');
+      const existing: DetectedGoogleAccount[] = raw ? JSON.parse(raw) : [];
+      const filtered = existing.filter((x) => x.email.toLowerCase() !== acc.email.toLowerCase());
+      filtered.unshift(acc);
+      localStorage.setItem('simple_device_google_accounts_v1', JSON.stringify(filtered.slice(0, 6)));
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleTriggerGoogleAccountChooser = async () => {
+    setErrorBanner(null);
+    setIsLoading(true);
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const gUser = cred.user;
+      if (gUser && gUser.email) {
+        const detected: DetectedGoogleAccount = {
+          email: gUser.email.toLowerCase(),
+          name: gUser.displayName || gUser.email.split('@')[0],
+          picture: gUser.photoURL || undefined,
+          source: 'oauth_verified',
+          oauthVerified: true,
+        };
+        persistDeviceGoogleAccount(detected);
+        setDetectedGoogleAccounts((prev) => [
+          detected,
+          ...prev.filter((a) => a.email !== detected.email),
+        ]);
+        setSelectedGoogleAccount(detected);
+        setName(detected.name);
+        setUsername(
+          detected.email
+            .split('@')[0]
+            .toLowerCase()
+            .replace(/[^a-z0-9._-]/g, '')
+        );
+        if (detected.picture) setAvatarUrl(detected.picture);
+        setMode('google');
+      }
+    } catch {
+      // In Android WebView or environments where popup is blocked, switch to Google Account tab so user can select or enter their device Google account and verify via Google Authenticator
+      setMode('google');
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   // Check URL or session for invite
   useEffect(() => {
@@ -196,6 +360,90 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       return;
     }
 
+    if (mode === 'google') {
+      const targetEmail = (selectedGoogleAccount?.email || manualGoogleEmail || '').trim().toLowerCase();
+      if (!targetEmail || !targetEmail.includes('@')) {
+        setErrorBanner('Please select a detected Google account or enter your Google email.');
+        return;
+      }
+      if (!cleanUser || cleanUser.length < 3) {
+        setErrorBanner('Please choose a unique @username (min 3 characters).');
+        return;
+      }
+
+      if (!selectedGoogleAccount) {
+        const added: DetectedGoogleAccount = {
+          email: targetEmail,
+          name: name.trim() || targetEmail.split('@')[0],
+          source: 'saved_device',
+        };
+        setSelectedGoogleAccount(added);
+        persistDeviceGoogleAccount(added);
+      }
+
+      // If already OAuth verified via Google Sign-In popup, we can create/sign-in directly or let them enroll TOTP
+      if (selectedGoogleAccount?.oauthVerified) {
+        setIsLoading(true);
+        try {
+          const res = await apiFetch('/api/auth/google-account', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email: targetEmail,
+              name: name.trim() || selectedGoogleAccount.name || cleanUser,
+              username: cleanUser,
+              avatarUrl,
+              avatarColor,
+              googleVerified: true,
+              identityFingerprint: localFingerprint,
+            }),
+          });
+          const data = await res.json();
+          if (res.ok && data.ok) {
+            const googleAcct: UserAccount = {
+              id: data.user.uid,
+              name: data.user.name,
+              username: data.user.username,
+              phone: data.user.phone || '',
+              normalizedPhone: data.user.normalizedPhone || '',
+              email: data.user.email || targetEmail,
+              authMethod: 'google',
+              verificationToken: data.sessionToken,
+              about: data.user.about || about,
+              avatarColor: data.user.avatarColor || avatarColor,
+              avatarUrl: data.user.avatarUrl || avatarUrl,
+              allowUsernameDiscovery: true,
+              hidePhoneNumber: true,
+              onboardingCompleted: true,
+            };
+            if (invitedBy && invitedBy !== googleAcct.username) {
+              apiFetch('/api/friends/request', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  fromUid: data.user.uid,
+                  toUsername: invitedBy,
+                }),
+              }).catch(() => {});
+            }
+            onComplete(googleAcct, {
+              ...settings,
+              cloudBackupAccountEmail: targetEmail,
+            });
+            return;
+          }
+        } catch {
+          // Fall back to Google Authenticator verification for this Google account
+        } finally {
+          setIsLoading(false);
+        }
+      }
+
+      await initTotpEnrollment(targetEmail);
+      setStep(2);
+      return;
+    }
+
     if (password.length < 6) {
       setErrorBanner('Password must be at least 6 characters long.');
       return;
@@ -261,10 +509,71 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
 
     const cleanUser = username.toLowerCase().trim().replace(/^@/, '');
-    const pwdHash = sha256HexSync(`simple_pw_salt_v1:${cleanUser}:${password}`);
+    const pwdHash = sha256HexSync(`simple_pw_salt_v1:${cleanUser}:${password || cleanUser}`);
     setIsLoading(true);
 
     try {
+      if (mode === 'google') {
+        const targetEmail = (selectedGoogleAccount?.email || manualGoogleEmail || '').trim().toLowerCase();
+        const res = await apiFetch('/api/auth/google-account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: targetEmail,
+            name: name.trim() || selectedGoogleAccount?.name || cleanUser,
+            username: cleanUser,
+            avatarUrl,
+            avatarColor,
+            passwordHash: pwdHash,
+            totpSecret,
+            totpCode: cleanCode,
+            identityFingerprint: localFingerprint,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          setErrorBanner(data.error || 'Invalid 6-digit Google Authenticator code.');
+          setIsLoading(false);
+          return;
+        }
+
+        const googleAcct: UserAccount = {
+          id: data.user.uid,
+          name: data.user.name,
+          username: data.user.username,
+          phone: data.user.phone || '',
+          normalizedPhone: data.user.normalizedPhone || '',
+          email: data.user.email || targetEmail,
+          authMethod: 'google',
+          passwordHash: pwdHash,
+          totpSecret,
+          verificationToken: data.sessionToken,
+          about: data.user.about || about,
+          avatarColor: data.user.avatarColor || avatarColor,
+          avatarUrl: data.user.avatarUrl || avatarUrl,
+          allowUsernameDiscovery: true,
+          hidePhoneNumber: true,
+          onboardingCompleted: true,
+        };
+
+        if (invitedBy && invitedBy !== googleAcct.username) {
+          apiFetch('/api/friends/request', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fromUid: data.user.uid,
+              toUsername: invitedBy,
+            }),
+          }).catch(() => {});
+        }
+
+        onComplete(googleAcct, {
+          ...settings,
+          cloudBackupAccountEmail: targetEmail,
+        });
+        return;
+      }
+
       if (mode === 'register') {
         const res = await apiFetch('/api/auth/register-totp', {
           method: 'POST',
@@ -441,7 +750,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         {/* Mode Switch (Only on Step 1) */}
         {step === 1 && (
           <div className="px-5 pt-3">
-            <div className="flex p-1 bg-slate-950 rounded-xl border border-slate-800 text-xs font-semibold">
+            <div className="flex p-1 bg-slate-950 rounded-xl border border-slate-800 text-xs font-semibold gap-1">
               <button
                 type="button"
                 onClick={() => {
@@ -472,6 +781,22 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 <KeyRound className="w-3.5 h-3.5" />
                 <span>Sign In</span>
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMode('google');
+                  setErrorBanner(null);
+                  scanDeviceGoogleAccounts();
+                }}
+                className={`flex-1 py-2 rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                  mode === 'google'
+                    ? 'bg-emerald-500 text-slate-950 font-bold shadow-md'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Mail className="w-3.5 h-3.5" />
+                <span>Google Account</span>
+              </button>
             </div>
           </div>
         )}
@@ -487,7 +812,160 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
         {/* Step 1: Form Details */}
         {step === 1 && (
           <form onSubmit={handleProceedToStep2} className="p-5 space-y-4 overflow-y-auto flex-1">
-            {mode === 'register' && (
+            {mode !== 'google' && (
+              <div className="p-3 rounded-2xl bg-slate-950/90 border border-emerald-500/25 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+                    <Mail className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-bold text-white truncate">
+                      {detectedGoogleAccounts.length > 0
+                        ? `Device Google Account: ${detectedGoogleAccounts[0].email}`
+                        : 'Use Google Account on Device'}
+                    </p>
+                    <p className="text-[10px] text-slate-400 truncate">
+                      Auto-detects your device Google account for fast signup/login
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('google');
+                    scanDeviceGoogleAccounts();
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[11px] font-bold shrink-0 transition-colors"
+                >
+                  Use Google
+                </button>
+              </div>
+            )}
+
+            {mode === 'google' && (
+              <div className="space-y-3">
+                <div className="p-3.5 rounded-2xl bg-slate-950 border border-emerald-500/30 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Mail className="w-4 h-4 text-emerald-400" />
+                      <span className="text-xs font-bold text-white">
+                        Detected Google Accounts on Device
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={scanDeviceGoogleAccounts}
+                      className="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isScanningGoogle ? 'animate-spin' : ''}`} />
+                      <span>Rescan</span>
+                    </button>
+                  </div>
+
+                  {detectedGoogleAccounts.length > 0 ? (
+                    <div className="space-y-2">
+                      {detectedGoogleAccounts.map((acc) => {
+                        const isSelected = selectedGoogleAccount?.email === acc.email;
+                        return (
+                          <button
+                            key={acc.email}
+                            type="button"
+                            onClick={() => {
+                              setSelectedGoogleAccount(acc);
+                              setManualGoogleEmail(acc.email);
+                              setName(acc.name);
+                              setUsername(
+                                acc.email
+                                  .split('@')[0]
+                                  .toLowerCase()
+                                  .replace(/[^a-z0-9._-]/g, '')
+                              );
+                              if (acc.picture) setAvatarUrl(acc.picture);
+                            }}
+                            className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between gap-2.5 transition-all ${
+                              isSelected
+                                ? 'bg-emerald-500/15 border-emerald-500/50 text-white'
+                                : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <UserAvatar
+                                name={acc.name || acc.email}
+                                avatarUrl={acc.picture}
+                                avatarColor="#10B981"
+                                sizeClass="w-9 h-9"
+                              />
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-white truncate">{acc.name}</p>
+                                <p className="text-[11px] text-emerald-400 font-mono truncate">
+                                  {acc.email}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="shrink-0 flex items-center gap-1.5">
+                              {acc.oauthVerified && (
+                                <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold">
+                                  Verified
+                                </span>
+                              )}
+                              {isSelected && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-400">
+                      Tap below to auto-detect your Google account from this device or enter your Google Account email.
+                    </p>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleTriggerGoogleAccountChooser}
+                    className="w-full py-2.5 px-3 rounded-xl bg-white hover:bg-slate-100 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition-all"
+                  >
+                    <Mail className="w-4 h-4 text-emerald-600" />
+                    <span>Detect / Choose Google Account from Device</span>
+                  </button>
+
+                  <div className="space-y-1 pt-1">
+                    <label className="text-[11px] font-semibold text-slate-400">
+                      Or confirm device Google Account Email:
+                    </label>
+                    <input
+                      type="email"
+                      value={selectedGoogleAccount?.email || manualGoogleEmail}
+                      onChange={(e) => {
+                        const val = e.target.value.trim().toLowerCase();
+                        setManualGoogleEmail(val);
+                        setSelectedGoogleAccount(
+                          val
+                            ? {
+                                email: val,
+                                name: name || val.split('@')[0],
+                                source: 'saved_device',
+                              }
+                            : null
+                        );
+                        if (val.includes('@') && !username) {
+                          setUsername(
+                            val
+                              .split('@')[0]
+                              .toLowerCase()
+                              .replace(/[^a-z0-9._-]/g, '')
+                          );
+                        }
+                      }}
+                      placeholder="your.account@gmail.com"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {(mode === 'register' || mode === 'google') && (
               <>
                 {/* Avatar Picker */}
                 <div className="flex flex-col items-center justify-center py-2">
@@ -582,28 +1060,30 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               )}
             </div>
 
-            {/* Password */}
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-300">Account Password</label>
-              <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 focus-within:border-emerald-500/50">
-                <Lock className="w-4 h-4 text-slate-400" />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password (min 6 chars)"
-                  className="w-full bg-transparent text-sm text-white placeholder-slate-500 focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="p-1 text-slate-400 hover:text-white"
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
+            {/* Password (for username/password modes) */}
+            {mode !== 'google' && (
+              <div className="space-y-1">
+                <label className="text-xs font-semibold text-slate-300">Account Password</label>
+                <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 focus-within:border-emerald-500/50">
+                  <Lock className="w-4 h-4 text-slate-400" />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter password (min 6 chars)"
+                    className="w-full bg-transparent text-sm text-white placeholder-slate-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="p-1 text-slate-400 hover:text-white"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Confirm Password (Register only) */}
             {mode === 'register' && (
@@ -627,8 +1107,15 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
             <div className="p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 text-[11px] text-slate-400 flex items-start gap-2.5">
               <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <span>
-                <strong>Zero Phone/Email Required:</strong> Only your unique @username and password
-                authenticated by Google Authenticator (TOTP) are stored to prevent account misuse.
+                {mode === 'google' ? (
+                  <>
+                    <strong>Verified Google Account:</strong> Your device Google account is verified with Google Sign-In or Google Authenticator before creating or signing into your Simple account.
+                  </>
+                ) : (
+                  <>
+                    <strong>Zero Phone/Email Required:</strong> Only your unique @username and password authenticated by Google Authenticator (TOTP) are stored to prevent account misuse.
+                  </>
+                )}
               </span>
             </div>
 
@@ -642,7 +1129,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 'Checking...'
               ) : (
                 <>
-                  <span>Continue with Google Authenticator</span>
+                  <span>
+                    {mode === 'google'
+                      ? 'Continue with Google Account'
+                      : 'Continue with Google Authenticator'}
+                  </span>
                   <Smartphone className="w-4 h-4" />
                 </>
               )}
@@ -656,7 +1147,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
             onSubmit={handleFinalizeVerification}
             className="p-5 space-y-4 overflow-y-auto flex-1 flex flex-col"
           >
-            {mode === 'register' ? (
+            {mode === 'register' || mode === 'google' ? (
               <>
                 <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 text-center flex flex-col items-center">
                   <div className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-bold rounded-full mb-3">

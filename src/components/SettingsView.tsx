@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import QRCode from 'qrcode';
 import {
   User,
   Lock,
@@ -34,6 +35,8 @@ import {
   Upload,
   Camera,
   Share2,
+  Copy,
+  QrCode,
 } from 'lucide-react';
 import {
   InlineProfilePhotoEditor,
@@ -79,7 +82,7 @@ import {
   DriveBackupFileMetadata,
 } from '../firebase';
 import { AndroidInstallButton } from '../hooks/usePWAInstall';
-import { apiFetch } from '../utils/androidBridge';
+import { apiFetch, generateBase32Secret } from '../utils/androidBridge';
 
 interface SettingsViewProps {
   account: UserAccount;
@@ -181,21 +184,38 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     );
   };
 
-  // OTP Verification States for Changing Mobile Number or Email in Account Settings
-  const [pendingPhone, setPendingPhone] = useState(account.phone);
+  // Google Authenticator Verification States for Cloud Backup Email
   const [pendingEmail, setPendingEmail] = useState(account.email || '');
-  const [phoneOtpCode, setPhoneOtpCode] = useState('');
   const [emailOtpCode, setEmailOtpCode] = useState('');
-  const [dispatchedPhoneOtp, setDispatchedPhoneOtp] = useState<string | null>(null);
   const [dispatchedEmailOtp, setDispatchedEmailOtp] = useState<string | null>(null);
+  const [backupTotpSecret, setBackupTotpSecret] = useState<string>(account.totpSecret || '');
+  const [backupTotpQrUrl, setBackupTotpQrUrl] = useState<string>('');
+  const [copiedBackupSecret, setCopiedBackupSecret] = useState(false);
   const [otpErrorMsg, setOtpErrorMsg] = useState<string | null>(null);
   const [isSendingOtp, setIsSendingOtp] = useState(false);
 
-  useEffect(() => {
-    setPendingPhone(account.phone);
-    setDispatchedPhoneOtp(null);
-    setPhoneOtpCode('');
-  }, [account.phone]);
+  // Instagram-style Privacy states (persisted in localStorage & settings)
+  const [isPrivateAccount, setIsPrivateAccount] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('simple_ig_private_account_v1') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [messageRequestPolicy, setMessageRequestPolicy] = useState<'everyone' | 'mutual_friends' | 'friends_only'>(() => {
+    try {
+      return (localStorage.getItem('simple_ig_msg_request_policy_v1') as any) || 'everyone';
+    } catch {
+      return 'everyone';
+    }
+  });
+  const [storyReplyPolicy, setStoryReplyPolicy] = useState<'everyone' | 'friends' | 'off'>(() => {
+    try {
+      return (localStorage.getItem('simple_ig_story_reply_policy_v1') as any) || 'friends';
+    } catch {
+      return 'friends';
+    }
+  });
 
   useEffect(() => {
     setPendingEmail(account.email || '');
@@ -203,128 +223,86 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setEmailOtpCode('');
   }, [account.email]);
 
-  const isPhoneChanged =
-    normalizePhone(pendingPhone) !== normalizePhone(account.phone) ||
-    pendingPhone.trim() !== account.phone.trim();
-  const isEmailChanged =
-    pendingEmail.trim().toLowerCase() !== (account.email || '').trim().toLowerCase();
-
-  const handleRequestSettingsOtp = async (channel: 'phone' | 'email') => {
+  const handleStartEmailTotpSetup = async () => {
     setOtpErrorMsg(null);
-    const target = channel === 'phone' ? pendingPhone.trim() : pendingEmail.trim();
+    const cleanMail = pendingEmail.trim().toLowerCase();
+    if (!cleanMail || !cleanMail.includes('@') || !cleanMail.includes('.')) {
+      setOtpErrorMsg('Please enter a valid email address (e.g., yourname@gmail.com) for Cloud Backup.');
+      return;
+    }
     setIsSendingOtp(true);
     try {
-      const res = await apiFetch('/api/auth/request-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          channel,
-          identifier: target,
-          mode: 'change_identifier',
-        }),
+      const secretToUse = account.totpSecret || backupTotpSecret || generateBase32Secret(20);
+      setBackupTotpSecret(secretToUse);
+      const label = encodeURIComponent(`SimpleBackup:${cleanMail}`);
+      const uri = `otpauth://totp/${label}?secret=${secretToUse}&issuer=Simple&algorithm=SHA1&digits=6&period=30`;
+      const qr = await QRCode.toDataURL(uri, {
+        width: 200,
+        margin: 1,
+        color: { dark: '#020617', light: '#ffffff' },
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        if (account.totpSecret) {
-          if (channel === 'phone') {
-            setDispatchedPhoneOtp('AWAITING_VERIFICATION');
-          } else {
-            setDispatchedEmailOtp('AWAITING_VERIFICATION');
-          }
-          setProfileSyncFeedback(
-            'Enter the 6-digit code from your linked Authenticator App (TOTP) below to verify this change.'
-          );
-        } else {
-          setOtpErrorMsg(
-            data.error ||
-              `Failed to dispatch ${channel} OTP. Configure live SMTP/SMS gateway or link an Authenticator App.`
-          );
-        }
-      } else if (channel === 'phone') {
-        setDispatchedPhoneOtp('AWAITING_VERIFICATION');
-        setProfileSyncFeedback(
-          data.message || `Dispatched real 6-digit SMS code to ${data.maskedTarget || target}.`
-        );
-      } else {
-        setDispatchedEmailOtp('AWAITING_VERIFICATION');
-        setProfileSyncFeedback(
-          data.message || `Dispatched real 6-digit Email code to ${data.maskedTarget || target}.`
-        );
-      }
+      setBackupTotpQrUrl(qr);
+      setDispatchedEmailOtp('AWAITING_TOTP_VERIFICATION');
+      setProfileSyncFeedback(
+        `Scan or enter the Google Authenticator key for ${cleanMail}, then enter the 6-digit code to verify ownership.`
+      );
     } catch {
-      setOtpErrorMsg('Network error while requesting verification OTP.');
+      setOtpErrorMsg('Could not initialize Google Authenticator setup for this email.');
     } finally {
       setIsSendingOtp(false);
     }
   };
 
-  const handleVerifySettingsOtp = async (channel: 'phone' | 'email') => {
+  const handleVerifyEmailTotpBackup = async () => {
     setOtpErrorMsg(null);
-    const target = channel === 'phone' ? pendingPhone.trim() : pendingEmail.trim();
-    const code = channel === 'phone' ? phoneOtpCode.trim() : emailOtpCode.trim();
+    const cleanMail = pendingEmail.trim().toLowerCase();
+    const code = emailOtpCode.trim().replace(/\D/g, '');
     if (code.length !== 6) {
-      setOtpErrorMsg('Please enter the 6-digit verification code.');
+      setOtpErrorMsg('Please enter the 6-digit verification code from your Google Authenticator app.');
       return;
     }
     setIsSendingOtp(true);
     try {
-      const res = await apiFetch('/api/auth/verify-otp', {
+      const res = await apiFetch('/api/auth/verify-totp-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          channel,
-          identifier: target,
+          uid: account.id,
+          email: cleanMail,
+          totpSecret: backupTotpSecret || account.totpSecret,
           code,
-          mode: 'change_identifier',
-          totpSecret: account.totpSecret,
         }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setOtpErrorMsg(data.error || 'Invalid or expired 6-digit verification code.');
+        setOtpErrorMsg(
+          data.error || 'Invalid 6-digit Google Authenticator code. Please check your Authenticator app.'
+        );
         setIsSendingOtp(false);
         return;
       }
-      if (channel === 'phone') {
-        onUpdateAccount({
-          phone: pendingPhone.trim(),
-          normalizedPhone: normalizePhone(pendingPhone),
-          phoneVerified: true,
-          authMethod: account.emailVerified ? 'both' : 'phone_otp',
-        });
-        setDispatchedPhoneOtp(null);
-        setPhoneOtpCode('');
-        setProfileSyncFeedback(
-          `Verified mobile number ${pendingPhone.trim()} via SMS OTP and updated your account!`
-        );
-      } else {
-        const cleanMail = pendingEmail.trim().toLowerCase();
-        onUpdateAccount({
-          email: cleanMail,
-          emailVerified: true,
-          cloudBackupGmail: cleanMail.endsWith('@gmail.com') ? cleanMail : account.cloudBackupGmail,
-          authMethod: account.phoneVerified ? 'both' : 'gmail_otp',
-        });
-        if (cleanMail.endsWith('@gmail.com')) {
-          onUpdateSettings({
-            cloudBackupGmail: cleanMail,
-            cloudBackupGmailVerified: true,
-          });
-          setGoogleUserEmail(cleanMail);
-        }
-        setDispatchedEmailOtp(null);
-        setEmailOtpCode('');
-        setProfileSyncFeedback(
-          `Verified ${cleanMail} via OTP! ${
-            cleanMail.endsWith('@gmail.com')
-              ? 'Linked for Google Drive & Gmail Cloud Backup.'
-              : ''
-          }`
-        );
-      }
+
+      onUpdateAccount({
+        email: cleanMail,
+        emailVerified: true,
+        totpSecret: data.totpSecret || backupTotpSecret || account.totpSecret,
+        cloudBackupGmail: cleanMail,
+        authMethod: 'totp',
+      });
+      onUpdateSettings({
+        cloudBackupAccountEmail: cleanMail,
+        cloudBackupGmail: cleanMail,
+        cloudBackupGmailVerified: true,
+      });
+      setGoogleUserEmail(cleanMail);
+      setDispatchedEmailOtp(null);
+      setEmailOtpCode('');
+      setProfileSyncFeedback(
+        `Verified ${cleanMail} with Google Authenticator! This email is now authorized for Cloud Backup.`
+      );
       setTimeout(() => setProfileSyncFeedback(null), 4500);
     } catch {
-      setOtpErrorMsg('Failed to verify OTP.');
+      setOtpErrorMsg('Failed to verify Google Authenticator code.');
     } finally {
       setIsSendingOtp(false);
     }
@@ -765,21 +743,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             {/* Account Auth Method Summary Banner */}
             <div className="p-3.5 rounded-2xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-slate-400 font-medium">Active Login Method:</span>
-                {account.phone && (
-                  <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold flex items-center gap-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Phone OTP ({account.phone})
-                  </span>
-                )}
-                {account.email && account.email.toLowerCase().endsWith('@gmail.com') ? (
+                <span className="text-slate-400 font-medium">Active Authentication:</span>
+                <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  @{account.username} · Google Authenticator (TOTP)
+                </span>
+                {account.email ? (
                   <span className="px-2.5 py-1 rounded-full bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 font-semibold flex items-center gap-1">
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                    Gmail OTP & Cloud Backup ({account.email})
+                    Cloud Backup Email ({account.email})
                   </span>
                 ) : (
                   <span className="px-2.5 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 font-semibold">
-                    No Gmail Linked for Cloud Backup
+                    No Email Linked for Cloud Backup
                   </span>
                 )}
               </div>
@@ -788,7 +764,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onClick={onOpenOnboarding}
                 className="text-emerald-400 hover:underline font-semibold"
               >
-                Re-run OTP Setup →
+                Switch / Create Account →
               </button>
             </div>
 
@@ -925,24 +901,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="space-y-2 border-t border-slate-800/80 pt-4">
               <label className="flex items-center justify-between py-2 cursor-pointer">
                 <div>
-                  <div className="text-sm font-medium">Hide Phone Number Display in Public Profile</div>
+                  <div className="text-sm font-medium">Allow @Username Discovery in Search & Suggestions</div>
                   <div className="text-xs text-slate-400">
-                    Friends who already saved your mobile number can still message you, while strangers searching by `@username` only see your handle.
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={account.hidePhoneNumber}
-                  onChange={(e) => onUpdateAccount({ hidePhoneNumber: e.target.checked })}
-                  className="w-4 h-4 accent-emerald-500"
-                />
-              </label>
-
-              <label className="flex items-center justify-between py-2 cursor-pointer">
-                <div>
-                  <div className="text-sm font-medium">Allow Username, Phone & Email Discovery</div>
-                  <div className="text-xs text-slate-400">
-                    Let friends find and message you using `@{account.username}`, `{account.phone}`, or `{account.email}`.
+                    Let people on Simple find your profile by searching `@{account.username}` and send you Friend Requests or Message Requests (just like Instagram).
                   </div>
                 </div>
                 <input
@@ -1346,14 +1307,127 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
-        {/* 3. PRIVACY */}
+        {/* 3. PRIVACY (Instagram-Style Account & Messaging Privacy) */}
         {activeSection === 'privacy' && (
           <div className="space-y-6">
             <div>
-              <h3 className="text-lg font-bold tracking-tight">Online Privacy & Visibility</h3>
+              <h3 className="text-lg font-bold tracking-tight">Account Privacy, Message Requests & Activity Status</h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Control who can see when you are online, your last seen timestamp, profile photo, and blue read ticks.
+                Instagram-style privacy controls for your `@username` profile, Friend Requests, Message Requests, Stories, and Activity Status.
               </p>
+            </div>
+
+            {/* Instagram-Style Private Account & Message Requests Control Card */}
+            <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/80 border border-emerald-500/30 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400">
+                    <Lock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="text-sm font-bold text-white flex items-center gap-2">
+                      <span>Account Privacy & Message Requests</span>
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                          isPrivateAccount
+                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                            : 'bg-cyan-500/15 border-cyan-500/30 text-cyan-300'
+                        }`}
+                      >
+                        {isPrivateAccount ? 'Private Account 🔒' : 'Public Account 🌐'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Control who can follow/friend you, view your stories, and send you direct messages vs. message requests.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <label className="flex items-start justify-between gap-4 p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 cursor-pointer">
+                <div>
+                  <div className="text-xs sm:text-sm font-semibold text-white">
+                    Private Account (Approve Friends Before Direct Messaging)
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+                    When your account is Private, only approved Friends can see your Stories/Status and chat with you in your Primary Inbox. Messages from non-friends go to your <strong>Message Requests</strong> tab where you can Accept or Decline them without triggering read receipts.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={isPrivateAccount}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    setIsPrivateAccount(next);
+                    try {
+                      localStorage.setItem('simple_ig_private_account_v1', String(next));
+                    } catch {
+                      // ignore
+                    }
+                    if (next) {
+                      onUpdateSettings({
+                        statusVisibility: 'contacts',
+                        lastSeenVisibility: 'contacts',
+                      });
+                    }
+                  }}
+                  className="w-5 h-5 mt-0.5 accent-emerald-500 shrink-0"
+                />
+              </label>
+
+              <div className="grid sm:grid-cols-2 gap-3.5">
+                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2">
+                  <label className="block text-xs font-semibold text-emerald-300">
+                    Who Can Send Message Requests
+                  </label>
+                  <select
+                    value={messageRequestPolicy}
+                    onChange={(e) => {
+                      const val = e.target.value as 'everyone' | 'mutual_friends' | 'friends_only';
+                      setMessageRequestPolicy(val);
+                      try {
+                        localStorage.setItem('simple_ig_msg_request_policy_v1', val);
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                    className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                  >
+                    <option value="everyone">Everyone on Simple (Goes to Requests)</option>
+                    <option value="mutual_friends">Accounts with Mutual Friends Only</option>
+                    <option value="friends_only">No One (Approved Friends Only)</option>
+                  </select>
+                  <p className="text-[10px] text-slate-400">
+                    Non-friends never see your read receipts or online status until you accept their request.
+                  </p>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2">
+                  <label className="block text-xs font-semibold text-cyan-300">
+                    Who Can Reply to Your Stories / Status
+                  </label>
+                  <select
+                    value={storyReplyPolicy}
+                    onChange={(e) => {
+                      const val = e.target.value as 'everyone' | 'friends' | 'off';
+                      setStoryReplyPolicy(val);
+                      try {
+                        localStorage.setItem('simple_ig_story_reply_policy_v1', val);
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                    className="w-full rounded-xl bg-slate-900 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
+                  >
+                    <option value="everyone">Everyone Who Can View Story</option>
+                    <option value="friends">Approved Friends Only</option>
+                    <option value="off">Turn Off Story Replies</option>
+                  </select>
+                  <p className="text-[10px] text-slate-400">
+                    Story replies appear directly as a quoted message in your chat thread.
+                  </p>
+                </div>
+              </div>
             </div>
 
             {/* Dedicated Online Status & Last Seen Privacy Card */}
@@ -1706,9 +1780,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="grid sm:grid-cols-3 gap-4">
               {(
                 [
-                  { key: 'profilePhotoVisibility', label: 'Who can see my Profile Photo' },
-                  { key: 'aboutVisibility', label: 'Who can see my About / Bio' },
-                  { key: 'statusVisibility', label: 'Who can see my Status Updates' },
+                  { key: 'profilePhotoVisibility', label: 'Profile Photo Audience' },
+                  { key: 'aboutVisibility', label: 'Bio / About Audience' },
+                  { key: 'statusVisibility', label: 'Stories / Status Audience' },
                 ] as const
               ).map((item) => (
                 <div key={item.key} className="p-3.5 rounded-2xl bg-slate-900/60 border border-slate-800">
@@ -1721,9 +1795,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
                   >
                     <option value="everyone">Everyone</option>
-                    <option value="contacts">My Contacts Only</option>
-                    <option value="contacts_except">My Contacts Except…</option>
-                    <option value="nobody">Nobody</option>
+                    <option value="contacts">Friends Only</option>
+                    <option value="contacts_except">Close Friends / Custom…</option>
+                    <option value="nobody">Only Me (Private)</option>
                   </select>
                 </div>
               ))}
@@ -3630,24 +3704,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               ))}
             </div>
 
-            {/* Mandatory Gmail Verification Gate for Cloud Backup (Google Drive / Gmail) */}
-            <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/90 border border-cyan-500/30 space-y-3">
+            {/* Mandatory Google Authenticator Email Verification Gate for Cloud Backup */}
+            <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/90 border border-cyan-500/30 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-sm font-bold text-white flex items-center gap-2">
-                    <span>Gmail Account for Cloud Backup (Google Drive & Gmail)</span>
-                    {account.email && account.email.toLowerCase().endsWith('@gmail.com') ? (
+                    <Shield className="w-4 h-4 text-emerald-400" />
+                    <span>Email for Cloud Backup (Verified via Google Authenticator)</span>
+                    {account.email && account.email.includes('@') ? (
                       <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-[10px] font-semibold text-emerald-300">
-                        ✓ Verified ({account.email})
+                        ✓ Authenticator Verified ({account.email})
                       </span>
                     ) : (
                       <span className="px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-[10px] font-semibold text-amber-300">
-                        Gmail Required for Cloud Backup
+                        Verification Required
                       </span>
                     )}
                   </div>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    If you created your account with Phone Number OTP only, please link and verify your <code className="text-cyan-300">@gmail.com</code> address below to back up chats to Google Drive or Gmail.
+                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                    Add your email for Cloud Backup and verify it with <strong>Google Authenticator</strong> so only the person who owns this email in Google Authenticator can link it or back up data to it.
                   </p>
                 </div>
               </div>
@@ -3662,44 +3737,93 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     setOtpErrorMsg(null);
                   }}
                   placeholder="yourname@gmail.com"
-                  className="flex-1 min-w-[220px] rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2 text-xs font-mono text-cyan-300 focus:outline-none focus:border-cyan-500"
+                  className="flex-1 min-w-[220px] rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-xs font-mono text-cyan-300 focus:outline-none focus:border-cyan-500"
                 />
                 <button
                   type="button"
-                  onClick={() => {
-                    if (!pendingEmail.trim().toLowerCase().endsWith('@gmail.com')) {
-                      setDriveStatusMsg('Please enter a valid @gmail.com address for Google Drive / Gmail cloud backup.');
-                      return;
-                    }
-                    handleRequestSettingsOtp('email');
-                  }}
+                  onClick={handleStartEmailTotpSetup}
                   disabled={isSendingOtp}
-                  className="px-3.5 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold"
+                  className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 shadow-sm"
                 >
-                  {isSendingOtp ? 'Sending…' : 'Send Gmail OTP'}
+                  <Smartphone className="w-4 h-4" />
+                  <span>
+                    {isSendingOtp ? 'Preparing…' : 'Verify with Google Authenticator'}
+                  </span>
                 </button>
               </div>
 
+              {otpErrorMsg && (
+                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-xs text-rose-300">
+                  {otpErrorMsg}
+                </div>
+              )}
+
+              {profileSyncFeedback && (
+                <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-xs text-emerald-300 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <span>{profileSyncFeedback}</span>
+                </div>
+              )}
+
               {dispatchedEmailOtp && (
-                <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/40 space-y-2 text-xs">
-                  <div className="text-[11px] text-cyan-200">
-                    Enter the 6-digit verification code sent to your Gmail inbox or from your linked Authenticator App:
+                <div className="p-4 rounded-2xl bg-slate-950 border border-emerald-500/40 space-y-3 text-xs">
+                  <div className="flex flex-col sm:flex-row items-center gap-4">
+                    {backupTotpQrUrl && (
+                      <div className="p-2.5 bg-white rounded-xl shrink-0">
+                        <img
+                          src={backupTotpQrUrl}
+                          alt="Google Authenticator QR for Cloud Backup Email"
+                          className="w-32 h-32 object-contain"
+                        />
+                      </div>
+                    )}
+                    <div className="space-y-2 flex-1 min-w-0">
+                      <div className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                        <QrCode className="w-4 h-4" />
+                        <span>Authenticate {pendingEmail} in Google Authenticator</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        1. Open <strong>Google Authenticator</strong> under the same email (<code className="text-cyan-300">{pendingEmail}</code>) and scan this QR code or copy the setup key below.<br />
+                        2. Enter the 6-digit code shown in Google Authenticator to verify and lock this email for your Cloud Backup.
+                      </p>
+                      <div className="p-2 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between gap-2">
+                        <span className="font-mono text-[11px] text-emerald-300 truncate">
+                          {backupTotpSecret}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard?.writeText(backupTotpSecret);
+                            setCopiedBackupSecret(true);
+                            setTimeout(() => setCopiedBackupSecret(false), 2000);
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-emerald-300 flex items-center gap-1 shrink-0"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>{copiedBackupSecret ? 'Copied' : 'Copy Key'}</span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex gap-2">
+
+                  <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-800">
                     <input
                       type="text"
+                      inputMode="numeric"
                       maxLength={6}
                       value={emailOtpCode}
-                      onChange={(e) => setEmailOtpCode(e.target.value.replace(/[^0-9]/g, ''))}
-                      placeholder="6-digit code"
-                      className="flex-1 text-center font-mono tracking-[0.3em] rounded-lg bg-slate-950 border border-slate-700 px-2.5 py-1.5 text-cyan-300"
+                      onChange={(e) => setEmailOtpCode(e.target.value.replace(/[^0-9]/g, '').slice(0, 6))}
+                      placeholder="Enter 6-digit Authenticator code"
+                      className="flex-1 min-w-[180px] text-center font-mono text-sm font-bold tracking-[0.3em] rounded-xl bg-slate-900 border border-emerald-500/40 px-3 py-2 text-emerald-300 focus:outline-none focus:border-emerald-400"
                     />
                     <button
                       type="button"
-                      onClick={() => handleVerifySettingsOtp('email')}
-                      className="px-3.5 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold"
+                      disabled={isSendingOtp || emailOtpCode.length !== 6}
+                      onClick={handleVerifyEmailTotpBackup}
+                      className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5"
                     >
-                      Verify Gmail for Backup
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Verify & Link Email</span>
                     </button>
                   </div>
                 </div>

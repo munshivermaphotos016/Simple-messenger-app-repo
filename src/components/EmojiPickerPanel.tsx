@@ -552,6 +552,7 @@ export interface EmojiPickerPanelProps {
   onClose?: () => void;
   compactMode?: boolean;
   compact?: boolean;
+  initialTab?: 'popular' | 'stickers_3d' | 'stickers';
 }
 
 export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
@@ -563,10 +564,14 @@ export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
   onClose,
   compactMode = false,
   compact = false,
+  initialTab = 'popular',
 }) => {
   const isCompact = compactMode || compact;
   const sendStickerHandler = onSendExpressiveSticker || onSendComboSticker;
-  const [activeCategoryId, setActiveCategoryId] = useState<string>('popular');
+  const [activeCategoryId, setActiveCategoryId] = useState<string>(initialTab);
+  const [stickerPackFilter, setStickerPackFilter] = useState<
+    'all' | 'reactions' | 'vibes' | 'props' | 'mascots'
+  >('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [skinToneIdx, setSkinToneIdx] = useState<number>(0);
   const [hoveredEmoji, setHoveredEmoji] = useState<EmojiItem | null>(null);
@@ -578,6 +583,12 @@ export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
       return ['😂', '❤️', '🔥', '👍', '🚀', '🥰', '🎉', '🔐'];
     }
   });
+
+  React.useEffect(() => {
+    if (initialTab) {
+      setActiveCategoryId(initialTab);
+    }
+  }, [initialTab]);
 
   const applySkinTone = (item: EmojiItem): string => {
     const mod = SKIN_TONES[skinToneIdx]?.modifier || '';
@@ -681,8 +692,59 @@ export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
         )}
       </div>
 
+      {/* Top-Level Mode Switcher: Emojis vs Sticker Packs vs Combo Badges */}
+      {!isCompact && (
+        <div className="flex p-1 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold gap-1">
+          <button
+            type="button"
+            onClick={() => {
+              if (activeCategoryId === 'stickers_3d' || activeCategoryId === 'stickers') {
+                setActiveCategoryId('popular');
+              }
+            }}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-all ${
+              activeCategoryId !== 'stickers_3d' && activeCategoryId !== 'stickers'
+                ? 'bg-emerald-500 text-slate-950 font-bold shadow-sm'
+                : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            <Smile className="w-3.5 h-3.5" />
+            <span>Emojis (300+)</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveCategoryId('stickers_3d');
+              setSearchQuery('');
+            }}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-all ${
+              activeCategoryId === 'stickers_3d'
+                ? 'bg-gradient-to-r from-emerald-400 to-cyan-400 text-slate-950 font-bold shadow-sm'
+                : 'text-emerald-300 hover:text-white'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Sticker Packs ({CARTOON_3D_STICKERS.length + 8})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveCategoryId('stickers');
+              setSearchQuery('');
+            }}
+            className={`flex-1 py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-all ${
+              activeCategoryId === 'stickers'
+                ? 'bg-emerald-500 text-slate-950 font-bold shadow-sm'
+                : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            <span>⚡ Combo Stickers ({EXPRESSIVE_STICKERS.length})</span>
+          </button>
+        </div>
+      )}
+
       {/* Category Navigation Bar */}
-      {!searchQuery.trim() && (
+      {!searchQuery.trim() && activeCategoryId !== 'stickers_3d' && activeCategoryId !== 'stickers' && (
         <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5 border-b border-slate-800/80">
           {EMOJI_CATEGORIES.map((cat) => {
             const active = activeCategoryId === cat.id;
@@ -702,39 +764,42 @@ export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
               </button>
             );
           })}
-          {!isCompact && (
-            <>
-              <button
-                type="button"
-                onClick={() => setActiveCategoryId('stickers_3d')}
-                className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 shrink-0 transition-all ${
-                  activeCategoryId === 'stickers_3d'
-                    ? 'bg-gradient-to-r from-emerald-400 to-cyan-400 text-slate-950 font-bold shadow-sm'
-                    : 'bg-slate-900/70 text-emerald-300 hover:bg-slate-800'
-                }`}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>3D Stickers</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveCategoryId('stickers')}
-                className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 shrink-0 transition-all ${
-                  activeCategoryId === 'stickers'
-                    ? 'bg-emerald-500 text-slate-950 font-bold shadow-sm'
-                    : 'bg-slate-900/70 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                <Smile className="w-3.5 h-3.5" />
-                <span>Combo Stickers</span>
-              </button>
-            </>
-          )}
+        </div>
+      )}
+
+      {/* Sticker Pack Sub-Category Tabs */}
+      {activeCategoryId === 'stickers_3d' && !searchQuery.trim() && (
+        <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1 border-b border-slate-800/80">
+          {(
+            [
+              { id: 'all', label: '🔥 All Stickers' },
+              { id: 'reactions', label: '😂 Reactions' },
+              { id: 'vibes', label: '💖 Love & Vibes' },
+              { id: 'props', label: '🎮 Gaming & Hype' },
+              { id: 'mascots', label: '🦄 3D Mascots' },
+            ] as const
+          ).map((pack) => (
+            <button
+              key={pack.id}
+              type="button"
+              onClick={() => setStickerPackFilter(pack.id)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold shrink-0 transition-all ${
+                stickerPackFilter === pack.id
+                  ? 'bg-emerald-500/20 border border-emerald-400/50 text-emerald-300'
+                  : 'bg-slate-900/80 border border-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              {pack.label}
+            </button>
+          ))}
         </div>
       )}
 
       {/* Frequently / Recently Used Quick Strip */}
-      {!searchQuery.trim() && activeCategoryId !== 'stickers' && recentEmojis.length > 0 && (
+      {!searchQuery.trim() &&
+        activeCategoryId !== 'stickers' &&
+        activeCategoryId !== 'stickers_3d' &&
+        recentEmojis.length > 0 && (
         <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-0.5">
           <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mr-1 shrink-0">
             Recent:
@@ -754,8 +819,10 @@ export const EmojiPickerPanel: React.FC<EmojiPickerPanelProps> = ({
 
       {/* 3D Cartoon Stickers View, Expressive Stickers View, OR Emoji Grid */}
       {activeCategoryId === 'stickers_3d' && !searchQuery.trim() ? (
-        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2 max-h-56 overflow-y-auto pr-1">
-          {CARTOON_3D_STICKERS.map((stk) => (
+        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2 max-h-60 overflow-y-auto pr-1">
+          {CARTOON_3D_STICKERS.filter(
+            (stk) => stickerPackFilter === 'all' || stk.category === stickerPackFilter
+          ).map((stk) => (
             <button
               key={stk.id}
               type="button"

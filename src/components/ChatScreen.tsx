@@ -243,7 +243,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   }, [composerText, isComposerExpanded]);
 
   // In-chat search
-  const [showChatSearch, setShowChatSearch] = useState(false);
+  const [showChatSearch, setShowChatSearch] = useState(true);
   const [chatSearchQuery, setChatSearchQuery] = useState('');
   const [chatSearchFilter, setChatSearchFilter] = useState<'all' | 'starred' | 'media' | 'links' | 'docs'>('all');
 
@@ -256,6 +256,23 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
   const docInputRef = useRef<HTMLInputElement | null>(null);
+
+  // WhatsApp-Style Multi-Image Pre-Send Preview & Optional Edit Queue
+  const [queuedPhotos, setQueuedPhotos] = useState<
+    Array<{
+      id: string;
+      url: string;
+      name: string;
+      sizeBytes: number;
+      caption: string;
+      edited?: boolean;
+    }>
+  >([]);
+  const [activeQueuedPhotoIdx, setActiveQueuedPhotoIdx] = useState<number>(0);
+  const [editingQueuedPhotoId, setEditingQueuedPhotoId] = useState<string | null>(null);
+
+  // Emoji & Sticker Picker initial tab
+  const [emojiPickerInitialTab, setEmojiPickerInitialTab] = useState<'popular' | 'stickers_3d' | 'stickers'>('popular');
 
   // Pro Photo & Video Editor Studio Modal State
   const [proMediaEditor, setProMediaEditor] = useState<{
@@ -740,7 +757,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           : undefined,
       contactCard:
         type === 'contact'
-          ? { name: 'Sora Takahashi', username: 'sora.compose', phone: '+81 3-5555-0192' }
+          ? { name: chat.name, username: chat.username || 'contact', phone: chat.phone || '' }
           : undefined,
       ...extra,
     };
@@ -762,8 +779,81 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
     setShowAttachSheet(false);
   };
 
+  const handleMultiPhotoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    const imageFiles = files.filter((f) => {
+      const ext = f.name.split('.').pop()?.toLowerCase() || '';
+      return f.type.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'svg'].includes(ext);
+    });
+
+    if (imageFiles.length === 0) {
+      handleRealFileUpload(e);
+      return;
+    }
+
+    Promise.all(
+      imageFiles.map(
+        (file, idx) =>
+          new Promise<{
+            id: string;
+            url: string;
+            name: string;
+            sizeBytes: number;
+            caption: string;
+            edited?: boolean;
+          }>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              resolve({
+                id: `qphoto_${Date.now()}_${idx}`,
+                url: String(reader.result || ''),
+                name: file.name,
+                sizeBytes: file.size || 680000,
+                caption: '',
+                edited: false,
+              });
+            };
+            reader.readAsDataURL(file);
+          })
+      )
+    ).then((loadedPhotos) => {
+      setShowAttachSheet(false);
+      setQueuedPhotos((prev) => {
+        const next = [...prev, ...loadedPhotos];
+        setActiveQueuedPhotoIdx(prev.length);
+        return next;
+      });
+    });
+
+    e.target.value = '';
+  };
+
+  const handleSendAllQueuedPhotos = () => {
+    if (queuedPhotos.length === 0) return;
+    queuedPhotos.forEach((item) => {
+      handleSendAttachment('photo', item.name, item.sizeBytes, {
+        url: item.url,
+        thumbnailUrl: item.url,
+        caption: item.caption.trim() || undefined,
+        quality: selectedMediaQuality,
+      });
+    });
+    const count = queuedPhotos.length;
+    setQueuedPhotos([]);
+    setActiveQueuedPhotoIdx(0);
+    setEditingQueuedPhotoId(null);
+    showToast(`Sent ${count} photo${count > 1 ? 's' : ''} (${selectedMediaQuality.toUpperCase()}) 📸`);
+  };
+
   const handleRealFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files || []);
+    if (files.length > 1 && files.every((f) => f.type.startsWith('image/'))) {
+      handleMultiPhotoSelect(e);
+      return;
+    }
+    const file = files[0];
     if (!file) return;
     const ext = file.name.split('.').pop()?.toLowerCase() || '';
     const type: AttachmentItem['type'] =
@@ -779,30 +869,41 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         ? 'zip'
         : 'document';
 
-    if (type === 'photo' || type === 'video') {
-      if (type === 'video') {
-        const objUrl = URL.createObjectURL(file);
+    if (type === 'photo') {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
         setShowAttachSheet(false);
-        setProMediaEditor({
-          isOpen: true,
-          mediaType: 'video',
-          url: objUrl,
-          caption: '',
+        setQueuedPhotos((prev) => {
+          const next = [
+            ...prev,
+            {
+              id: `qphoto_${Date.now()}`,
+              url: dataUrl,
+              name: file.name,
+              sizeBytes: file.size || 680000,
+              caption: '',
+              edited: false,
+            },
+          ];
+          setActiveQueuedPhotoIdx(next.length - 1);
+          return next;
         });
-      } else {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = String(reader.result || '');
-          setShowAttachSheet(false);
-          setProMediaEditor({
-            isOpen: true,
-            mediaType: 'photo',
-            url: dataUrl,
-            caption: '',
-          });
-        };
-        reader.readAsDataURL(file);
-      }
+      };
+      reader.readAsDataURL(file);
+      e.target.value = '';
+      return;
+    }
+
+    if (type === 'video') {
+      const objUrl = URL.createObjectURL(file);
+      setShowAttachSheet(false);
+      setProMediaEditor({
+        isOpen: true,
+        mediaType: 'video',
+        url: objUrl,
+        caption: '',
+      });
       e.target.value = '';
       return;
     }
@@ -1037,10 +1138,25 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         </div>
       )}
 
-      {/* Hidden native file input for uploading real files */}
+      {/* Hidden native file inputs for uploading real files & multi-photo gallery selection */}
       <input
         ref={fileInputRef}
         type="file"
+        className="hidden"
+        onChange={handleRealFileUpload}
+      />
+      <input
+        ref={galleryInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={handleMultiPhotoSelect}
+      />
+      <input
+        ref={videoInputRef}
+        type="file"
+        accept="video/*"
         className="hidden"
         onChange={handleRealFileUpload}
       />
@@ -1599,9 +1715,13 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 
             <button
               onClick={() => setShowChatSearch((s) => !s)}
-              className="hidden xs:flex min-h-[36px] min-w-[36px] items-center justify-center rounded-xl text-slate-300 hover:text-white hover:bg-slate-800/80 transition-colors"
+              className={`flex min-h-[36px] min-w-[36px] items-center justify-center rounded-xl transition-colors ${
+                showChatSearch
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                  : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
+              }`}
               aria-label="Search in conversation"
-              title="Search in conversation"
+              title="Search messages in conversation"
             >
               <Search className="w-4 h-4" />
             </button>
@@ -1747,25 +1867,45 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         </div>
       )}
 
-      {/* In-Chat Local Decrypted Search Bar */}
+      {/* In-Chat Search Bar to Filter Messages Within Current Conversation History */}
       {showChatSearch && (
-        <div className="px-4 py-2.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center gap-2 z-10">
-          <input
-            type="text"
-            value={chatSearchQuery}
-            onChange={(e) => setChatSearchQuery(e.target.value)}
-            placeholder="Search messages, sender, or files in this chat…"
-            className="flex-1 min-w-[180px] rounded-xl bg-slate-950 border border-slate-800 px-3 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-          />
-          <div className="flex items-center gap-1">
+        <div className="px-3 sm:px-4 py-2 bg-slate-900/95 border-b border-slate-800 flex flex-wrap items-center gap-2 z-10">
+          <div className="relative flex-1 min-w-[180px]">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="search"
+              value={chatSearchQuery}
+              onChange={(e) => setChatSearchQuery(e.target.value)}
+              placeholder={`Search messages in ${chat.name}…`}
+              aria-label="Search messages in current conversation"
+              className="w-full rounded-xl bg-slate-950 border border-slate-800 pl-8 pr-16 py-1.5 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-emerald-500"
+            />
+            {chatSearchQuery.trim() && (
+              <span className="absolute right-7 top-1/2 -translate-y-1/2 text-[10px] font-mono text-emerald-400">
+                {filteredMessages.length} found
+              </span>
+            )}
+            {chatSearchQuery && (
+              <button
+                type="button"
+                onClick={() => setChatSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                aria-label="Clear search query"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
             {(['all', 'starred', 'media', 'links', 'docs'] as const).map((f) => (
               <button
                 key={f}
+                type="button"
                 onClick={() => setChatSearchFilter(f)}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-medium capitalize ${
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-medium capitalize shrink-0 ${
                   chatSearchFilter === f
                     ? 'bg-emerald-500 text-slate-950 font-semibold'
-                    : 'bg-slate-800 text-slate-300'
+                    : 'bg-slate-800 text-slate-300 hover:text-white'
                 }`}
               >
                 {f}
@@ -1773,12 +1913,14 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
             ))}
           </div>
           <button
+            type="button"
             onClick={() => {
               setShowChatSearch(false);
               setChatSearchQuery('');
               setChatSearchFilter('all');
             }}
-            className="p-1.5 text-slate-400 hover:text-white"
+            className="p-1 text-slate-400 hover:text-white"
+            title="Hide search bar"
           >
             <X className="w-4 h-4" />
           </button>
@@ -2861,8 +3003,21 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 
           {showAttachSheet && (
             <div className="space-y-3">
-              {/* Circular Icon Grid for All Attachments & Actions */}
-              <div className="grid grid-cols-3 sm:grid-cols-9 gap-2 text-center">
+              {/* Circular Icon Grid for All Attachments & Actions (WhatsApp-style Send Photos, Camera, Stickers, Video, Document, Location, Contact) */}
+              <div className="grid grid-cols-4 sm:grid-cols-8 gap-2 text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    galleryInputRef.current?.click();
+                  }}
+                  className="p-2 rounded-2xl bg-slate-950/90 border border-emerald-500/40 hover:border-emerald-400 text-xs flex flex-col items-center gap-1.5 transition-colors"
+                >
+                  <div className="w-9 h-9 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
+                    <Image className="w-4 h-4" />
+                  </div>
+                  <span className="text-[11px] font-semibold text-emerald-300">Send Photos</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => {
@@ -2880,61 +3035,34 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setEmojiPickerInitialTab('stickers_3d');
                     setShowAttachSheet(false);
-                    setProMediaEditor({
-                      isOpen: true,
-                      mediaType: 'photo',
-                      url: STYLED_3D_SCENES.aurora_peaks,
-                    });
+                    setShowEmojiPicker(true);
                   }}
-                  className="p-2 rounded-2xl bg-slate-950/90 border border-emerald-500/40 hover:border-emerald-400 text-xs flex flex-col items-center gap-1.5 transition-colors"
+                  className="p-2 rounded-2xl bg-slate-950/90 border border-fuchsia-500/40 hover:border-fuchsia-400 text-xs flex flex-col items-center gap-1.5 transition-colors"
                 >
-                  <div className="w-9 h-9 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
-                    <Image className="w-4 h-4" />
+                  <div className="w-9 h-9 rounded-full bg-fuchsia-500/20 text-fuchsia-400 flex items-center justify-center">
+                    <Sparkles className="w-4 h-4" />
                   </div>
-                  <span className="text-[11px] font-semibold text-emerald-300">Photo Studio</span>
+                  <span className="text-[11px] font-semibold text-fuchsia-300">Stickers (48+)</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => {
-                    setShowAttachSheet(false);
-                    setProMediaEditor({
-                      isOpen: true,
-                      mediaType: 'video',
-                      url: 'https://assets.mixkit.co/videos/preview/mixkit-waves-in-the-water-1164-large.mp4',
-                    });
+                    videoInputRef.current?.click();
                   }}
                   className="p-2 rounded-2xl bg-slate-950/90 border border-cyan-500/40 hover:border-cyan-400 text-xs flex flex-col items-center gap-1.5 transition-colors"
                 >
                   <div className="w-9 h-9 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center">
                     <Video className="w-4 h-4" />
                   </div>
-                  <span className="text-[11px] font-semibold text-cyan-300">Video Studio</span>
+                  <span className="text-[11px] font-semibold text-cyan-300">Send Video</span>
                 </button>
 
                 <button
                   type="button"
-                  onClick={() => {
-                    const pick =
-                      CARTOON_3D_STICKERS[Math.floor(Math.random() * CARTOON_3D_STICKERS.length)];
-                    handleSendAttachment('sticker', `${pick.id}.svg`, 68000, {
-                      stickerEmoji: pick.emoji,
-                      caption: pick.title,
-                      url: pick.url,
-                    });
-                  }}
-                  className="p-2 rounded-2xl bg-slate-950/90 border border-slate-800 hover:border-emerald-500/50 text-xs flex flex-col items-center gap-1.5 transition-colors"
-                >
-                  <div className="w-9 h-9 rounded-full bg-fuchsia-500/20 text-fuchsia-400 flex items-center justify-center">
-                    <Sparkles className="w-4 h-4" />
-                  </div>
-                  <span className="text-[11px] font-medium text-slate-200">3D Sticker</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleSendAttachment('pdf', 'ZeroKnowledge_Spec.pdf', 1250000)}
+                  onClick={() => fileInputRef.current?.click()}
                   className="p-2 rounded-2xl bg-slate-950/90 border border-slate-800 hover:border-emerald-500/50 text-xs flex flex-col items-center gap-1.5 transition-colors"
                 >
                   <div className="w-9 h-9 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center">
@@ -2945,13 +3073,38 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-2 rounded-2xl bg-slate-950/90 border border-slate-800 hover:border-emerald-500/50 text-xs flex flex-col items-center gap-1.5 transition-colors"
+                  onClick={() => {
+                    setShowAttachSheet(false);
+                    setQueuedPhotos((prev) => {
+                      const sampleBatch = [
+                        {
+                          id: `qphoto_${Date.now()}_1`,
+                          url: STYLED_3D_SCENES.aurora_peaks,
+                          name: 'Aurora_Peaks_HD.jpg',
+                          sizeBytes: 1240000,
+                          caption: '',
+                          edited: false,
+                        },
+                        {
+                          id: `qphoto_${Date.now()}_2`,
+                          url: STYLED_3D_SCENES.neon_city,
+                          name: 'Neon_Skyline_HD.jpg',
+                          sizeBytes: 1420000,
+                          caption: '',
+                          edited: false,
+                        },
+                      ];
+                      const next = [...prev, ...sampleBatch];
+                      setActiveQueuedPhotoIdx(prev.length);
+                      return next;
+                    });
+                  }}
+                  className="p-2 rounded-2xl bg-slate-950/90 border border-indigo-500/40 hover:border-indigo-400 text-xs flex flex-col items-center gap-1.5 transition-colors"
                 >
                   <div className="w-9 h-9 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center">
                     <Upload className="w-4 h-4" />
                   </div>
-                  <span className="text-[11px] font-medium text-slate-200">Device File</span>
+                  <span className="text-[11px] font-medium text-slate-200">Multi-Photos</span>
                 </button>
 
                 <button
@@ -2989,27 +3142,13 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => handleSendAttachment('contact', 'Contact_Card_Sora.vcf', 4096)}
+                  onClick={() => handleSendAttachment('contact', 'Contact_Card.vcf', 4096)}
                   className="p-2 rounded-2xl bg-slate-950/90 border border-slate-800 hover:border-emerald-500/50 text-xs flex flex-col items-center gap-1.5 transition-colors"
                 >
                   <div className="w-9 h-9 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center">
                     <UserCheck className="w-4 h-4" />
                   </div>
                   <span className="text-[11px] font-medium text-slate-200">Contact</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowAttachSheet(false);
-                    setShowPollModal(true);
-                  }}
-                  className="p-2 rounded-2xl bg-slate-950/90 border border-slate-800 hover:border-emerald-500/50 text-xs flex flex-col items-center gap-1.5 transition-colors"
-                >
-                  <div className="w-9 h-9 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
-                    <BarChart2 className="w-4 h-4" />
-                  </div>
-                  <span className="text-[11px] font-medium text-slate-200">Poll</span>
                 </button>
               </div>
 
@@ -3038,8 +3177,9 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 
           {showEmojiPicker && (
             <div className="space-y-2.5">
-              {/* Expressive Emoji & 3D Cartoon Sticker Studio */}
+              {/* Expressive Emoji & 48+ Sticker Packs Studio */}
               <EmojiPickerPanel
+                initialTab={emojiPickerInitialTab}
                 onSelectEmoji={(em) => {
                   handleComposerChange(composerText + em);
                   composerInputRef.current?.focus();
@@ -3164,22 +3304,40 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           <div className="flex items-end gap-1.5 sm:gap-2">
             {/* Unified Rounded Input Pill — Maximum Width for Seeing What You Type */}
             <div className="flex-1 min-w-0 flex items-end gap-1 bg-slate-900 border border-slate-800 focus-within:border-emerald-500/70 rounded-3xl px-2 sm:px-3 py-1 shadow-inner transition-colors">
-              {/* Left Emoji Toggle Inside Pill */}
+              {/* Left Emoji & Stickers Toggles Inside Pill */}
               <button
                 type="button"
                 onClick={() => {
-                  setShowEmojiPicker((s) => !s);
+                  setEmojiPickerInitialTab('popular');
+                  setShowEmojiPicker((s) => !s || emojiPickerInitialTab !== 'popular');
                   setShowAttachSheet(false);
                 }}
                 className={`h-9 w-8 rounded-full flex items-center justify-center shrink-0 transition-colors ${
-                  showEmojiPicker
+                  showEmojiPicker && emojiPickerInitialTab === 'popular'
                     ? 'text-emerald-400 bg-emerald-500/15'
                     : 'text-slate-400 hover:text-white'
                 }`}
-                aria-label="Emoji and text formatting"
-                title="Emojis & Text Formatting"
+                aria-label="Emoji picker"
+                title="Emojis (300+)"
               >
                 <Smile className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setEmojiPickerInitialTab('stickers_3d');
+                  setShowEmojiPicker((s) => !s || emojiPickerInitialTab !== 'stickers_3d');
+                  setShowAttachSheet(false);
+                }}
+                className={`h-9 w-8 rounded-full flex items-center justify-center shrink-0 transition-colors ${
+                  showEmojiPicker && emojiPickerInitialTab === 'stickers_3d'
+                    ? 'text-fuchsia-400 bg-fuchsia-500/15'
+                    : 'text-fuchsia-400/80 hover:text-fuchsia-300'
+                }`}
+                aria-label="Sticker packs"
+                title="Stickers (48+ Sticker Packs)"
+              >
+                <Sparkles className="w-4 h-4" />
               </button>
 
               {/* Wide, Multi-Line Auto-Expanding Typing Area */}
@@ -3239,23 +3397,17 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
                   <Paperclip className="w-4 h-4" />
                 </button>
 
-                {/* Camera & Pro Media Studio buttons only show when input is empty, hiding automatically as soon as you type to give 100% space to your text */}
+                {/* Send Images (Gallery) & Camera buttons show when input is empty, hiding automatically as soon as you type */}
                 {!composerText.trim() && (
                   <>
                     <button
                       type="button"
-                      onClick={() =>
-                        setProMediaEditor({
-                          isOpen: true,
-                          mediaType: 'photo',
-                          url: STYLED_3D_SCENES.aurora_peaks,
-                        })
-                      }
+                      onClick={() => galleryInputRef.current?.click()}
                       className="h-8 w-8 rounded-full text-emerald-400 hover:text-emerald-300 hover:bg-slate-800/80 flex items-center justify-center transition-colors"
-                      aria-label="Open Pro Photo & Video Studio"
-                      title="Pro Photo & Video Editor Studio"
+                      aria-label="Send images from gallery"
+                      title="Send Photo(s) — Select one or multiple images & optionally edit before sending"
                     >
-                      <Wand2 className="w-4 h-4" />
+                      <Image className="w-4 h-4" />
                     </button>
                     <button
                       type="button"
@@ -5542,7 +5694,162 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         />
       )}
 
-      {/* Pro Media Editor Studio Modal for Sending Edited Photos & Videos in Chat */}
+      {/* WhatsApp-Style Pre-Send Multi-Image Preview & Optional Photo Editor Queue Modal */}
+      {queuedPhotos.length > 0 && !proMediaEditor.isOpen && (() => {
+        const currentPhoto = queuedPhotos[activeQueuedPhotoIdx] || queuedPhotos[0];
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md flex flex-col justify-between p-3 sm:p-5 animate-in fade-in duration-150">
+            {/* Top Bar: Close, Count, Quality & Optional "Edit Photo" Button */}
+            <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQueuedPhotos([]);
+                    setActiveQueuedPhotoIdx(0);
+                    setEditingQueuedPhotoId(null);
+                  }}
+                  className="w-9 h-9 rounded-full bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white flex items-center justify-center"
+                  title="Cancel sending photos"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <div>
+                  <div className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
+                    <span>Send to {chat.name}</span>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-mono text-emerald-300">
+                      {activeQueuedPhotoIdx + 1} of {queuedPhotos.length}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-400">
+                    Review your selected photo{queuedPhotos.length > 1 ? 's' : ''} — tap "Edit Photo" if you want to crop, draw, or add filters before sending
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {/* Optional Edit Photo Button (Just Like WhatsApp Before Sending!) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingQueuedPhotoId(currentPhoto.id);
+                    setProMediaEditor({
+                      isOpen: true,
+                      mediaType: 'photo',
+                      url: currentPhoto.url,
+                      caption: currentPhoto.caption,
+                    });
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 text-xs font-bold flex items-center gap-1.5 shadow-lg transition-all"
+                >
+                  <Wand2 className="w-4 h-4" />
+                  <span>Edit Photo</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => galleryInputRef.current?.click()}
+                  className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5"
+                  title="Add more photos to send together"
+                >
+                  <Plus className="w-4 h-4 text-emerald-400" />
+                  <span className="hidden sm:inline">Add More</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Center Selected Image Preview */}
+            <div className="flex-1 flex flex-col items-center justify-center overflow-hidden my-3 relative">
+              <img
+                src={currentPhoto.url}
+                alt={currentPhoto.name}
+                className="max-h-[58dvh] max-w-full object-contain rounded-2xl border border-slate-800 shadow-2xl"
+              />
+              {currentPhoto.edited && (
+                <span className="mt-2 px-2.5 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-[10px] font-bold text-emerald-300">
+                  ✨ Edited in Photo Studio
+                </span>
+              )}
+            </div>
+
+            {/* Bottom Multi-Photo Thumbnail Strip + Caption Input + Send Button */}
+            <div className="space-y-3 pt-2 border-t border-slate-800 max-w-2xl w-full mx-auto">
+              {/* Thumbnail Strip for Multiple Selected Images */}
+              <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
+                {queuedPhotos.map((item, idx) => (
+                  <div
+                    key={item.id}
+                    className={`relative w-14 h-14 rounded-xl overflow-hidden border-2 shrink-0 cursor-pointer transition-all ${
+                      idx === activeQueuedPhotoIdx
+                        ? 'border-emerald-400 scale-105 ring-2 ring-emerald-500/30'
+                        : 'border-slate-700 opacity-70 hover:opacity-100'
+                    }`}
+                    onClick={() => setActiveQueuedPhotoIdx(idx)}
+                  >
+                    <img src={item.url} alt={item.name} className="w-full h-full object-cover" />
+                    {queuedPhotos.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setQueuedPhotos((prev) => {
+                            const filtered = prev.filter((p) => p.id !== item.id);
+                            setActiveQueuedPhotoIdx((cur) =>
+                              Math.min(cur, Math.max(0, filtered.length - 1))
+                            );
+                            return filtered;
+                          });
+                        }}
+                        className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-black/80 text-rose-400 flex items-center justify-center text-[10px]"
+                        title="Remove this photo"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => galleryInputRef.current?.click()}
+                  className="w-14 h-14 rounded-xl bg-slate-900 hover:bg-slate-800 border border-dashed border-slate-700 hover:border-emerald-400 text-slate-400 hover:text-emerald-300 flex flex-col items-center justify-center gap-0.5 shrink-0 text-[10px] font-semibold"
+                  title="Select more images from device"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add</span>
+                </button>
+              </div>
+
+              {/* Caption Input & Send All Button */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={currentPhoto.caption}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setQueuedPhotos((prev) =>
+                      prev.map((p, i) => (i === activeQueuedPhotoIdx ? { ...p, caption: val } : p))
+                    );
+                  }}
+                  placeholder={`Add a caption to ${currentPhoto.name}…`}
+                  className="flex-1 rounded-2xl bg-slate-900 border border-slate-700 px-4 py-2.5 text-xs sm:text-sm text-white placeholder:text-slate-400 focus:outline-none focus:border-emerald-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleSendAllQueuedPhotos}
+                  className="px-5 py-2.5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs sm:text-sm font-extrabold flex items-center gap-1.5 shadow-lg shadow-emerald-500/25 shrink-0"
+                >
+                  <Send className="w-4 h-4" />
+                  <span>
+                    Send {queuedPhotos.length > 1 ? `(${queuedPhotos.length} Photos)` : 'Photo'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Pro Media Editor Studio Modal for Editing Chosen Photos Before Sending or Videos in Chat */}
       <MediaEditorModal
         isOpen={proMediaEditor.isOpen}
         initialMediaType={proMediaEditor.mediaType}
@@ -5552,9 +5859,31 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         initialTrimEnd={proMediaEditor.trimEnd}
         mode="chat"
         recipientName={chat.name}
-        onClose={() => setProMediaEditor((prev) => ({ ...prev, isOpen: false }))}
+        onClose={() => {
+          setEditingQueuedPhotoId(null);
+          setProMediaEditor((prev) => ({ ...prev, isOpen: false }));
+        }}
         onApply={(res) => {
           setSelectedMediaQuality(res.quality);
+          if (editingQueuedPhotoId && res.mediaType === 'photo') {
+            setQueuedPhotos((prev) =>
+              prev.map((item) =>
+                item.id === editingQueuedPhotoId
+                  ? {
+                      ...item,
+                      url: res.url,
+                      caption: res.caption || item.caption,
+                      edited: true,
+                    }
+                  : item
+              )
+            );
+            setEditingQueuedPhotoId(null);
+            setProMediaEditor((prev) => ({ ...prev, isOpen: false }));
+            showToast('Photo edits saved! Review and tap Send when ready ✨');
+            return;
+          }
+
           const trimRatio =
             res.mediaType === 'video' &&
             res.videoMeta &&

@@ -671,6 +671,187 @@ async function handleLocalApiFallback(
     });
   }
 
+  if (pathName === '/api/auth/setup-totp' && method === 'POST') {
+    const accountLabel = String(bodyObj.accountLabel || bodyObj.label || bodyObj.identifier || 'SimpleUser')
+      .trim()
+      .replace(/[^a-zA-Z0-9@._+-]/g, '');
+    const secret = generateBase32Secret(20);
+    const label = encodeURIComponent(`SimpleMessenger:${accountLabel}`);
+    const otpauthUri = `otpauth://totp/${label}?secret=${secret}&issuer=SimpleMessenger&algorithm=SHA1&digits=6&period=30`;
+    return jsonResponse({
+      ok: true,
+      secret,
+      totpSecret: secret,
+      issuer: 'SimpleMessenger',
+      accountLabel,
+      otpauthUri,
+    });
+  }
+
+  if (pathName === '/api/auth/check-username' && method === 'GET') {
+    const raw = String(searchParams.get('username') || '').toLowerCase().trim().replace(/^@/, '');
+    const clean = raw.replace(/[^a-z0-9._-]/g, '');
+    if (!clean || clean.length < 3) {
+      return jsonResponse({ available: false, error: 'Username must be at least 3 characters.' });
+    }
+    const users = Object.values(getLocalUsers());
+    const taken = users.some((u: any) => String(u.username || '').toLowerCase() === clean);
+    return jsonResponse({ available: !taken, username: clean });
+  }
+
+  if (pathName === '/api/auth/check-user-for-login' && method === 'POST') {
+    const cleanUsername = String(bodyObj.username || '').toLowerCase().trim().replace(/^@/, '');
+    const passwordHash = String(bodyObj.passwordHash || '').trim();
+    const users = Object.values(getLocalUsers());
+    const matched: any = users.find((u: any) => String(u.username || '').toLowerCase() === cleanUsername);
+    if (!matched) {
+      return jsonResponse({ ok: false, error: `No Simple account found with username @${cleanUsername}.` }, 404);
+    }
+    if (matched.passwordHash && passwordHash && matched.passwordHash !== passwordHash) {
+      return jsonResponse({ ok: false, error: 'Incorrect account password.' }, 401);
+    }
+    return jsonResponse({
+      ok: true,
+      username: matched.username,
+      name: matched.name,
+      avatarUrl: matched.avatarUrl,
+      avatarColor: matched.avatarColor,
+      hasTotp: Boolean(matched.totpSecret),
+    });
+  }
+
+  if (pathName === '/api/auth/register-totp' && method === 'POST') {
+    const cleanUsername = String(bodyObj.username || '').toLowerCase().trim().replace(/^@/, '').replace(/[^a-z0-9._-]/g, '');
+    const totpSecret = String(bodyObj.totpSecret || '').trim();
+    const code = String(bodyObj.code || bodyObj.totpCode || '').trim();
+    if (!verifyTotpCodeSync(totpSecret, code)) {
+      return jsonResponse({ ok: false, error: 'Invalid 6-digit Google Authenticator code.' }, 400);
+    }
+    const users = getLocalUsers();
+    const uid = `usr_${Date.now().toString(36)}`;
+    const userObj = {
+      uid,
+      name: String(bodyObj.name || cleanUsername),
+      username: cleanUsername,
+      phone: '',
+      normalizedPhone: '',
+      email: '',
+      passwordHash: String(bodyObj.passwordHash || ''),
+      totpSecret,
+      about: String(bodyObj.about || 'Hey there! I am using Simple.'),
+      avatarColor: String(bodyObj.avatarColor || '#10B981'),
+      avatarUrl: bodyObj.avatarUrl ? String(bodyObj.avatarUrl) : undefined,
+      allowUsernameDiscovery: true,
+      hidePhoneNumber: true,
+      isOnline: true,
+      lastSeen: 'Online',
+      updatedAt: Date.now(),
+    };
+    users[uid] = userObj;
+    saveLocalUsers(users);
+    return jsonResponse({
+      ok: true,
+      user: userObj,
+      sessionToken: createVerificationToken(cleanUsername),
+    });
+  }
+
+  if (pathName === '/api/auth/login-totp' && method === 'POST') {
+    const cleanUsername = String(bodyObj.username || '').toLowerCase().trim().replace(/^@/, '');
+    const passwordHash = String(bodyObj.passwordHash || '').trim();
+    const code = String(bodyObj.code || bodyObj.totpCode || '').trim();
+    const users = Object.values(getLocalUsers());
+    const matched: any = users.find((u: any) => String(u.username || '').toLowerCase() === cleanUsername);
+    if (!matched) {
+      return jsonResponse({ ok: false, error: `No Simple account found with username @${cleanUsername}.` }, 404);
+    }
+    if (matched.passwordHash && passwordHash && matched.passwordHash !== passwordHash) {
+      return jsonResponse({ ok: false, error: 'Incorrect account password.' }, 401);
+    }
+    if (matched.totpSecret && !verifyTotpCodeSync(matched.totpSecret, code)) {
+      return jsonResponse({ ok: false, error: 'Invalid 6-digit Google Authenticator code.' }, 400);
+    }
+    return jsonResponse({
+      ok: true,
+      user: matched,
+      sessionToken: createVerificationToken(cleanUsername),
+    });
+  }
+
+  if (pathName === '/api/auth/verify-totp-email' && method === 'POST') {
+    const cleanEmail = String(bodyObj.email || '').trim().toLowerCase();
+    const totpSecret = String(bodyObj.totpSecret || '').trim();
+    const code = String(bodyObj.code || '').trim();
+    if (!cleanEmail.includes('@')) {
+      return jsonResponse({ ok: false, error: 'Please enter a valid email address.' }, 400);
+    }
+    if (!verifyTotpCodeSync(totpSecret, code)) {
+      return jsonResponse({ ok: false, error: 'Invalid 6-digit Google Authenticator code.' }, 400);
+    }
+    return jsonResponse({
+      ok: true,
+      email: cleanEmail,
+      totpSecret,
+      verificationToken: createVerificationToken(cleanEmail),
+      verifiedAt: Date.now(),
+    });
+  }
+
+  if (pathName === '/api/auth/google-account' && method === 'POST') {
+    const cleanEmail = String(bodyObj.email || '').trim().toLowerCase();
+    if (!cleanEmail.includes('@')) {
+      return jsonResponse({ ok: false, error: 'Valid Google account email is required.' }, 400);
+    }
+    const totpSecret = String(bodyObj.totpSecret || '').trim();
+    const totpCode = String(bodyObj.totpCode || '').trim();
+    if (totpSecret && totpCode && !verifyTotpCodeSync(totpSecret, totpCode)) {
+      return jsonResponse({ ok: false, error: 'Invalid 6-digit Google Authenticator code.' }, 400);
+    }
+    const users = getLocalUsers();
+    const existing: any = Object.values(users).find(
+      (u: any) => String(u.email || '').toLowerCase() === cleanEmail
+    );
+    if (existing) {
+      return jsonResponse({
+        ok: true,
+        isExistingAccount: true,
+        user: existing,
+        sessionToken: createVerificationToken(cleanEmail),
+      });
+    }
+    const uid = `usr_${Date.now().toString(36)}`;
+    const baseUsername = String(bodyObj.username || cleanEmail.split('@')[0] || 'user')
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9._-]/g, '');
+    const userObj = {
+      uid,
+      name: String(bodyObj.name || cleanEmail.split('@')[0]),
+      username: baseUsername,
+      phone: '',
+      normalizedPhone: '',
+      email: cleanEmail,
+      passwordHash: String(bodyObj.passwordHash || sha256HexSync(`google_oauth_${cleanEmail}`)),
+      totpSecret: totpSecret || generateBase32Secret(20),
+      about: 'Hey there! I am using Simple.',
+      avatarColor: String(bodyObj.avatarColor || '#10B981'),
+      avatarUrl: bodyObj.avatarUrl ? String(bodyObj.avatarUrl) : undefined,
+      allowUsernameDiscovery: true,
+      hidePhoneNumber: true,
+      isOnline: true,
+      lastSeen: 'Online',
+      updatedAt: Date.now(),
+    };
+    users[uid] = userObj;
+    saveLocalUsers(users);
+    return jsonResponse({
+      ok: true,
+      isExistingAccount: false,
+      user: userObj,
+      sessionToken: createVerificationToken(cleanEmail),
+    });
+  }
+
   if (pathName === '/api/users/register' && method === 'POST') {
     const users = getLocalUsers();
     const uid = String(bodyObj.uid || `usr_${Date.now()}`);

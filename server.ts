@@ -225,6 +225,22 @@ function sanitizePublicUserRecord(u: DirectoryUserRecord): Omit<DirectoryUserRec
   return publicFields;
 }
 
+function isServerDummyRecord(u: Partial<DirectoryUserRecord> | null | undefined): boolean {
+  if (!u || !u.uid) return true;
+  if (u.passwordHash === 'undefined') return true;
+  const uname = String(u.username || '').toLowerCase().trim().replace(/^@/, '');
+  const uid = String(u.uid || '').toLowerCase().trim();
+  const legacyNames = new Set([
+    'alice_wonder', 'bob_builder', 'alice_badc', 'bob_badc', 'alice_c705', 'bob_c705',
+    'sora_t', 'arjun_m', 'elena_r', 'marcus_v', 'maya_l', 'vikram_s', 'ananya_k', 'rohan_d', 'priya_n', 'kiran_p',
+    'testuser', 'demo', 'dummy',
+  ]);
+  if (legacyNames.has(uname) || uid.startsWith('u_alice_') || uid.startsWith('u_bob_') || uid.startsWith('usr_dummy')) {
+    return true;
+  }
+  return false;
+}
+
 function loadPersistentDatabase(): void {
   try {
     if (!fs.existsSync(DB_FILE)) return;
@@ -232,7 +248,9 @@ function loadPersistentDatabase(): void {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.users)) {
       parsed.users.forEach((u: DirectoryUserRecord) => {
-        if (u && u.uid) userDirectory.set(u.uid, u);
+        if (u && u.uid && !isServerDummyRecord(u)) {
+          userDirectory.set(u.uid, u);
+        }
       });
     }
     if (Array.isArray(parsed.accountBackups)) {
@@ -1075,6 +1093,213 @@ async function startServer() {
       user: sanitizePublicUserRecord(matchedUser),
       sessionToken,
       backupJson: backupRecord?.backupJson,
+    });
+  });
+
+  // Verify Email for Cloud Backup strictly using Google Authenticator 6-digit TOTP code
+  app.post('/api/auth/verify-totp-email', (req, res) => {
+    const { uid, email, totpSecret, code } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const rawCode = String(code || '').trim();
+
+    if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+      res.status(400).json({ ok: false, error: 'Please enter a valid email address for Cloud Backup.' });
+      return;
+    }
+
+    // Ensure no other user owns this email
+    const existingOwner = findRegisteredUserByTarget('email', cleanEmail);
+    if (existingOwner && uid && existingOwner.uid !== String(uid)) {
+      res.status(409).json({
+        ok: false,
+        error: `This email (${cleanEmail}) is already linked to another Simple account (@${existingOwner.username}).`,
+      });
+      return;
+    }
+
+    if (!/^\d{6}$/.test(rawCode)) {
+      res.status(400).json({
+        ok: false,
+        error: 'Enter the 6-digit verification code from your Google Authenticator app.',
+      });
+      return;
+    }
+
+    const dirUser = uid ? userDirectory.get(String(uid)) : undefined;
+    const secretToVerify = String(totpSecret || dirUser?.totpSecret || '').trim();
+    if (!secretToVerify) {
+      res.status(400).json({
+        ok: false,
+        error: 'Google Authenticator secret is required to verify this email.',
+      });
+      return;
+    }
+
+    const isValid = verifyTotpCode(secretToVerify, rawCode);
+    if (!isValid) {
+      res.status(400).json({
+        ok: false,
+        error: 'Invalid 6-digit Google Authenticator code. Ensure you entered the current code for this email.',
+      });
+      return;
+    }
+
+    if (dirUser) {
+      dirUser.email = cleanEmail;
+      dirUser.emailHash = computeSha256Hex(cleanEmail);
+      dirUser.totpSecret = secretToVerify;
+      dirUser.updatedAt = Date.now();
+      userDirectory.set(dirUser.uid, dirUser);
+      savePersistentDatabase();
+    }
+
+    const verificationToken = `vtok_${crypto.randomBytes(24).toString('hex')}`;
+    verifiedOwnershipTokens.set(verificationToken, {
+      token: verificationToken,
+      channel: 'email',
+      normalizedTarget: cleanEmail,
+      verifiedAt: Date.now(),
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    });
+
+    res.json({
+      ok: true,
+      email: cleanEmail,
+      totpSecret: secretToVerify,
+      verificationToken,
+      verifiedAt: Date.now(),
+    });
+  });
+
+  // Google Account Sign-Up / Sign-In (Auto-detected device Google account or OAuth)
+  app.post('/api/auth/google-account', (req, res) => {
+    const {
+      email,
+      name,
+      username,
+      avatarUrl,
+      avatarColor,
+      passwordHash,
+      totpSecret,
+      totpCode,
+      googleVerified,
+      identityFingerprint,
+    } = req.body || {};
+
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      res.status(400).json({ ok: false, error: 'A valid Google account email is required.' });
+      return;
+    }
+
+    // Check if an account already exists with this Google email
+    const existingByEmail = findRegisteredUserByTarget('email', cleanEmail);
+    if (existingByEmail) {
+      // If user has TOTP enabled and didn't verify via Google OAuth token or TOTP code, check TOTP if provided
+      if (!googleVerified && existingByEmail.totpSecret && totpCode) {
+        if (!verifyTotpCode(existingByEmail.totpSecret, String(totpCode).trim())) {
+          res.status(401).json({ ok: false, error: 'Invalid Google Authenticator code for this Google account.' });
+          return;
+        }
+      }
+      const backupRecord = cloudAccountBackups.get(existingByEmail.uid);
+      const sessionToken = `stok_${crypto.randomBytes(24).toString('hex')}`;
+      verifiedOwnershipTokens.set(sessionToken, {
+        token: sessionToken,
+        channel: 'email',
+        normalizedTarget: cleanEmail,
+        verifiedAt: Date.now(),
+        expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      });
+
+      res.json({
+        ok: true,
+        isExistingAccount: true,
+        user: sanitizePublicUserRecord(existingByEmail),
+        sessionToken,
+        backupJson: backupRecord?.backupJson,
+      });
+      return;
+    }
+
+    // Creating a new account with the Google account
+    const baseUsername = String(username || cleanEmail.split('@')[0] || 'user')
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9._-]/g, '');
+    let finalUsername = baseUsername.length >= 3 ? baseUsername : `${baseUsername}_ user`.replace(/\s+/g, '');
+
+    // Check if username is taken
+    let usernameTaken = false;
+    for (const u of userDirectory.values()) {
+      if (u.username.toLowerCase() === finalUsername) {
+        usernameTaken = true;
+        break;
+      }
+    }
+    if (usernameTaken) {
+      finalUsername = `${finalUsername}_${crypto.randomBytes(2).toString('hex')}`;
+    }
+
+    // If TOTP code + secret provided, verify it
+    if (totpSecret && totpCode) {
+      if (!verifyTotpCode(String(totpSecret), String(totpCode).trim())) {
+        res.status(400).json({
+          ok: false,
+          error: 'Invalid 6-digit Google Authenticator code. Please enter the current code shown in your app.',
+        });
+        return;
+      }
+    }
+
+    const uid = `usr_${crypto.randomBytes(8).toString('hex')}`;
+    const record: DirectoryUserRecord = {
+      uid,
+      name: String(name || cleanEmail.split('@')[0]).trim(),
+      username: finalUsername,
+      phone: '',
+      normalizedPhone: '',
+      email: cleanEmail,
+      emailHash: computeSha256Hex(cleanEmail),
+      passwordHash: passwordHash ? String(passwordHash) : computeSha256Hex(`google_oauth_${cleanEmail}`),
+      totpSecret: totpSecret ? String(totpSecret) : generateBase32Secret(20),
+      about: 'Hey there! I am using Simple.',
+      avatarColor: String(avatarColor || '#10B981'),
+      avatarUrl: avatarUrl ? String(avatarUrl) : undefined,
+      identityFingerprint: String(
+        identityFingerprint || crypto.randomBytes(16).toString('hex').toUpperCase()
+      ),
+      allowUsernameDiscovery: true,
+      hidePhoneNumber: true,
+      isOnline: true,
+      lastSeen: 'Online',
+      updatedAt: Date.now(),
+    };
+
+    userDirectory.set(uid, record);
+    savePersistentDatabase();
+
+    const publicUser = sanitizePublicUserRecord(record);
+    const sessionToken = `stok_${crypto.randomBytes(24).toString('hex')}`;
+    verifiedOwnershipTokens.set(sessionToken, {
+      token: sessionToken,
+      channel: 'email',
+      normalizedTarget: cleanEmail,
+      verifiedAt: Date.now(),
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    });
+
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        c.send(JSON.stringify({ type: 'directory:user_updated', user: publicUser }));
+      }
+    });
+
+    res.json({
+      ok: true,
+      isExistingAccount: false,
+      user: publicUser,
+      sessionToken,
     });
   });
 
